@@ -136,10 +136,16 @@ fn map_button(button: u32) -> MouseButton {
     }
 }
 
+// XComponent reports pointer coordinates in device pixels; GPUI works in
+// logical pixels, so divide by the window scale.
+fn logical(value: f32) -> crate::Pixels {
+    crate::px(value / window::SCALE)
+}
+
 pub fn pointer_down(x: f32, y: f32, button: u32) {
     with_current(|platform| {
         for window in platform.windows() {
-            window.pointer_down(map_button(button), crate::point(crate::px(x), crate::px(y)));
+            window.pointer_down(map_button(button), crate::point(logical(x), logical(y)));
         }
     });
 }
@@ -147,7 +153,7 @@ pub fn pointer_down(x: f32, y: f32, button: u32) {
 pub fn pointer_up(x: f32, y: f32, button: u32) {
     with_current(|platform| {
         for window in platform.windows() {
-            window.pointer_up(map_button(button), crate::point(crate::px(x), crate::px(y)));
+            window.pointer_up(map_button(button), crate::point(logical(x), logical(y)));
         }
     });
 }
@@ -155,7 +161,7 @@ pub fn pointer_up(x: f32, y: f32, button: u32) {
 pub fn pointer_move(x: f32, y: f32) {
     with_current(|platform| {
         for window in platform.windows() {
-            window.pointer_move(crate::point(crate::px(x), crate::px(y)));
+            window.pointer_move(crate::point(logical(x), logical(y)));
         }
     });
 }
@@ -169,8 +175,8 @@ pub fn scroll(x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) {
     with_current(|platform| {
         for window in platform.windows() {
             window.scroll(
-                crate::point(crate::px(x), crate::px(y)),
-                crate::point(crate::px(delta_x), crate::px(delta_y)),
+                crate::point(logical(x), logical(y)),
+                crate::point(logical(delta_x), logical(delta_y)),
                 phase,
             );
         }
