@@ -140,6 +140,16 @@ impl WindowShared {
         self.callbacks.borrow_mut().request_frame = callback;
     }
 
+    /// Current editor text and caret (UTF-16), mirrored to the input method.
+    pub(crate) fn ime_context(&self) -> Option<(String, usize)> {
+        let mut guard = self.input_handler.borrow_mut();
+        let handler = guard.as_mut()?;
+        let mut adjusted = None;
+        let text = handler.text_for_range(0..usize::MAX, &mut adjusted)?;
+        let selection = handler.selected_text_range(true)?;
+        Some((text, selection.range.end))
+    }
+
     /// Apply an IME command to the focused input handler.
     pub(crate) fn handle_ime(&self, command: &super::inputmethod::ImeCommand) {
         use super::inputmethod::ImeCommand;

@@ -126,6 +126,16 @@ impl OhosPlatform {
         self.windows.borrow().clone()
     }
 
+    /// Text and caret of the focused editor, for IME context notifications.
+    pub(crate) fn ime_context(&self) -> Option<(String, usize)> {
+        for window in self.windows() {
+            if let Some(context) = window.ime_context() {
+                return Some(context);
+            }
+        }
+        None
+    }
+
     /// Forward an IME command to every window's input handler.
     pub(crate) fn handle_ime(&self, command: super::inputmethod::ImeCommand) {
         for window in self.windows() {

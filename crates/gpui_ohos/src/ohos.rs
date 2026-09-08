@@ -110,6 +110,7 @@ where
     }
     Application::with_platform(platform.clone() as Rc<dyn Platform>).run(app);
     platform.launch();
+    inputmethod::attach();
     platform.request_frames();
     vk::log(&format!(
         "[gpui_ohos] launched, windows={}",
@@ -135,6 +136,9 @@ pub fn tick() {
     with_current(|platform| {
         for command in inputmethod::drain() {
             platform.handle_ime(command);
+        }
+        if let Some((text, caret)) = platform.ime_context() {
+            inputmethod::update_context(&text, caret);
         }
         platform.tick();
     });
