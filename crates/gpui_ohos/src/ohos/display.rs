@@ -1,28 +1,44 @@
 use std::fmt::Debug;
-use uuid::Uuid;
 
-use openharmony_ability::OpenHarmonyApp;
+use uuid::Uuid;
 
 use crate::{Bounds, DisplayId, Pixels, PlatformDisplay, Result, point, px, size};
 
+/// The OHOS display.
+///
+/// The system-reported default display is unreliable on this 2in1 device (it
+/// reports a portrait 1260x2719 panel while the real panel is 3120x2080), so we
+/// derive the display bounds from the XComponent surface size instead.
 #[derive(Clone)]
 pub(crate) struct OhosDisplay {
-    app: OpenHarmonyApp,
     id: DisplayId,
+    bounds: Bounds<Pixels>,
 }
 
 impl OhosDisplay {
-    pub(crate) fn new(app: OpenHarmonyApp) -> Self {
+    pub(crate) fn new(width_px: u32, height_px: u32, scale: f32) -> Self {
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        let bounds = if width_px > 0 && height_px > 0 {
+            Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(width_px as f32 / scale), px(height_px as f32 / scale)),
+            )
+        } else {
+            Bounds::new(point(px(0.0), px(0.0)), size(px(3120.0), px(2080.0)))
+        };
         Self {
-            app,
             id: DisplayId::new(0),
+            bounds,
         }
     }
 }
 
 impl Debug for OhosDisplay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OhosDisplay").field("id", &self.id).finish()
+        f.debug_struct("OhosDisplay")
+            .field("id", &self.id)
+            .field("bounds", &self.bounds)
+            .finish()
     }
 }
 
@@ -32,7 +48,6 @@ impl PlatformDisplay for OhosDisplay {
     }
 
     fn uuid(&self) -> Result<Uuid> {
-        // Generate a stable UUID for the display
         Ok(Uuid::from_bytes([
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01,
@@ -40,28 +55,10 @@ impl PlatformDisplay for OhosDisplay {
     }
 
     fn bounds(&self) -> Bounds<Pixels> {
-        // Get actual display bounds from content_rect (device px) and convert to logical px.
-        let content_rect = self.app.content_rect();
-        let scale = self.app.scale() as f32;
-        if content_rect.width > 0 && content_rect.height > 0 {
-            Bounds::new(
-                point(
-                    px(content_rect.left as f32 / scale),
-                    px(content_rect.top as f32 / scale),
-                ),
-                size(
-                    px(content_rect.width as f32 / scale),
-                    px(content_rect.height as f32 / scale),
-                ),
-            )
-        } else {
-            // Fallback to default bounds if content_rect is not available yet
-            Bounds::new(point(px(0.0), px(0.0)), size(px(1080.0), px(1920.0)))
-        }
+        self.bounds
     }
 
     fn visible_bounds(&self) -> Bounds<Pixels> {
-        // On OHOS, visible bounds are the same as full bounds
-        self.bounds()
+        self.bounds
     }
 }

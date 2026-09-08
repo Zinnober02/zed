@@ -228,15 +228,6 @@ impl Application {
         self
     }
 
-    /// Set the OpenHarmonyApp instance for OHOS platform.
-    /// This should be called before `run()` to ensure the app is available when the platform initializes.
-    #[cfg(target_env = "ohos")]
-    pub fn with_ohos_app(self, app: openharmony_ability::OpenHarmonyApp) -> Self {
-        let platform = self.0.borrow().platform.clone();
-        platform.set_ohos_app(app);
-        self
-    }
-
     /// Start the application. The provided callback will be called once the
     /// app is fully launched.
     pub fn run<F>(self, on_finish_launching: F)

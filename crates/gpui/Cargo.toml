@@ -130,10 +130,6 @@ scap = { workspace = true, optional = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Power"] }
 
-[target.'cfg(target_env = "ohos")'.dependencies]
-openharmony-ability = { version = "1.0.0-beta.2" }
-
-
 [dev-dependencies]
 backtrace.workspace = true
 collections = { workspace = true, features = ["test-support"] }

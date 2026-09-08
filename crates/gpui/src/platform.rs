@@ -165,9 +165,6 @@ pub trait Platform: 'static {
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>>;
 
-    #[cfg(target_env = "ohos")]
-    fn set_ohos_app(&self, _app: openharmony_ability::OpenHarmonyApp) {}
-
     /// Returns the appearance of the application's windows.
     fn window_appearance(&self) -> WindowAppearance;
 

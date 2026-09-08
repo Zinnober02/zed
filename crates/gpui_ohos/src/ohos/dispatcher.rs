@@ -7,7 +7,6 @@ use std::{
 };
 
 use crate::{PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant};
-use openharmony_ability::OpenHarmonyWaker;
 
 struct TimerAfter {
     when: Instant,
@@ -16,7 +15,7 @@ struct TimerAfter {
 
 impl Ord for TimerAfter {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse for min-heap behavior
+        // Reverse for min-heap behavior.
         other.when.cmp(&self.when)
     }
 }
@@ -35,12 +34,20 @@ impl PartialEq for TimerAfter {
 
 impl Eq for TimerAfter {}
 
+type Waker = Box<dyn Fn() + Send + Sync + 'static>;
+
+/// Main-thread task dispatcher for OHOS.
+///
+/// OHOS owns the UI thread, so we never block it. Foreground tasks are queued
+/// and drained from OhosPlatform::tick, which the ArkTS host calls once per
+/// frame. Timers run on a dedicated thread that pushes due runnables into a
+/// ready queue and (optionally) nudges the host through the waker.
 pub(crate) struct OhosDispatcher {
     main_thread_id: thread::ThreadId,
     main_sender: PriorityQueueSender<RunnableVariant>,
     timer_queue: Arc<(Mutex<BinaryHeap<TimerAfter>>, Condvar)>,
     ready_timers: Arc<Mutex<VecDeque<RunnableVariant>>>,
-    waker: Arc<Mutex<Option<OpenHarmonyWaker>>>,
+    waker: Arc<Mutex<Option<Waker>>>,
     _timer_thread: thread::JoinHandle<()>,
 }
 
@@ -49,7 +56,8 @@ impl OhosDispatcher {
         let timer_queue: Arc<(Mutex<BinaryHeap<TimerAfter>>, Condvar)> =
             Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new()));
         let ready_timers = Arc::new(Mutex::new(VecDeque::new()));
-        let waker: Arc<Mutex<Option<OpenHarmonyWaker>>> = Arc::new(Mutex::new(None));
+        let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+
         let timer_queue_thread = timer_queue.clone();
         let ready_timers_thread = ready_timers.clone();
         let waker_thread = waker.clone();
@@ -84,11 +92,10 @@ impl OhosDispatcher {
                     let queued_any = !due.is_empty();
                     ready_timers_thread.lock().unwrap().append(&mut due);
 
-                    // A timer is removed from the deadline heap before waking the UI thread.
-                    // This guarantees that a delayed or unavailable waker cannot turn an
-                    // expired timer into a busy loop.
-                    if queued_any && let Some(waker) = waker_thread.lock().unwrap().as_ref() {
-                        waker.wake();
+                    if queued_any {
+                        if let Some(waker) = waker_thread.lock().unwrap().as_ref() {
+                            waker();
+                        }
                     }
                 }
             })
@@ -104,19 +111,18 @@ impl OhosDispatcher {
         }
     }
 
-    pub(crate) fn set_waker(&self, waker: OpenHarmonyWaker) {
+    /// Install a host waker that nudges the ArkTS frame loop.
+    #[allow(dead_code)]
+    pub(crate) fn set_waker(&self, waker: Waker) {
         *self.waker.lock().unwrap() = Some(waker);
     }
 
+    /// Run timers that are already due. Called from the main thread.
     pub(crate) fn run_due_timers(&self) {
         let due = std::mem::take(&mut *self.ready_timers.lock().unwrap());
         for runnable in due {
             runnable.run();
         }
-    }
-
-    pub(crate) fn execute_runnable(runnable: RunnableVariant) {
-        runnable.run();
     }
 }
 
@@ -126,24 +132,16 @@ impl PlatformDispatcher for OhosDispatcher {
     }
 
     fn dispatch(&self, runnable: RunnableVariant, _priority: Priority) {
-        // On OHOS, run background tasks off the main thread to avoid UI stalls.
-        std::thread::spawn(move || runnable.run());
+        // Background work runs on its own thread.
+        thread::spawn(move || runnable.run());
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {
         match self.main_sender.send(priority, runnable) {
-            Ok(_) => {
-                // Task has been queued, it will be processed in the run_loop callback
-            }
+            Ok(_) => {}
             Err(runnable) => {
-                // NOTE: Runnable may wrap a Future that is !Send.
-                //
-                // This is usually safe because we only poll it on the main thread.
-                // However if the send fails, we know that:
-                // 1. main_receiver has been dropped (which implies the app is shutting down)
-                // 2. we are on a background thread.
-                // It is not safe to drop something !Send on the wrong thread, and
-                // the app will exit soon anyway, so we must forget the runnable.
+                // The receiver is gone (shutdown). Runnable may be !Send, so we
+                // cannot drop it here; the process is exiting anyway.
                 std::mem::forget(runnable);
             }
         }

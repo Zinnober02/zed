@@ -1,42 +1,50 @@
-use log::{debug, warn};
-
-use std::{
-    cell::RefCell,
-    path::PathBuf,
-    rc::{Rc, Weak},
-    sync::Arc,
-};
+use std::{cell::RefCell, ffi::c_void, path::PathBuf, rc::Rc, sync::Arc};
 
 use anyhow::Result;
 use futures::channel::oneshot;
-use openharmony_ability::{Event, OpenHarmonyApp, TouchInputDelivery};
-use openharmony_ability_plugin_app_control::{
-    AppControlBridgePlugin, TerminateRequest, TerminateResponse,
-};
 
 use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow,
-    PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task, ThermalState,
-    WindowAppearance, WindowParams,
+    Keymap, Menu, MenuItem, NoopTextSystem, OwnedMenu, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task,
+    ThermalState, WindowAppearance, WindowParams,
 };
 
-use super::{
-    dispatcher::OhosDispatcher, display::OhosDisplay, text_system::OhosTextSystem,
-    wgpu_context::WgpuContext, window::OhosWindow,
-};
+use super::dispatcher::OhosDispatcher;
+use super::display::OhosDisplay;
+use super::keyboard::{OhosKeyboardLayout, OhosKeyboardMapper};
+use super::window::{OhosWindow, WindowShared};
+
+/// State of the XComponent surface backing the GPUI window.
+pub(crate) struct SurfaceState {
+    /// OHNativeWindow pointer handed to us by OnSurfaceCreated.
+    pub window: *mut c_void,
+    pub width: u32,
+    pub height: u32,
+    pub valid: bool,
+}
+
+impl Default for SurfaceState {
+    fn default() -> Self {
+        Self {
+            window: std::ptr::null_mut(),
+            width: 0,
+            height: 0,
+            valid: false,
+        }
+    }
+}
 
 pub(crate) struct OhosPlatform {
-    app: Rc<RefCell<Option<OpenHarmonyApp>>>,
     dispatcher: Arc<OhosDispatcher>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    primary_display: Rc<RefCell<Option<OhosDisplay>>>,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
-    gpu_context: Arc<WgpuContext>,
-    windows: Rc<RefCell<Vec<Weak<RefCell<OhosWindow>>>>>,
+    surface: Rc<RefCell<SurfaceState>>,
+    pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
+    windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
 }
 
 impl OhosPlatform {
@@ -45,123 +53,76 @@ impl OhosPlatform {
         let dispatcher = Arc::new(OhosDispatcher::new(main_sender));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
-        let text_system = Arc::new(OhosTextSystem::new());
-
-        // Initialize GPU context for WGPU renderer.
-        // Note: ZED_DEVICE_ID environment variable is optional - if not set, device_id defaults to 0
-        let gpu_context = Arc::new(WgpuContext::new()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create GPU context: {}. \
-                    Note: ZED_DEVICE_ID environment variable is optional. \
-                    If you need to specify a GPU device, set ZED_DEVICE_ID to a 4-digit hex PCI ID (e.g., '0x1234').",
-                    e
-                )
-            })?);
-
         Ok(Self {
-            app: Rc::new(RefCell::new(None)),
             dispatcher,
             background_executor,
             foreground_executor,
-            text_system,
-            primary_display: Rc::new(RefCell::new(None)),
+            text_system: Arc::new(NoopTextSystem::new()),
             main_receiver,
-            gpu_context,
+            surface: Rc::new(RefCell::new(SurfaceState::default())),
+            pending_launch: RefCell::new(None),
             windows: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
-    pub(crate) fn set_app(&self, app: OpenHarmonyApp) {
-        if let Err(error) = app.set_touch_input_delivery(TouchInputDelivery::ArkUiGestures) {
-            warn!("Failed to configure ArkUI gesture input for GPUI: {error}");
-        }
-        if let Err(error) = app.register_plugin(AppControlBridgePlugin) {
-            warn!("Failed to register OpenHarmony app-control plugin: {error}");
-        }
-        *self.app.borrow_mut() = Some(app.clone());
-        // Initialize primary display when app is set
-        *self.primary_display.borrow_mut() = Some(OhosDisplay::new(app.clone()));
-        self.dispatcher.set_waker(app.create_waker());
+    pub(crate) fn set_surface(&self, window: *mut c_void, width: u32, height: u32) {
+        let mut surface = self.surface.borrow_mut();
+        surface.window = window;
+        surface.width = width;
+        surface.height = height;
+        surface.valid = true;
     }
 
-    pub(crate) fn set_app_from_platform(&self, app: OpenHarmonyApp) {
-        self.set_app(app);
-    }
-
-    fn run_foreground_tasks(&self) {
-        // Process GPUI tasks queued for the main thread
-        // Similar to Windows' run_foreground_task, but simpler since OHOS doesn't have message timeouts
-        let mut receiver = self.main_receiver.clone();
-        while let Ok(Some(runnable)) = receiver.try_pop() {
-            OhosDispatcher::execute_runnable(runnable);
-        }
-    }
-
-    fn handle_ohos_event(&self, event: &Event, on_finish_launching: Option<Box<dyn FnOnce()>>) {
-        // create_waker() snapshots the lifecycle's current ThreadsafeFunction. Refresh it once
-        // the surface exists so timers scheduled during early startup can reliably wake the UI
-        // thread even if the first snapshot was taken before lifecycle initialization finished.
-        if matches!(event, Event::SurfaceCreate)
-            && let Some(app) = self.app.borrow().as_ref()
+    pub(crate) fn surface_resized(&self, width: u32, height: u32) {
         {
-            self.dispatcher.set_waker(app.create_waker());
+            let mut surface = self.surface.borrow_mut();
+            surface.width = width;
+            surface.height = height;
+            surface.valid = true;
         }
+        for window in self.windows.borrow().iter() {
+            window.on_surface_resized(width, height);
+        }
+        self.request_frames();
+    }
 
-        // First, process any GPUI tasks queued for the main thread
-        // This ensures tasks are processed in the run_loop, integrating GPUI with OpenHarmony's event loop
-        self.run_foreground_tasks();
-        self.dispatcher.run_due_timers();
+    pub(crate) fn surface_destroyed(&self) {
+        let mut surface = self.surface.borrow_mut();
+        surface.valid = false;
+        surface.window = std::ptr::null_mut();
+    }
 
-        // Handle on_finish_launching callback first, before routing to windows.
-        // This is critical because windows are created INSIDE the on_finish_launching callback,
-        // so we cannot depend on windows existing before calling it.
-        // This is similar to how macOS handles did_finish_launching.
-        // Note: The callback is only passed when event is SurfaceCreate (checked in run() method),
-        // so we can safely call it here unconditionally.
-        if let Some(callback) = on_finish_launching {
-            debug!("OhosPlatform: Calling on_finish_launching on SurfaceCreate");
+    /// Invoke the GPUI launch callback recorded by Platform::run.
+    pub(crate) fn launch(&self) {
+        let callback = self.pending_launch.borrow_mut().take();
+        if let Some(callback) = callback {
             callback();
         }
+    }
 
-        // Route events to all known OHOS windows without borrowing App.
-        // This avoids RefCell borrow conflicts when callbacks trigger app updates.
-        let mut live_windows: Vec<Rc<RefCell<OhosWindow>>> = Vec::new();
-        {
-            let mut windows = self.windows.borrow_mut();
-            windows.retain(|weak: &Weak<RefCell<OhosWindow>>| {
-                if let Some(window) = weak.upgrade() {
-                    live_windows.push(window);
-                    true
-                } else {
-                    false
-                }
-            });
+    /// One host frame: drain foreground tasks, fire due timers, then draw.
+    pub(crate) fn tick(&self) {
+        let mut receiver = self.main_receiver.clone();
+        while let Ok(Some(runnable)) = receiver.try_pop() {
+            runnable.run();
         }
+        self.dispatcher.run_due_timers();
+        self.request_frames();
+    }
 
-        if live_windows.is_empty() {
-            warn!("OhosPlatform: No active windows to handle event");
-        }
-
-        for window in live_windows {
-            window.borrow().handle_event(event);
+    pub(crate) fn request_frames(&self) {
+        for window in self.windows.borrow().iter() {
+            window.request_frame();
         }
     }
-}
 
-impl Clone for OhosPlatform {
-    fn clone(&self) -> Self {
-        Self {
-            app: self.app.clone(),
-            dispatcher: self.dispatcher.clone(),
-            background_executor: self.background_executor.clone(),
-            foreground_executor: self.foreground_executor.clone(),
-            text_system: self.text_system.clone(),
-            primary_display: self.primary_display.clone(),
-            main_receiver: self.main_receiver.clone(),
-            gpu_context: self.gpu_context.clone(),
-            windows: self.windows.clone(),
-        }
+    pub(crate) fn window_count(&self) -> usize {
+        self.windows.borrow().len()
+    }
+
+    /// Snapshot of live window state, for input routing and frame ticks.
+    pub(crate) fn windows(&self) -> Vec<Rc<WindowShared>> {
+        self.windows.borrow().clone()
     }
 }
 
@@ -179,100 +140,42 @@ impl Platform for OhosPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
-        let platform = self.clone();
-        let on_finish = Rc::new(RefCell::new(Some(on_finish_launching)));
-        if let Some(app) = self.app.borrow().clone() {
-            let on_finish_clone = on_finish.clone();
-            app.run_loop(move |event: Event| {
-                // Only take on_finish_launching when we receive SurfaceCreate event
-                let callback = if matches!(event, Event::SurfaceCreate { .. }) {
-                    on_finish_clone.borrow_mut().take()
-                } else {
-                    None
-                };
-                platform.handle_ohos_event(&event, callback);
-            });
-        } else {
-            warn!("OhosPlatform: App not set");
-        }
+        // The ArkTS host owns the run loop; we record the callback and invoke it
+        // from run_with_surface once the XComponent surface exists.
+        *self.pending_launch.borrow_mut() = Some(on_finish_launching);
     }
 
-    fn quit(&self) {
-        let Some(app) = self.app.borrow().clone() else {
-            return;
-        };
+    fn quit(&self) {}
 
-        self.background_executor
-            .spawn(async move {
-                let result = async {
-                    let response = app
-                        .bridge()?
-                        .call_sync_from_worker::<
-                            AppControlBridgePlugin,
-                            TerminateRequest,
-                            TerminateResponse,
-                        >("terminate", TerminateRequest { code: 0 })
-                        .await?;
-                    anyhow::ensure!(
-                        response.accepted,
-                        "OpenHarmony app-control plugin rejected termination"
-                    );
-                    Ok::<(), anyhow::Error>(())
-                }
-                .await;
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {}
 
-                if let Err(error) = result {
-                    warn!("Failed to terminate OpenHarmony application: {error}");
-                }
-            })
-            .detach();
-    }
+    fn activate(&self, _ignoring_other_apps: bool) {}
 
-    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {
-        // Not supported on OHOS
-    }
-
-    fn activate(&self, _ignoring_other_apps: bool) {
-        // Not supported on OHOS
-    }
-
-    fn hide_cursor_until_mouse_moves(&self) {
-        // Not supported on OHOS
-    }
+    fn hide_cursor_until_mouse_moves(&self) {}
 
     fn is_cursor_visible(&self) -> bool {
         true
     }
 
-    fn hide(&self) {
-        // Not supported on OHOS
-    }
+    fn hide(&self) {}
 
-    fn hide_other_apps(&self) {
-        // Not supported on OHOS
-    }
+    fn hide_other_apps(&self) {}
 
-    fn unhide_other_apps(&self) {
-        // Not supported on OHOS
-    }
+    fn unhide_other_apps(&self) {}
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
-        if let Some(display) = self.primary_display.borrow().as_ref() {
-            vec![Rc::new(display.clone()) as Rc<dyn PlatformDisplay>]
-        } else {
-            vec![]
-        }
+        let (w, h) = {
+            let surface = self.surface.borrow();
+            (surface.width, surface.height)
+        };
+        vec![Rc::new(OhosDisplay::new(w, h, 1.0)) as Rc<dyn PlatformDisplay>]
     }
 
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
-        self.primary_display
-            .borrow()
-            .as_ref()
-            .map(|d| Rc::new(d.clone()) as Rc<dyn PlatformDisplay>)
+        self.displays().into_iter().next()
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
-        // OHOS typically has a single window
         None
     }
 
@@ -295,47 +198,28 @@ impl Platform for OhosPlatform {
 
     fn open_window(
         &self,
-        handle: AnyWindowHandle,
+        _handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
-        if self.app.borrow().is_some() {
-            let window = OhosWindow::new(
-                self.app.clone(),
-                handle,
-                options,
-                self.gpu_context.clone(),
-                self.foreground_executor.clone(),
-            )?;
-
-            // GPUI fetches sprite_atlas during window initialization and caches it.
-            // Renderer must be ready at open_window time to avoid caching a broken atlas.
-            window.initialize_renderer()?;
-
-            let window = Rc::new(RefCell::new(window));
-            self.windows.borrow_mut().push(Rc::downgrade(&window));
-            Ok(Box::new(super::window::OhosWindowHandle::new(window)))
-        } else {
-            Err(anyhow::anyhow!("OpenHarmonyApp not set"))
+        if !self.surface.borrow().valid {
+            anyhow::bail!("OHOS surface is not available yet");
         }
-    }
-
-    #[cfg(target_env = "ohos")]
-    fn set_ohos_app(&self, app: OpenHarmonyApp) {
-        self.set_app_from_platform(app);
+        let shared = WindowShared::new(
+            self.surface.clone(),
+            options,
+            self.foreground_executor.clone(),
+        );
+        self.windows.borrow_mut().push(shared.clone());
+        Ok(Box::new(OhosWindow::new(shared)))
     }
 
     fn window_appearance(&self) -> WindowAppearance {
         WindowAppearance::Light
     }
 
-    fn open_url(&self, url: &str) {
-        // Not supported on OHOS
-        warn!("open_url not supported on OHOS: {}", url);
-    }
+    fn open_url(&self, _url: &str) {}
 
-    fn on_open_urls(&self, _callback: Box<dyn FnMut(Vec<String>)>) {
-        // Not supported on OHOS
-    }
+    fn on_open_urls(&self, _callback: Box<dyn FnMut(Vec<String>)>) {}
 
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
         Task::ready(Err(anyhow::anyhow!(
@@ -366,49 +250,29 @@ impl Platform for OhosPlatform {
         false
     }
 
-    fn reveal_path(&self, _path: &std::path::Path) {
-        // Not supported on OHOS
-    }
+    fn reveal_path(&self, _path: &std::path::Path) {}
 
-    fn open_with_system(&self, _path: &std::path::Path) {
-        // Not supported on OHOS
-    }
+    fn open_with_system(&self, _path: &std::path::Path) {}
 
-    fn on_quit(&self, _callback: Box<dyn FnMut() -> bool>) {
-        // Handled by OpenHarmonyApp lifecycle
-    }
+    fn on_quit(&self, _callback: Box<dyn FnMut() -> bool>) {}
 
-    fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
-        // Not supported on OHOS
-    }
+    fn on_reopen(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {
-        // Not supported on OHOS
-    }
+    fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
-        // Not supported on OHOS
-    }
+    fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {}
 
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
         None
     }
 
-    fn set_dock_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {
-        // Not supported on OHOS
-    }
+    fn set_dock_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {}
 
-    fn on_app_menu_action(&self, _callback: Box<dyn FnMut(&dyn Action)>) {
-        // Not supported on OHOS
-    }
+    fn on_app_menu_action(&self, _callback: Box<dyn FnMut(&dyn Action)>) {}
 
-    fn on_will_open_app_menu(&self, _callback: Box<dyn FnMut()>) {
-        // Not supported on OHOS
-    }
+    fn on_will_open_app_menu(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn on_validate_app_menu_command(&self, _callback: Box<dyn FnMut(&dyn Action) -> bool>) {
-        // Not supported on OHOS
-    }
+    fn on_validate_app_menu_command(&self, _callback: Box<dyn FnMut(&dyn Action) -> bool>) {}
 
     fn compositor_name(&self) -> &'static str {
         "OHOS"
@@ -424,22 +288,23 @@ impl Platform for OhosPlatform {
         ))
     }
 
-    fn set_cursor_style(&self, _style: CursorStyle) {
-        // Cursor style is managed by the system on OHOS
-    }
+    fn set_cursor_style(&self, _style: CursorStyle) {}
 
     fn should_auto_hide_scrollbars(&self) -> bool {
         false
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        // TODO: Implement clipboard support
         None
     }
 
-    fn write_to_clipboard(&self, _item: ClipboardItem) {
-        // TODO: Implement clipboard support
+    fn write_to_clipboard(&self, _item: ClipboardItem) {}
+
+    fn read_from_primary(&self) -> Option<ClipboardItem> {
+        None
     }
+
+    fn write_to_primary(&self, _item: ClipboardItem) {}
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
         Task::ready(Err(anyhow::anyhow!(
@@ -458,26 +323,18 @@ impl Platform for OhosPlatform {
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
-        Box::new(super::keyboard::OhosKeyboardLayout)
+        Box::new(OhosKeyboardLayout)
     }
 
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper> {
-        Rc::new(super::keyboard::OhosKeyboardMapper)
+        Rc::new(OhosKeyboardMapper)
     }
 
-    fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {
-        // Not supported on OHOS
-    }
+    fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {}
 
     fn thermal_state(&self) -> ThermalState {
         ThermalState::Nominal
     }
 
     fn on_thermal_state_change(&self, _callback: Box<dyn FnMut()>) {}
-
-    fn read_from_primary(&self) -> Option<ClipboardItem> {
-        None
-    }
-
-    fn write_to_primary(&self, _item: ClipboardItem) {}
 }
