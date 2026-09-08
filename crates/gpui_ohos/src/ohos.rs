@@ -24,6 +24,18 @@ thread_local! {
     /// The live platform for this (UI) thread. XComponent callbacks, ArkTS
     /// frame ticks and input all arrive on the ArkUI UI thread.
     static CURRENT: RefCell<Weak<OhosPlatform>> = RefCell::new(Weak::new());
+    /// Writable directory the app should browse, set from ArkTS filesDir.
+    static ROOT_DIR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Set the directory the application should browse (from ArkTS context.filesDir).
+pub fn set_root_dir(path: &str) {
+    ROOT_DIR.with(|root| *root.borrow_mut() = Some(path.to_string()));
+}
+
+/// The directory set by set_root_dir, if any.
+pub fn root_dir() -> Option<String> {
+    ROOT_DIR.with(|root| root.borrow().clone())
 }
 
 fn set_current(platform: &Rc<OhosPlatform>) {
