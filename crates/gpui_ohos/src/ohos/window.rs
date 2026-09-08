@@ -31,6 +31,10 @@ use super::vk::VkRenderer;
 /// Teal so it is unambiguous versus the old probe blue.
 const CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.45, 1.0];
 
+/// Logical-to-device pixel scale. The 2in1 panel is 3120x2080 at a high DPI,
+/// so a logical pixel maps to ~3 device pixels (otherwise 16px text is tiny).
+pub(crate) const SCALE: f32 = 3.0;
+
 pub(crate) struct WindowCallbacks {
     request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     input: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
@@ -95,11 +99,19 @@ impl WindowShared {
             let s = surface.borrow();
             (s.width, s.height)
         };
+        let scale = SCALE;
+        let bounds = Bounds::new(
+            point(px(0.0), px(0.0)),
+            Size {
+                width: px(w as f32 / scale),
+                height: px(h as f32 / scale),
+            },
+        );
         Rc::new(Self {
             surface,
-            bounds: RefCell::new(params.bounds),
-            scale: Cell::new(1.0),
-            display: OhosDisplay::new(w, h, 1.0),
+            bounds: RefCell::new(bounds),
+            scale: Cell::new(scale),
+            display: OhosDisplay::new(w, h, scale),
             input_handler: RefCell::new(None),
             callbacks: RefCell::new(WindowCallbacks::default()),
             renderer: RefCell::new(None),

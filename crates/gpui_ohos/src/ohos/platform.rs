@@ -198,7 +198,7 @@ impl Platform for OhosPlatform {
             let surface = self.surface.borrow();
             (surface.width, surface.height)
         };
-        vec![Rc::new(OhosDisplay::new(w, h, 1.0)) as Rc<dyn PlatformDisplay>]
+        vec![Rc::new(OhosDisplay::new(w, h, super::window::SCALE)) as Rc<dyn PlatformDisplay>]
     }
 
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
