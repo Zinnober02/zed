@@ -325,16 +325,22 @@ impl Platform for OhosPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        None
+        super::clipboard::read_text().map(ClipboardItem::new_string)
     }
 
-    fn write_to_clipboard(&self, _item: ClipboardItem) {}
+    fn write_to_clipboard(&self, item: ClipboardItem) {
+        if let Some(text) = item.text() {
+            super::clipboard::write_text(&text);
+        }
+    }
 
     fn read_from_primary(&self) -> Option<ClipboardItem> {
-        None
+        self.read_from_clipboard()
     }
 
-    fn write_to_primary(&self, _item: ClipboardItem) {}
+    fn write_to_primary(&self, item: ClipboardItem) {
+        self.write_to_clipboard(item)
+    }
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
         Task::ready(Err(anyhow::anyhow!(

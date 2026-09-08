@@ -1,4 +1,5 @@
 mod atlas;
+mod clipboard;
 mod dispatcher;
 mod display;
 mod keyboard;
@@ -89,6 +90,16 @@ where
         if let Some(sample) = names.iter().find(|name| name.contains("HarmonyOS")) {
             vk::log(&format!("[gpui_ohos] text_system sample={sample}"));
         }
+    }
+    {
+        // Clipboard self-test: write needs no permission, read needs the
+        // READ_PASTEBOARD ACL permission.
+        let marker = "gpui_ohos clipboard test";
+        let wrote = clipboard::write_text(marker);
+        let read = clipboard::read_text();
+        vk::log(&format!(
+            "[gpui_ohos] clipboard write={wrote} read={read:?}"
+        ));
     }
     Application::with_platform(platform.clone() as Rc<dyn Platform>).run(app);
     platform.launch();
