@@ -1,7 +1,9 @@
+mod atlas;
 mod dispatcher;
 mod display;
 mod keyboard;
 mod platform;
+mod text_system;
 mod vk;
 mod window;
 
@@ -68,6 +70,14 @@ where
     ));
     let platform = new_platform();
     platform.set_surface(window, width, height);
+    {
+        let text_system = platform.text_system();
+        let names = text_system.all_font_names();
+        vk::log(&format!("[gpui_ohos] text_system fonts={}", names.len()));
+        if let Some(sample) = names.iter().find(|name| name.contains("HarmonyOS")) {
+            vk::log(&format!("[gpui_ohos] text_system sample={sample}"));
+        }
+    }
     Application::with_platform(platform.clone() as Rc<dyn Platform>).run(app);
     platform.launch();
     platform.request_frames();

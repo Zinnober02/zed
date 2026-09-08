@@ -5,7 +5,7 @@ use futures::channel::oneshot;
 
 use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    Keymap, Menu, MenuItem, NoopTextSystem, OwnedMenu, PathPromptOptions, Platform,
+    Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task,
     ThermalState, WindowAppearance, WindowParams,
@@ -14,6 +14,7 @@ use crate::{
 use super::dispatcher::OhosDispatcher;
 use super::display::OhosDisplay;
 use super::keyboard::{OhosKeyboardLayout, OhosKeyboardMapper};
+use super::text_system::OhosTextSystem;
 use super::window::{OhosWindow, WindowShared};
 
 /// State of the XComponent surface backing the GPUI window.
@@ -57,7 +58,7 @@ impl OhosPlatform {
             dispatcher,
             background_executor,
             foreground_executor,
-            text_system: Arc::new(NoopTextSystem::new()),
+            text_system: Arc::new(OhosTextSystem::new()),
             main_receiver,
             surface: Rc::new(RefCell::new(SurfaceState::default())),
             pending_launch: RefCell::new(None),

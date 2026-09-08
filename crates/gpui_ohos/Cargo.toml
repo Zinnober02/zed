@@ -20,3 +20,11 @@ collections.workspace = true
 futures.workspace = true
 raw-window-handle = "0.6"
 uuid.workspace = true
+
+# Text shaping/rasterization (fonts come from /system/fonts).
+cosmic-text = "0.17"
+etagere = "0.2"
+itertools.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true

@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     cell::{Cell, RefCell},
     ffi::c_void,
     ptr::NonNull,
@@ -15,7 +14,7 @@ use raw_window_handle::{
 };
 
 use crate::{
-    AtlasKey, AtlasTile, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, ForegroundExecutor,
+    AtlasTextureKind, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, ForegroundExecutor,
     GpuSpecs, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, ScrollDelta,
@@ -23,6 +22,7 @@ use crate::{
     WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowParams, point, px,
 };
 
+use super::atlas::OhosAtlas;
 use super::display::OhosDisplay;
 use super::platform::SurfaceState;
 use super::vk::VkRenderer;
@@ -30,22 +30,6 @@ use super::vk::VkRenderer;
 /// Clear color used until the GPUI scene renderer lands (M2+).
 /// Teal so it is unambiguous versus the old probe blue.
 const CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.45, 1.0];
-
-/// Placeholder atlas. Returns None for every request; good enough while the
-/// scene renderer is not implemented yet.
-struct EmptyAtlas;
-
-impl PlatformAtlas for EmptyAtlas {
-    fn get_or_insert_with<'a>(
-        &self,
-        _key: &AtlasKey,
-        _build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
-    ) -> Result<Option<AtlasTile>> {
-        Ok(None)
-    }
-
-    fn remove(&self, _key: &AtlasKey) {}
-}
 
 pub(crate) struct WindowCallbacks {
     request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -94,6 +78,9 @@ pub(crate) struct WindowShared {
     hovered: Cell<bool>,
     render_failure_logged: Cell<bool>,
     frame_count: Cell<u64>,
+    atlas: Arc<OhosAtlas>,
+    framebuffer: RefCell<Vec<u8>>,
+    last_scene_hash: Cell<Option<u64>>,
     #[allow(dead_code)]
     foreground_executor: ForegroundExecutor,
 }
@@ -123,6 +110,9 @@ impl WindowShared {
             hovered: Cell::new(true),
             render_failure_logged: Cell::new(false),
             frame_count: Cell::new(0),
+            atlas: Arc::new(OhosAtlas::new()),
+            framebuffer: RefCell::new(Vec::new()),
+            last_scene_hash: Cell::new(None),
             foreground_executor,
         })
     }
@@ -209,20 +199,29 @@ impl WindowShared {
         if !self.ensure_renderer() {
             return;
         }
+        let hash = scene_hash(scene);
+        if self.last_scene_hash.get() == Some(hash) {
+            return;
+        }
         let frame = self.frame_count.get() + 1;
         self.frame_count.set(frame);
         if frame % 120 == 1 {
             super::vk::log(&format!(
-                "[gpui_ohos] frame {frame} quads={}",
-                scene.quads.len()
+                "[gpui_ohos] frame {frame} quads={} glyphs={}",
+                scene.quads.len(),
+                scene.monochrome_sprites.len()
             ));
         }
-        let rects = collect_clear_rects(scene);
+        let mut framebuffer = self.framebuffer.borrow_mut();
         if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
-            if let Err(error) = renderer.render_frame(CLEAR_COLOR, &rects) {
+            let (w, h) = renderer.size();
+            framebuffer.resize(w as usize * h as usize * 4, 0);
+            composite(scene, &mut framebuffer, w, h, &self.atlas, renderer.needs_bgra_swap());
+            if let Err(error) = renderer.render_software(&framebuffer, hash) {
                 super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
             }
         }
+        self.last_scene_hash.set(Some(hash));
     }
 
     pub(crate) fn pointer_down(&self, button: MouseButton, position: Point<Pixels>) {
@@ -451,7 +450,7 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        Arc::new(EmptyAtlas)
+        self.shared.atlas.clone()
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -486,33 +485,186 @@ impl PlatformWindow for OhosWindow {
     fn start_window_move(&self) {}
 }
 
-/// Translate GPUI scene quads into solid clear rectangles, in paint order.
-/// M1 handles solid backgrounds only; borders, gradients, paths and glyphs
-/// are layered on in later milestones.
-fn collect_clear_rects(scene: &Scene) -> Vec<super::vk::ClearRect> {
-    let mut rects = Vec::with_capacity(scene.quads.len());
+/// Cheap identity of the rendered scene, used to skip unchanged frames.
+fn scene_hash(scene: &Scene) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scene.quads.len().hash(&mut hasher);
+    for quad in &scene.quads {
+        quad.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
+        quad.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
+        quad.bounds.size.width.as_f32().to_bits().hash(&mut hasher);
+        quad.bounds.size.height.as_f32().to_bits().hash(&mut hasher);
+        if let Some(color) = quad.background.as_solid() {
+            let rgba = color.to_rgb();
+            rgba.r.to_bits().hash(&mut hasher);
+            rgba.g.to_bits().hash(&mut hasher);
+            rgba.b.to_bits().hash(&mut hasher);
+            rgba.a.to_bits().hash(&mut hasher);
+        }
+    }
+    scene.monochrome_sprites.len().hash(&mut hasher);
+    for sprite in &scene.monochrome_sprites {
+        sprite.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
+        sprite.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
+        sprite.bounds.size.width.as_f32().to_bits().hash(&mut hasher);
+        sprite.bounds.size.height.as_f32().to_bits().hash(&mut hasher);
+        sprite.tile.bounds.origin.x.0.hash(&mut hasher);
+        sprite.tile.bounds.origin.y.0.hash(&mut hasher);
+        sprite.tile.bounds.size.width.0.hash(&mut hasher);
+        sprite.tile.bounds.size.height.0.hash(&mut hasher);
+        let rgba = sprite.color.to_rgb();
+        rgba.r.to_bits().hash(&mut hasher);
+        rgba.g.to_bits().hash(&mut hasher);
+        rgba.b.to_bits().hash(&mut hasher);
+        rgba.a.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn fill_rect(
+    fb: &mut [u8],
+    w: u32,
+    h: u32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    rgba: [u8; 4],
+    bgra: bool,
+) {
+    let x0 = x0.max(0);
+    let y0 = y0.max(0);
+    let x1 = x1.min(w as i32);
+    let y1 = y1.min(h as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let px = if bgra {
+        [rgba[2], rgba[1], rgba[0], rgba[3]]
+    } else {
+        rgba
+    };
+    let stride = w as usize * 4;
+    for y in y0..y1 {
+        let start = y as usize * stride + x0 as usize * 4;
+        let end = y as usize * stride + x1 as usize * 4;
+        for chunk in fb[start..end].chunks_exact_mut(4) {
+            chunk.copy_from_slice(&px);
+        }
+    }
+}
+
+/// CPU-composite the scene (solid quads then monochrome glyph sprites).
+fn composite(scene: &Scene, fb: &mut [u8], w: u32, h: u32, atlas: &OhosAtlas, bgra: bool) {
+    fill_rect(
+        fb,
+        w,
+        h,
+        0,
+        0,
+        w as i32,
+        h as i32,
+        [0x1b, 0x1b, 0x1b, 0xff],
+        bgra,
+    );
+
     for quad in &scene.quads {
         let Some(color) = quad.background.as_solid() else {
             continue;
         };
         let rgba = color.to_rgb();
-        if rgba.a < 0.996 {
+        let a = (rgba.a * 255.0) as u8;
+        if a == 0 {
             continue;
         }
-        let x = quad.bounds.origin.x.as_f32();
-        let y = quad.bounds.origin.y.as_f32();
-        let w = quad.bounds.size.width.as_f32();
-        let h = quad.bounds.size.height.as_f32();
-        if w <= 0.0 || h <= 0.0 {
-            continue;
-        }
-        rects.push(super::vk::ClearRect {
-            x: x as i32,
-            y: y as i32,
-            width: w as u32,
-            height: h as u32,
-            color: [rgba.r, rgba.g, rgba.b, 1.0],
-        });
+        let x0 = quad.bounds.origin.x.as_f32() as i32;
+        let y0 = quad.bounds.origin.y.as_f32() as i32;
+        let x1 = x0 + quad.bounds.size.width.as_f32() as i32;
+        let y1 = y0 + quad.bounds.size.height.as_f32() as i32;
+        fill_rect(
+            fb,
+            w,
+            h,
+            x0,
+            y0,
+            x1,
+            y1,
+            [
+                (rgba.r * 255.0) as u8,
+                (rgba.g * 255.0) as u8,
+                (rgba.b * 255.0) as u8,
+                a,
+            ],
+            bgra,
+        );
     }
-    rects
+
+    if scene.monochrome_sprites.is_empty() {
+        return;
+    }
+
+    atlas.with_texture(AtlasTextureKind::Monochrome, |data, atlas_w, _atlas_h| {
+        let stride = w as usize * 4;
+        for sprite in &scene.monochrome_sprites {
+            let sx = sprite.bounds.origin.x.as_f32() as i32;
+            let sy = sprite.bounds.origin.y.as_f32() as i32;
+            let sw = sprite.bounds.size.width.as_f32() as i32;
+            let sh = sprite.bounds.size.height.as_f32() as i32;
+            if sw <= 0 || sh <= 0 {
+                continue;
+            }
+            let tx = sprite.tile.bounds.origin.x.0;
+            let ty = sprite.tile.bounds.origin.y.0;
+            let color = sprite.color.to_rgb();
+            let cr = (color.r * 255.0) as u32;
+            let cg = (color.g * 255.0) as u32;
+            let cb = (color.b * 255.0) as u32;
+            let ca = (color.a * 255.0) as u32;
+            for row in 0..sh {
+                let dy = sy + row;
+                if dy < 0 || dy >= h as i32 {
+                    continue;
+                }
+                for col in 0..sw {
+                    let dx = sx + col;
+                    if dx < 0 || dx >= w as i32 {
+                        continue;
+                    }
+                    let ax = tx + col;
+                    let ay = ty + row;
+                    if ax < 0 || ay < 0 {
+                        continue;
+                    }
+                    let Some(&coverage) = data.get(ay as usize * atlas_w as usize + ax as usize)
+                    else {
+                        continue;
+                    };
+                    if coverage == 0 {
+                        continue;
+                    }
+                    let cov = coverage as u32;
+                    let inv = 255 - cov;
+                    let i = dy as usize * stride + dx as usize * 4;
+                    let dr = fb[i] as u32;
+                    let dg = fb[i + 1] as u32;
+                    let db = fb[i + 2] as u32;
+                    let r = (cr * cov * ca / 65025 + dr * inv / 255) as u8;
+                    let g = (cg * cov * ca / 65025 + dg * inv / 255) as u8;
+                    let b = (cb * cov * ca / 65025 + db * inv / 255) as u8;
+                    if bgra {
+                        fb[i] = b;
+                        fb[i + 1] = g;
+                        fb[i + 2] = r;
+                    } else {
+                        fb[i] = r;
+                        fb[i + 1] = g;
+                        fb[i + 2] = b;
+                    }
+                    fb[i + 3] = 255;
+                }
+            }
+        }
+    });
 }
+
