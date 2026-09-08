@@ -13,6 +13,12 @@ use std::{cell::RefCell, ffi::c_void, rc::{Rc, Weak}};
 
 pub use vk::LogFn;
 
+pub use inputmethod::{
+    commit_text as ime_commit_text, delete_backward as ime_delete_backward,
+    delete_forward as ime_delete_forward, finish_preview as ime_finish_preview,
+    preview_text as ime_preview_text,
+};
+
 /// Log a line through the host-provided hilog sink.
 pub fn log_line(message: &str) {
     vk::log(message);
@@ -104,7 +110,6 @@ where
     }
     Application::with_platform(platform.clone() as Rc<dyn Platform>).run(app);
     platform.launch();
-    inputmethod::attach();
     platform.request_frames();
     vk::log(&format!(
         "[gpui_ohos] launched, windows={}",

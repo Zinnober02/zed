@@ -245,3 +245,24 @@ pub(crate) fn attach() {
 pub(crate) fn drain() -> Vec<ImeCommand> {
     std::mem::take(&mut *QUEUE.lock().unwrap())
 }
+
+// Entry points for the ArkTS InputMethodController event bridge (Qt-style).
+pub fn commit_text(text: &str) {
+    QUEUE.lock().unwrap().push(ImeCommand::Commit(text.to_string()));
+}
+
+pub fn delete_backward(length: usize) {
+    QUEUE.lock().unwrap().push(ImeCommand::Backspace(length.max(1)));
+}
+
+pub fn delete_forward(length: usize) {
+    QUEUE.lock().unwrap().push(ImeCommand::DeleteForward(length.max(1)));
+}
+
+pub fn preview_text(text: &str) {
+    QUEUE.lock().unwrap().push(ImeCommand::Preview(text.to_string()));
+}
+
+pub fn finish_preview() {
+    QUEUE.lock().unwrap().push(ImeCommand::ClearPreview);
+}
