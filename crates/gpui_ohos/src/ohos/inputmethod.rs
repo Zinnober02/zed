@@ -17,6 +17,7 @@ const RTLD_NOW: c_int = 2;
 pub(crate) enum ImeCommand {
     Commit(String),
     Backspace(usize),
+    DeleteForward(usize),
     Preview(String),
     ClearPreview,
 }
@@ -58,6 +59,59 @@ unsafe extern "C" fn on_preview(
         .lock()
         .unwrap()
         .push(ImeCommand::Preview(utf16_to_string(text, length)));
+    0
+}
+
+unsafe extern "C" fn on_delete_forward(_proxy: *mut c_void, length: i32) {
+    QUEUE
+        .lock()
+        .unwrap()
+        .push(ImeCommand::DeleteForward(length.max(1) as usize));
+}
+
+unsafe extern "C" fn on_keyboard_status(_proxy: *mut c_void, _status: i32) {}
+
+unsafe extern "C" fn on_enter_key(_proxy: *mut c_void, _kind: i32) {
+    QUEUE.lock().unwrap().push(ImeCommand::Commit("\n".to_string()));
+}
+
+unsafe extern "C" fn on_move_cursor(_proxy: *mut c_void, _direction: i32) {}
+
+unsafe extern "C" fn on_set_selection(_proxy: *mut c_void, _start: i32, _end: i32) {}
+
+unsafe extern "C" fn on_extend_action(_proxy: *mut c_void, _action: i32) {}
+
+unsafe extern "C" fn on_get_left_text(
+    _proxy: *mut c_void,
+    _number: i32,
+    _text: *mut u16,
+    length: *mut usize,
+) {
+    if !length.is_null() {
+        *length = 0;
+    }
+}
+
+unsafe extern "C" fn on_get_right_text(
+    _proxy: *mut c_void,
+    _number: i32,
+    _text: *mut u16,
+    length: *mut usize,
+) {
+    if !length.is_null() {
+        *length = 0;
+    }
+}
+
+unsafe extern "C" fn on_text_index_at_cursor(_proxy: *mut c_void) -> i32 {
+    0
+}
+
+unsafe extern "C" fn on_private_command(
+    _proxy: *mut c_void,
+    _command: *mut c_void,
+    _size: usize,
+) -> i32 {
     0
 }
 
@@ -119,6 +173,26 @@ pub(crate) fn attach() {
             sym!("OH_TextEditorProxy_SetSetPreviewTextFunc", ProxySetPreview);
         let set_finish: ProxySetFinish =
             sym!("OH_TextEditorProxy_SetFinishTextPreviewFunc", ProxySetFinish);
+        let set_delete_forward: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetDeleteForwardFunc", ProxySetTextConfig);
+        let set_keyboard_status: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetSendKeyboardStatusFunc", ProxySetTextConfig);
+        let set_enter_key: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetSendEnterKeyFunc", ProxySetTextConfig);
+        let set_move_cursor: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetMoveCursorFunc", ProxySetTextConfig);
+        let set_set_selection: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetHandleSetSelectionFunc", ProxySetTextConfig);
+        let set_extend_action: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetHandleExtendActionFunc", ProxySetTextConfig);
+        let set_get_left: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetGetLeftTextOfCursorFunc", ProxySetTextConfig);
+        let set_get_right: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetGetRightTextOfCursorFunc", ProxySetTextConfig);
+        let set_text_index: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetGetTextIndexAtCursorFunc", ProxySetTextConfig);
+        let set_private_command: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetReceivePrivateCommandFunc", ProxySetTextConfig);
         let set_text_config: ProxySetTextConfig =
             sym!("OH_TextEditorProxy_SetGetTextConfigFunc", ProxySetTextConfig);
         let set_input_type: SetInputType =
@@ -138,6 +212,16 @@ pub(crate) fn attach() {
         set_preview(proxy, on_preview as *const c_void);
         set_finish(proxy, on_finish_preview as *const c_void);
         set_text_config(proxy, on_get_text_config as *const c_void);
+        set_delete_forward(proxy, on_delete_forward as *const c_void);
+        set_keyboard_status(proxy, on_keyboard_status as *const c_void);
+        set_enter_key(proxy, on_enter_key as *const c_void);
+        set_move_cursor(proxy, on_move_cursor as *const c_void);
+        set_set_selection(proxy, on_set_selection as *const c_void);
+        set_extend_action(proxy, on_extend_action as *const c_void);
+        set_get_left(proxy, on_get_left_text as *const c_void);
+        set_get_right(proxy, on_get_right_text as *const c_void);
+        set_text_index(proxy, on_text_index_at_cursor as *const c_void);
+        set_private_command(proxy, on_private_command as *const c_void);
 
         let options = options_create(false);
         super::vk::log(&format!(

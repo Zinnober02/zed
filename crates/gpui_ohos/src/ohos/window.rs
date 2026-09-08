@@ -159,6 +159,13 @@ impl WindowShared {
                     handler.replace_text_in_range(Some(start..end), "");
                 }
             }
+            ImeCommand::DeleteForward(count) => {
+                if let Some(selection) = handler.selected_text_range(true) {
+                    let start = selection.range.end;
+                    let end = start + *count;
+                    handler.replace_text_in_range(Some(start..end), "");
+                }
+            }
             ImeCommand::Preview(text) => {
                 handler.replace_and_mark_text_in_range(None, text, None);
             }
