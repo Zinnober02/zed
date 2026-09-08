@@ -38,6 +38,10 @@ static NOTIFY_CURSOR: OnceLock<unsafe extern "C" fn(*mut c_void, *mut c_void) ->
     OnceLock::new();
 static CURSOR_CREATE: OnceLock<unsafe extern "C" fn(f64, f64, f64, f64) -> *mut c_void> =
     OnceLock::new();
+static SHOW_TEXT_INPUT: OnceLock<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32> =
+    OnceLock::new();
+static HIDE_TEXT_INPUT: OnceLock<unsafe extern "C" fn(*mut c_void) -> i32> = OnceLock::new();
+static OPTIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn utf16_to_string(text: *const u16, length: usize) -> String {
     if text.is_null() || length == 0 {
@@ -185,6 +189,7 @@ pub(crate) fn attach() {
         type Attach =
             unsafe extern "C" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32;
         type ShowTextInput = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+        type HideTextInput = unsafe extern "C" fn(*mut c_void) -> i32;
         type NotifySelection =
             unsafe extern "C" fn(*mut c_void, *mut u16, usize, i32, i32) -> i32;
         type NotifyCursor = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
@@ -222,6 +227,18 @@ pub(crate) fn attach() {
         let attach: Attach = sym!("OH_InputMethodController_Attach", Attach);
         let show_text_input: ShowTextInput =
             sym!("OH_InputMethodProxy_ShowTextInput", ShowTextInput);
+        // Optional: older system images do not export it, and a missing hide
+        // must not abort the whole attach.
+        let hide_raw = dlsym(
+            lib,
+            CString::new("OH_InputMethodProxy_HideKeyboard").unwrap().as_ptr(),
+        );
+        let hide_text_input: Option<HideTextInput> = if hide_raw.is_null() {
+            super::vk::log("[gpui_ohos] missing IME symbol: OH_InputMethodProxy_HideKeyboard");
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, HideTextInput>(hide_raw))
+        };
         let notify_selection: NotifySelection =
             sym!("OH_InputMethodProxy_NotifySelectionChange", NotifySelection);
         let notify_cursor: NotifyCursor =
@@ -231,6 +248,10 @@ pub(crate) fn attach() {
         let _ = NOTIFY_SELECTION.set(notify_selection);
         let _ = NOTIFY_CURSOR.set(notify_cursor);
         let _ = CURSOR_CREATE.set(cursor_create);
+        let _ = SHOW_TEXT_INPUT.set(show_text_input);
+        if let Some(hide) = hide_text_input {
+            let _ = HIDE_TEXT_INPUT.set(hide);
+        }
 
         let proxy = proxy_create();
         if proxy.is_null() {
@@ -254,6 +275,7 @@ pub(crate) fn attach() {
         set_private(proxy, on_private_command as *const c_void);
 
         let options = options_create(true);
+        OPTIONS.store(options as usize, Ordering::Relaxed);
         let mut proxy_out: *mut c_void = std::ptr::null_mut();
         let code = attach(proxy, options, &mut proxy_out);
         super::vk::log(&format!("[gpui_ohos] IME attach code={code}"));
@@ -264,6 +286,52 @@ pub(crate) fn attach() {
         }
         let _ = on_noop as *const c_void;
         *attached = true;
+    }
+}
+
+/// Re-enter the editing state so the input method accepts keys again.
+///
+/// The IME leaves the editing state whenever its panel hides (window blur,
+/// focus moving elsewhere), and only ShowTextInput restores it. Attaching
+/// once at startup is not enough: the client must show again once the editor
+/// actually holds focus, otherwise every key is dropped with "keyEvent is not
+/// consumed by ime".
+fn try_show() -> i32 {
+    let proxy = PROXY.load(Ordering::Relaxed) as *mut c_void;
+    let options = OPTIONS.load(Ordering::Relaxed) as *mut c_void;
+    if proxy.is_null() || options.is_null() {
+        return -1;
+    }
+    match SHOW_TEXT_INPUT.get() {
+        Some(show) => unsafe { show(proxy, options) },
+        None => -1,
+    }
+}
+
+pub fn show() {
+    let code = try_show();
+    if code == 0 {
+        return;
+    }
+    // 12800009 IME_ERR_DETACHED: the system unbinds the client when the window
+    // loses focus, and a detached client rejects ShowTextInput. Bind again.
+    super::vk::log(&format!("[gpui_ohos] IME show failed code={code}; re-attaching"));
+    *ATTACHED.lock().unwrap() = false;
+    *IME_CONTEXT.lock().unwrap() = (String::new(), 0);
+    attach();
+    let code = try_show();
+    super::vk::log(&format!("[gpui_ohos] IME show after re-attach code={code}"));
+}
+
+/// Leave the editing state. Pairs with show().
+pub fn hide() {
+    let proxy = PROXY.load(Ordering::Relaxed) as *mut c_void;
+    if proxy.is_null() {
+        return;
+    }
+    if let Some(hide) = HIDE_TEXT_INPUT.get() {
+        let code = unsafe { hide(proxy) };
+        super::vk::log(&format!("[gpui_ohos] IME hide code={code}"));
     }
 }
 

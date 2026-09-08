@@ -16,7 +16,7 @@ pub use vk::LogFn;
 pub use inputmethod::{
     commit_text as ime_commit_text, delete_backward as ime_delete_backward,
     delete_forward as ime_delete_forward, finish_preview as ime_finish_preview,
-    preview_text as ime_preview_text,
+    hide as ime_hide, preview_text as ime_preview_text, show as ime_show,
 };
 
 /// Log a line through the host-provided hilog sink.

@@ -83,7 +83,6 @@ pub(crate) struct WindowShared {
     render_failure_logged: Cell<bool>,
     frame_count: Cell<u64>,
     atlas: Arc<OhosAtlas>,
-    framebuffer: RefCell<Vec<u8>>,
     last_scene_hash: Cell<Option<u64>>,
     #[allow(dead_code)]
     foreground_executor: ForegroundExecutor,
@@ -123,7 +122,6 @@ impl WindowShared {
             render_failure_logged: Cell::new(false),
             frame_count: Cell::new(0),
             atlas: Arc::new(OhosAtlas::new()),
-            framebuffer: RefCell::new(Vec::new()),
             last_scene_hash: Cell::new(None),
             foreground_executor,
         })
@@ -677,151 +675,5 @@ fn scene_hash(scene: &Scene) -> u64 {
         rgba.a.to_bits().hash(&mut hasher);
     }
     hasher.finish()
-}
-
-fn fill_rect(
-    fb: &mut [u8],
-    w: u32,
-    h: u32,
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-    rgba: [u8; 4],
-    bgra: bool,
-) {
-    let x0 = x0.max(0);
-    let y0 = y0.max(0);
-    let x1 = x1.min(w as i32);
-    let y1 = y1.min(h as i32);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let px = if bgra {
-        [rgba[2], rgba[1], rgba[0], rgba[3]]
-    } else {
-        rgba
-    };
-    let stride = w as usize * 4;
-    for y in y0..y1 {
-        let start = y as usize * stride + x0 as usize * 4;
-        let end = y as usize * stride + x1 as usize * 4;
-        for chunk in fb[start..end].chunks_exact_mut(4) {
-            chunk.copy_from_slice(&px);
-        }
-    }
-}
-
-/// CPU-composite the scene (solid quads then monochrome glyph sprites).
-fn composite(scene: &Scene, fb: &mut [u8], w: u32, h: u32, atlas: &OhosAtlas, bgra: bool) {
-    fill_rect(
-        fb,
-        w,
-        h,
-        0,
-        0,
-        w as i32,
-        h as i32,
-        [0x1b, 0x1b, 0x1b, 0xff],
-        bgra,
-    );
-
-    for quad in &scene.quads {
-        let Some(color) = quad.background.as_solid() else {
-            continue;
-        };
-        let rgba = color.to_rgb();
-        let a = (rgba.a * 255.0) as u8;
-        if a == 0 {
-            continue;
-        }
-        let x0 = quad.bounds.origin.x.as_f32() as i32;
-        let y0 = quad.bounds.origin.y.as_f32() as i32;
-        let x1 = x0 + quad.bounds.size.width.as_f32() as i32;
-        let y1 = y0 + quad.bounds.size.height.as_f32() as i32;
-        fill_rect(
-            fb,
-            w,
-            h,
-            x0,
-            y0,
-            x1,
-            y1,
-            [
-                (rgba.r * 255.0) as u8,
-                (rgba.g * 255.0) as u8,
-                (rgba.b * 255.0) as u8,
-                a,
-            ],
-            bgra,
-        );
-    }
-
-    if scene.monochrome_sprites.is_empty() {
-        return;
-    }
-
-    atlas.with_texture(AtlasTextureKind::Monochrome, |data, atlas_w, _atlas_h| {
-        let stride = w as usize * 4;
-        for sprite in &scene.monochrome_sprites {
-            let sx = sprite.bounds.origin.x.as_f32() as i32;
-            let sy = sprite.bounds.origin.y.as_f32() as i32;
-            let sw = sprite.bounds.size.width.as_f32() as i32;
-            let sh = sprite.bounds.size.height.as_f32() as i32;
-            if sw <= 0 || sh <= 0 {
-                continue;
-            }
-            let tx = sprite.tile.bounds.origin.x.0;
-            let ty = sprite.tile.bounds.origin.y.0;
-            let color = sprite.color.to_rgb();
-            let cr = (color.r * 255.0) as u32;
-            let cg = (color.g * 255.0) as u32;
-            let cb = (color.b * 255.0) as u32;
-            let ca = (color.a * 255.0) as u32;
-            for row in 0..sh {
-                let dy = sy + row;
-                if dy < 0 || dy >= h as i32 {
-                    continue;
-                }
-                for col in 0..sw {
-                    let dx = sx + col;
-                    if dx < 0 || dx >= w as i32 {
-                        continue;
-                    }
-                    let ax = tx + col;
-                    let ay = ty + row;
-                    if ax < 0 || ay < 0 {
-                        continue;
-                    }
-                    let Some(&coverage) = data.get(ay as usize * atlas_w as usize + ax as usize)
-                    else {
-                        continue;
-                    };
-                    if coverage == 0 {
-                        continue;
-                    }
-                    let cov = coverage as u32;
-                    let inv = 255 - cov;
-                    let i = dy as usize * stride + dx as usize * 4;
-                    let dr = fb[i] as u32;
-                    let dg = fb[i + 1] as u32;
-                    let db = fb[i + 2] as u32;
-                    let r = (cr * cov * ca / 65025 + dr * inv / 255) as u8;
-                    let g = (cg * cov * ca / 65025 + dg * inv / 255) as u8;
-                    let b = (cb * cov * ca / 65025 + db * inv / 255) as u8;
-                    if bgra {
-                        fb[i] = b;
-                        fb[i + 1] = g;
-                        fb[i + 2] = r;
-                    } else {
-                        fb[i] = r;
-                        fb[i + 1] = g;
-                        fb[i + 2] = b;
-                    }
-                    fb[i + 3] = 255;
-                }
-            }
-        }
-    });
 }
 

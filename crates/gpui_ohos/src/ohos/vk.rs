@@ -565,8 +565,6 @@ pub struct VkRenderer {
     fns: DeviceFns,
     gpa: PFN_vkGetInstanceProcAddr,
     gpd: PFN_vkGetDeviceProcAddr,
-    software: Option<SoftwareBuffer>,
-    last_hash: Option<u64>,
     text: Option<TextPipeline>,
 }
 
@@ -822,8 +820,6 @@ impl VkRenderer {
             fns,
             gpa,
             gpd,
-            software: None,
-            last_hash: None,
             text: None,
         };
 
@@ -836,12 +832,6 @@ impl VkRenderer {
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
-    }
-
-    /// True when the swapchain format is not plain RGBA8, so the CPU
-    /// compositor must emit BGRA bytes.
-    pub fn needs_bgra_swap(&self) -> bool {
-        self.format != FMT_R8G8B8A8_UNORM
     }
 
     fn create_render_pass(&mut self) -> anyhow::Result<()> {
@@ -1367,9 +1357,7 @@ const BUFFER_USAGE_VERTEX_BUFFER: u32 = 0x0080;
 const MEMORY_PROPERTY_HOST_VISIBLE: u32 = 0x0002;
 const MEMORY_PROPERTY_HOST_COHERENT: u32 = 0x0004;
 const LAYOUT_TRANSFER_DST_OPTIMAL: u32 = 7;
-const PIPELINE_STAGE_TOP_OF_PIPE: u32 = 0x1;
 const PIPELINE_STAGE_TRANSFER: u32 = 0x1000;
-const PIPELINE_STAGE_BOTTOM_OF_PIPE: u32 = 0x2000;
 const ACCESS_TRANSFER_WRITE: u32 = 0x1000;
 const QUEUE_FAMILY_IGNORED: u32 = 0xFFFF_FFFF;
 const VK_WHOLE_SIZE: u64 = !0u64;
@@ -1519,14 +1507,6 @@ type PFN_vkCmdPipelineBarrier = unsafe extern "C" fn(
     *const VkImageMemoryBarrier,
 );
 
-struct SoftwareBuffer {
-    buffer: u64,
-    #[allow(dead_code)]
-    memory: u64,
-    mapped: *mut u8,
-    size: u64,
-}
-
 impl VkRenderer {
     fn inst_proc(&self, name: &str) -> *const c_void {
         unsafe { (self.gpa)(self.instance, CString::new(name).unwrap().as_ptr()) }
@@ -1553,265 +1533,6 @@ impl VkRenderer {
         anyhow::bail!("no suitable Vulkan memory type (required {required:#x})")
     }
 
-    fn ensure_software_buffer(&mut self, size: u64) -> anyhow::Result<()> {
-        if let Some(existing) = &self.software {
-            if existing.size >= size {
-                return Ok(());
-            }
-        }
-
-        let create_buffer: PFN_vkCreateBuffer = inst_fn!(self, "vkCreateBuffer", PFN_vkCreateBuffer);
-        let get_reqs: PFN_vkGetBufferMemoryRequirements = inst_fn!(
-            self,
-            "vkGetBufferMemoryRequirements",
-            PFN_vkGetBufferMemoryRequirements
-        );
-        let alloc_mem: PFN_vkAllocateMemory = inst_fn!(self, "vkAllocateMemory", PFN_vkAllocateMemory);
-        let bind_mem: PFN_vkBindBufferMemory =
-            inst_fn!(self, "vkBindBufferMemory", PFN_vkBindBufferMemory);
-        let map_mem: PFN_vkMapMemory = inst_fn!(self, "vkMapMemory", PFN_vkMapMemory);
-
-        let bci = VkBufferCreateInfo {
-            s_type: ST_BUFFER_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            size,
-            usage: BUFFER_USAGE_TRANSFER_SRC,
-            sharing_mode: SHARING_MODE_EXCLUSIVE,
-            queue_family_index_count: 0,
-            p_queue_family_indices: std::ptr::null(),
-        };
-        let mut buffer: u64 = 0;
-        if unsafe { create_buffer(self.device, &bci, std::ptr::null(), &mut buffer) } != VK_SUCCESS {
-            anyhow::bail!("vkCreateBuffer failed");
-        }
-
-        let mut reqs = VkMemoryRequirements {
-            size: 0,
-            alignment: 0,
-            memory_type_bits: 0,
-        };
-        unsafe { get_reqs(self.device, buffer, &mut reqs) };
-        let memory_type_index = self.find_memory_type(
-            reqs.memory_type_bits,
-            MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT,
-        )?;
-        let ai = VkMemoryAllocateInfo {
-            s_type: ST_MEMORY_ALLOCATE_INFO,
-            p_next: std::ptr::null(),
-            allocation_size: reqs.size,
-            memory_type_index,
-        };
-        let mut memory: u64 = 0;
-        if unsafe { alloc_mem(self.device, &ai, std::ptr::null(), &mut memory) } != VK_SUCCESS {
-            anyhow::bail!("vkAllocateMemory failed");
-        }
-        if unsafe { bind_mem(self.device, buffer, memory, 0) } != VK_SUCCESS {
-            anyhow::bail!("vkBindBufferMemory failed");
-        }
-        let mut mapped: *mut c_void = std::ptr::null_mut();
-        if unsafe { map_mem(self.device, memory, 0, VK_WHOLE_SIZE, 0, &mut mapped) } != VK_SUCCESS {
-            anyhow::bail!("vkMapMemory failed");
-        }
-        self.software = Some(SoftwareBuffer {
-            buffer,
-            memory,
-            mapped: mapped as *mut u8,
-            size: reqs.size,
-        });
-        Ok(())
-    }
-
-    /// Present a CPU-composited RGBA frame. The hash identifies the scene, so
-    /// unchanged frames are skipped entirely.
-    pub fn render_software(&mut self, framebuffer: &[u8], hash: u64) -> anyhow::Result<()> {
-        if self.last_hash == Some(hash) {
-            return Ok(());
-        }
-        self.ensure_software_buffer(framebuffer.len() as u64)?;
-        {
-            let sw = self.software.as_ref().expect("software buffer");
-            if framebuffer.len() as u64 > sw.size {
-                anyhow::bail!("framebuffer larger than staging buffer");
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(framebuffer.as_ptr(), sw.mapped, framebuffer.len());
-            }
-        }
-
-        unsafe {
-            (self.fns.wait_for_fences)(self.device, 1, &self.in_flight, 1, u64::MAX);
-            (self.fns.reset_fences)(self.device, 1, &self.in_flight);
-        }
-
-        let mut image_index: u32 = 0;
-        let ar = unsafe {
-            (self.fns.acquire_next_image)(
-                self.device,
-                self.swapchain,
-                u64::MAX,
-                self.image_available,
-                0,
-                &mut image_index,
-            )
-        };
-        if ar == VK_ERROR_OUT_OF_DATE_KHR {
-            let (w, h) = (self.width, self.height);
-            self.resize(w, h)?;
-            return Ok(());
-        }
-        if ar != VK_SUCCESS {
-            anyhow::bail!("vkAcquireNextImageKHR failed: {ar}");
-        }
-
-        let copy_image: PFN_vkCmdCopyBufferToImage =
-            dev_fn!(self, "vkCmdCopyBufferToImage", PFN_vkCmdCopyBufferToImage);
-        let pipeline_barrier: PFN_vkCmdPipelineBarrier =
-            dev_fn!(self, "vkCmdPipelineBarrier", PFN_vkCmdPipelineBarrier);
-
-        unsafe { (self.fns.reset_command_buffer)(self.command_buffer, 0) };
-        let cbbi = VkCommandBufferBeginInfo {
-            s_type: ST_COMMAND_BUFFER_BEGIN_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            p_inheritance_info: std::ptr::null(),
-        };
-        if unsafe { (self.fns.begin_command_buffer)(self.command_buffer, &cbbi) } != VK_SUCCESS {
-            anyhow::bail!("vkBeginCommandBuffer failed");
-        }
-
-        let image = self.images[image_index as usize];
-        let range = VkImageSubresourceRange {
-            aspect_mask: ASPECT_COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-        let to_transfer = VkImageMemoryBarrier {
-            s_type: ST_IMAGE_MEMORY_BARRIER,
-            p_next: std::ptr::null(),
-            src_access_mask: 0,
-            dst_access_mask: ACCESS_TRANSFER_WRITE,
-            old_layout: LAYOUT_UNDEFINED,
-            new_layout: LAYOUT_TRANSFER_DST_OPTIMAL,
-            src_queue_family_index: QUEUE_FAMILY_IGNORED,
-            dst_queue_family_index: QUEUE_FAMILY_IGNORED,
-            image,
-            subresource_range: range,
-        };
-        unsafe {
-            pipeline_barrier(
-                self.command_buffer,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                1,
-                &to_transfer,
-            );
-        }
-
-        let region = VkBufferImageCopy {
-            buffer_offset: 0,
-            buffer_row_length: 0,
-            buffer_image_height: 0,
-            image_subresource: VkImageSubresourceLayers {
-                aspect_mask: ASPECT_COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            image_offset: VkOffset3D { x: 0, y: 0, z: 0 },
-            image_extent: VkExtent3D {
-                width: self.width,
-                height: self.height,
-                depth: 1,
-            },
-        };
-        let buffer = self.software.as_ref().expect("software buffer").buffer;
-        unsafe {
-            copy_image(
-                self.command_buffer,
-                buffer,
-                image,
-                LAYOUT_TRANSFER_DST_OPTIMAL,
-                1,
-                &region,
-            );
-        }
-
-        let to_present = VkImageMemoryBarrier {
-            s_type: ST_IMAGE_MEMORY_BARRIER,
-            p_next: std::ptr::null(),
-            src_access_mask: ACCESS_TRANSFER_WRITE,
-            dst_access_mask: 0,
-            old_layout: LAYOUT_TRANSFER_DST_OPTIMAL,
-            new_layout: LAYOUT_PRESENT_SRC,
-            src_queue_family_index: QUEUE_FAMILY_IGNORED,
-            dst_queue_family_index: QUEUE_FAMILY_IGNORED,
-            image,
-            subresource_range: range,
-        };
-        unsafe {
-            pipeline_barrier(
-                self.command_buffer,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                0,
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                1,
-                &to_present,
-            );
-            (self.fns.end_command_buffer)(self.command_buffer);
-        }
-
-        let wait_stage = [PIPELINE_STAGE_TRANSFER];
-        let cmds: [*const c_void; 1] = [self.command_buffer];
-        let si = VkSubmitInfo {
-            s_type: ST_SUBMIT_INFO,
-            p_next: std::ptr::null(),
-            wait_semaphore_count: 1,
-            p_wait_semaphores: &self.image_available,
-            p_wait_dst_stage_mask: wait_stage.as_ptr(),
-            command_buffer_count: 1,
-            p_command_buffers: cmds.as_ptr(),
-            signal_semaphore_count: 1,
-            p_signal_semaphores: &self.render_finished,
-        };
-        if unsafe { (self.fns.queue_submit)(self.queue, 1, &si, self.in_flight) } != VK_SUCCESS {
-            anyhow::bail!("vkQueueSubmit failed");
-        }
-        unsafe { (self.fns.wait_for_fences)(self.device, 1, &self.in_flight, 1, u64::MAX) };
-
-        let pi = VkPresentInfoKHR {
-            s_type: ST_PRESENT_INFO_KHR,
-            p_next: std::ptr::null(),
-            wait_semaphore_count: 1,
-            p_wait_semaphores: &self.render_finished,
-            swapchain_count: 1,
-            p_swapchains: &self.swapchain,
-            p_image_indices: &image_index,
-            p_results: std::ptr::null_mut(),
-        };
-        let pr = unsafe { (self.fns.queue_present)(self.queue, &pi) };
-        if pr == VK_ERROR_OUT_OF_DATE_KHR {
-            let (w, h) = (self.width, self.height);
-            self.resize(w, h)?;
-            return Ok(());
-        }
-        if pr != VK_SUCCESS {
-            anyhow::bail!("vkQueuePresentKHR failed: {pr}");
-        }
-        self.last_hash = Some(hash);
-        Ok(())
-    }
 }
 
 
@@ -1838,7 +1559,6 @@ const ST_PIPELINE_DYNAMIC_STATE_CREATE_INFO: u32 = 27;
 const ST_GRAPHICS_PIPELINE_CREATE_INFO: u32 = 28;
 const IMAGE_TYPE_2D: u32 = 1;
 const IMAGE_TILING_OPTIMAL: u32 = 0;
-const IMAGE_LAYOUT_PREINITIALIZED: u32 = 8;
 const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0002;
 const IMAGE_USAGE_SAMPLED: u32 = 0x0004;
 const FORMAT_R8_UNORM: u32 = 9;

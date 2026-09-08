@@ -93,17 +93,6 @@ impl OhosAtlas {
         (texture.width, texture.height)
     }
 
-    /// Borrow a texture's CPU pixels as (data, width, height).
-    pub(crate) fn with_texture<R>(
-        &self,
-        kind: AtlasTextureKind,
-        f: impl FnOnce(&[u8], u32, u32) -> R,
-    ) -> R {
-        let state = self.state.borrow();
-        let texture = &state.textures[kind as usize];
-        f(&texture.cpu, texture.width, texture.height)
-    }
-
     /// Drain dirty regions, cloning their pixel data for upload.
     pub(crate) fn take_uploads(&self) -> Vec<AtlasUpload> {
         let mut state = self.state.borrow_mut();
