@@ -166,6 +166,7 @@ pub fn pointer_move(x: f32, y: f32) {
     });
 }
 
+/// ArkUI axis events (mouse wheel / touchpad) are already in logical pixels.
 pub fn scroll(x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) {
     let phase = match phase {
         0 => crate::TouchPhase::Started,
@@ -175,8 +176,8 @@ pub fn scroll(x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) {
     with_current(|platform| {
         for window in platform.windows() {
             window.scroll(
-                crate::point(logical(x), logical(y)),
-                crate::point(logical(delta_x), logical(delta_y)),
+                crate::point(crate::px(x), crate::px(y)),
+                crate::point(crate::px(delta_x), crate::px(delta_y)),
                 phase,
             );
         }
