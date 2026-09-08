@@ -20,15 +20,21 @@ pub(crate) enum ImeCommand {
     Commit(String),
     Backspace(usize),
     DeleteForward(usize),
-    Preview(String),
+    Preview {
+        text: String,
+        start: i32,
+        end: i32,
+    },
     ClearPreview,
     MoveCursor(i32),
 }
 
 static QUEUE: Mutex<Vec<ImeCommand>> = Mutex::new(Vec::new());
 static ATTACHED: Mutex<bool> = Mutex::new(false);
-/// (full text, caret index in UTF-16) mirrored from the focused editor.
-static IME_CONTEXT: Mutex<(String, usize)> = Mutex::new((String::new(), 0));
+/// (full text, caret index in UTF-16, absolute caret rect) mirrored from the
+/// focused editor.
+static IME_CONTEXT: Mutex<(String, usize, (f64, f64, f64, f64))> =
+    Mutex::new((String::new(), 0, (0.0, 0.0, 2.0, 20.0)));
 static PROXY: AtomicUsize = AtomicUsize::new(0);
 static SET_INPUT_TYPE: OnceLock<unsafe extern "C" fn(*mut c_void, i32) -> i32> = OnceLock::new();
 static NOTIFY_SELECTION: OnceLock<
@@ -76,13 +82,14 @@ unsafe extern "C" fn on_preview(
     _proxy: *mut c_void,
     text: *const u16,
     length: usize,
-    _start: i32,
-    _end: i32,
+    start: i32,
+    end: i32,
 ) -> i32 {
-    QUEUE
-        .lock()
-        .unwrap()
-        .push(ImeCommand::Preview(utf16_to_string(text, length)));
+    QUEUE.lock().unwrap().push(ImeCommand::Preview {
+        text: utf16_to_string(text, length),
+        start,
+        end,
+    });
     0
 }
 
@@ -317,7 +324,7 @@ pub fn show() {
     // loses focus, and a detached client rejects ShowTextInput. Bind again.
     super::vk::log(&format!("[gpui_ohos] IME show failed code={code}; re-attaching"));
     *ATTACHED.lock().unwrap() = false;
-    *IME_CONTEXT.lock().unwrap() = (String::new(), 0);
+    *IME_CONTEXT.lock().unwrap() = (String::new(), 0, (0.0, 0.0, 2.0, 20.0));
     attach();
     let code = try_show();
     super::vk::log(&format!("[gpui_ohos] IME show after re-attach code={code}"));
@@ -341,14 +348,15 @@ pub(crate) fn drain() -> Vec<ImeCommand> {
 
 /// Mirror the focused editor's text and caret to the input method. The IME
 /// needs these notifications to start composing.
-pub(crate) fn update_context(text: &str, caret: usize) {
+pub(crate) fn update_context(text: &str, caret: usize, cursor: (f64, f64, f64, f64)) {
     {
         let mut context = IME_CONTEXT.lock().unwrap();
-        if context.0 == text && context.1 == caret {
+        if context.0 == text && context.1 == caret && context.2 == cursor {
             return;
         }
         context.0 = text.to_string();
         context.1 = caret;
+        context.2 = cursor;
     }
     let proxy = PROXY.load(Ordering::Relaxed) as *mut c_void;
     if proxy.is_null() {
@@ -366,7 +374,7 @@ pub(crate) fn update_context(text: &str, caret: usize) {
             );
         }
         if let (Some(create), Some(notify)) = (CURSOR_CREATE.get(), NOTIFY_CURSOR.get()) {
-            let info = create(0.0, 0.0, 2.0, 20.0);
+            let info = create(cursor.0, cursor.1, cursor.2, cursor.3);
             if !info.is_null() {
                 notify(proxy, info);
             }
@@ -387,7 +395,11 @@ pub fn delete_forward(length: usize) {
 }
 
 pub fn preview_text(text: &str) {
-    QUEUE.lock().unwrap().push(ImeCommand::Preview(text.to_string()));
+    QUEUE.lock().unwrap().push(ImeCommand::Preview {
+        text: text.to_string(),
+        start: -1,
+        end: -1,
+    });
 }
 
 pub fn finish_preview() {

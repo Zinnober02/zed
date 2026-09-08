@@ -1,4 +1,11 @@
-use std::{cell::RefCell, ffi::c_void, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    ffi::c_void,
+    path::PathBuf,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use futures::channel::oneshot;
@@ -13,6 +20,7 @@ use crate::{
 
 use super::dispatcher::OhosDispatcher;
 use super::display::OhosDisplay;
+use super::host;
 use super::keyboard::{OhosKeyboardLayout, OhosKeyboardMapper};
 use super::text_system::OhosTextSystem;
 use super::window::{OhosWindow, WindowShared};
@@ -46,6 +54,22 @@ pub(crate) struct OhosPlatform {
     surface: Rc<RefCell<SurfaceState>>,
     pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
     windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
+    /// GPUI window handles paired with their platform window, in open order.
+    handles: RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>,
+    menus: RefCell<Vec<OwnedMenu>>,
+    app_menu_action: RefCell<Option<Box<dyn FnMut(&dyn Action)>>>,
+    app_menu_will_open: RefCell<Option<Box<dyn FnMut()>>>,
+    app_menu_validate: RefCell<Option<Box<dyn FnMut(&dyn Action) -> bool>>>,
+    open_urls: RefCell<Option<Box<dyn FnMut(Vec<String>)>>>,
+    on_quit: RefCell<Option<Box<dyn FnMut() -> bool>>>,
+    on_reopen: RefCell<Option<Box<dyn FnMut()>>>,
+    on_system_wake: RefCell<Option<Box<dyn FnMut()>>>,
+    appearance: Cell<WindowAppearance>,
+    pending_picks: RefCell<HashMap<u64, oneshot::Sender<Result<Option<Vec<PathBuf>>>>>>,
+    pending_new_paths: RefCell<HashMap<u64, oneshot::Sender<Result<Option<PathBuf>>>>>,
+    next_pick_id: Cell<u64>,
+    /// Window rect in physical pixels: (x, y, width, height).
+    window_rect: Cell<(f32, f32, f32, f32)>,
 }
 
 impl OhosPlatform {
@@ -54,6 +78,13 @@ impl OhosPlatform {
         let dispatcher = Arc::new(OhosDispatcher::new(main_sender));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
+        let appearance = match host::query(host::query::COLOR_MODE, "").as_deref() {
+            Some("0") => WindowAppearance::Dark,
+            _ => WindowAppearance::Light,
+        };
+        let window_rect = host::query(host::query::WINDOW_RECT, "")
+            .and_then(|value| parse_rect(&value))
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
         Ok(Self {
             dispatcher,
             background_executor,
@@ -63,7 +94,114 @@ impl OhosPlatform {
             surface: Rc::new(RefCell::new(SurfaceState::default())),
             pending_launch: RefCell::new(None),
             windows: Rc::new(RefCell::new(Vec::new())),
+            handles: RefCell::new(Vec::new()),
+            menus: RefCell::new(Vec::new()),
+            app_menu_action: RefCell::new(None),
+            app_menu_will_open: RefCell::new(None),
+            app_menu_validate: RefCell::new(None),
+            open_urls: RefCell::new(None),
+            on_quit: RefCell::new(None),
+            on_reopen: RefCell::new(None),
+            on_system_wake: RefCell::new(None),
+            appearance: Cell::new(appearance),
+            pending_picks: RefCell::new(HashMap::new()),
+            pending_new_paths: RefCell::new(HashMap::new()),
+            next_pick_id: Cell::new(1),
+            window_rect: Cell::new(window_rect),
         })
+    }
+
+    /// Host-pushed events: focus, window status, color mode, lifecycle, picker
+    /// results. Everything arrives on the ArkUI UI thread.
+    pub(crate) fn handle_host_event(&self, kind: i32, arg: &str) {
+        super::vk::log(&format!("[gpui_ohos] host event {kind}: {arg}"));
+        match kind {
+            host::event::APPEARANCE => {
+                let appearance = if arg == "0" {
+                    WindowAppearance::Dark
+                } else {
+                    WindowAppearance::Light
+                };
+                if self.appearance.get() != appearance {
+                    self.appearance.set(appearance);
+                    for window in self.windows() {
+                        window.set_appearance(appearance);
+                    }
+                }
+            }
+            host::event::FOCUS => {
+                let active = arg != "0";
+                for window in self.windows() {
+                    window.set_active(active);
+                }
+            }
+            host::event::WINDOW_STATUS => {
+                // 1 full screen, 2 maximize, 3 minimize, 4 floating, 5 split.
+                // On 2in1 the system reports MAXIMIZE for a screen-filling
+                // window, which is what GPUI's titlebar treats as fullscreen.
+                let fullscreen = arg == "1" || arg == "2";
+                for window in self.windows() {
+                    window.set_fullscreen(fullscreen);
+                }
+            }
+            host::event::WINDOW_RECT => {
+                if let Some(rect) = parse_rect(arg) {
+                    self.window_rect.set(rect);
+                }
+            }
+            host::event::LIFECYCLE => match arg {
+                "background" | "destroy" => {
+                    if let Some(mut callback) = self.on_quit.borrow_mut().take() {
+                        let _ = callback();
+                        *self.on_quit.borrow_mut() = Some(callback);
+                    }
+                }
+                "newwant" => {
+                    if let Some(mut callback) = self.on_reopen.borrow_mut().take() {
+                        callback();
+                        *self.on_reopen.borrow_mut() = Some(callback);
+                    }
+                }
+                "foreground" => {
+                    if let Some(mut callback) = self.on_system_wake.borrow_mut().take() {
+                        callback();
+                        *self.on_system_wake.borrow_mut() = Some(callback);
+                    }
+                }
+                _ => {}
+            },
+            host::event::PICK_RESULT => {
+                let (token, rest) = arg.split_once('\t').unwrap_or((arg, ""));
+                let kind = token.chars().next().unwrap_or('p');
+                let id: u64 = token[1..].parse().unwrap_or(0);
+                if kind == 'n' {
+                    if let Some(sender) = self.pending_new_paths.borrow_mut().remove(&id) {
+                        let path = rest
+                            .lines()
+                            .find(|line| !line.is_empty())
+                            .map(PathBuf::from);
+                        let _ = sender.send(Ok(path));
+                    }
+                } else if let Some(sender) = self.pending_picks.borrow_mut().remove(&id) {
+                    let paths: Vec<PathBuf> = rest
+                        .lines()
+                        .filter(|line| !line.is_empty())
+                        .map(PathBuf::from)
+                        .collect();
+                    let answer = if paths.is_empty() { Ok(None) } else { Ok(Some(paths)) };
+                    let _ = sender.send(answer);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn appearance(&self) -> WindowAppearance {
+        self.appearance.get()
+    }
+
+    pub(crate) fn window_rect(&self) -> (f32, f32, f32, f32) {
+        self.window_rect.get()
     }
 
     pub(crate) fn set_surface(&self, window: *mut c_void, width: u32, height: u32) {
@@ -126,11 +264,18 @@ impl OhosPlatform {
         self.windows.borrow().clone()
     }
 
-    /// Text and caret of the focused editor, for IME context notifications.
-    pub(crate) fn ime_context(&self) -> Option<(String, usize)> {
+    /// Text, caret and absolute caret rect (physical pixels) of the focused
+    /// editor, for IME context notifications.
+    pub(crate) fn ime_context(&self) -> Option<(String, usize, (f64, f64, f64, f64))> {
+        let (rect_x, rect_y, _, _) = self.window_rect.get();
+        let scale = super::window::SCALE as f64;
         for window in self.windows() {
-            if let Some(context) = window.ime_context() {
-                return Some(context);
+            if let Some((text, caret, cursor)) = window.ime_context() {
+                let left = rect_x as f64 + cursor.origin.x.as_f32() as f64 * scale;
+                let top = rect_y as f64 + cursor.origin.y.as_f32() as f64 * scale;
+                let width = cursor.size.width.as_f32() as f64 * scale;
+                let height = cursor.size.height.as_f32() as f64 * scale;
+                return Some((text, caret, (left, top, width, height)));
             }
         }
         None
@@ -171,6 +316,43 @@ impl OhosPlatform {
             }
         }
     }
+}
+
+/// Map a GPUI cursor style to the OHOS PointerStyle enum member name.
+fn cursor_style_name(style: CursorStyle) -> &'static str {
+    match style {
+        CursorStyle::Arrow => "DEFAULT",
+        CursorStyle::IBeam => "TEXT_CURSOR",
+        CursorStyle::Crosshair => "CROSS",
+        CursorStyle::ClosedHand => "HAND_GRABBING",
+        CursorStyle::OpenHand => "HAND_OPEN",
+        CursorStyle::PointingHand => "HAND_POINTING",
+        CursorStyle::ResizeLeft => "WEST",
+        CursorStyle::ResizeRight => "EAST",
+        CursorStyle::ResizeLeftRight => "WEST_EAST",
+        CursorStyle::ResizeUp => "NORTH",
+        CursorStyle::ResizeDown => "SOUTH",
+        CursorStyle::ResizeUpDown => "NORTH_SOUTH",
+        CursorStyle::ResizeUpLeftDownRight => "NORTH_WEST_SOUTH_EAST",
+        CursorStyle::ResizeUpRightDownLeft => "NORTH_EAST_SOUTH_WEST",
+        CursorStyle::ResizeColumn => "RESIZE_LEFT_RIGHT",
+        CursorStyle::ResizeRow => "RESIZE_UP_DOWN",
+        CursorStyle::IBeamCursorForVerticalLayout => "HORIZONTAL_TEXT_CURSOR",
+        CursorStyle::OperationNotAllowed => "CURSOR_FORBID",
+        CursorStyle::DragLink => "MOVE",
+        CursorStyle::DragCopy => "CURSOR_COPY",
+        CursorStyle::ContextualMenu => "CURSOR_CIRCLE",
+    }
+}
+
+/// Parse a host rect string of the form "x,y,w,h" (physical pixels).
+fn parse_rect(value: &str) -> Option<(f32, f32, f32, f32)> {
+    let mut parts = value.split(',');
+    let x = parts.next()?.trim().parse().ok()?;
+    let y = parts.next()?.trim().parse().ok()?;
+    let width = parts.next()?.trim().parse().ok()?;
+    let height = parts.next()?.trim().parse().ok()?;
+    Some((x, y, width, height))
 }
 
 impl Platform for OhosPlatform {
@@ -223,11 +405,29 @@ impl Platform for OhosPlatform {
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
-        None
+        let active = self
+            .windows()
+            .into_iter()
+            .find(|window| window.is_active())?;
+        self.handles
+            .borrow()
+            .iter()
+            .find(|(_, shared)| {
+                shared
+                    .upgrade()
+                    .map_or(false, |shared| Rc::ptr_eq(&shared, &active))
+            })
+            .map(|(handle, _)| *handle)
     }
 
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
-        None
+        Some(
+            self.handles
+                .borrow()
+                .iter()
+                .map(|(handle, _)| *handle)
+                .collect(),
+        )
     }
 
     fn is_screen_capture_supported(&self) -> bool {
@@ -245,11 +445,18 @@ impl Platform for OhosPlatform {
 
     fn open_window(
         &self,
-        _handle: AnyWindowHandle,
+        handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         if !self.surface.borrow().valid {
             anyhow::bail!("OHOS surface is not available yet");
+        }
+        if let Some(title) = options
+            .titlebar
+            .as_ref()
+            .and_then(|titlebar| titlebar.title.as_ref())
+        {
+            host::window_op(host::op::SET_TITLE, title);
         }
         let shared = WindowShared::new(
             self.surface.clone(),
@@ -257,16 +464,23 @@ impl Platform for OhosPlatform {
             self.foreground_executor.clone(),
         );
         self.windows.borrow_mut().push(shared.clone());
+        self.handles
+            .borrow_mut()
+            .push((handle, Rc::downgrade(&shared)));
         Ok(Box::new(OhosWindow::new(shared)))
     }
 
     fn window_appearance(&self) -> WindowAppearance {
-        WindowAppearance::Light
+        self.appearance.get()
     }
 
-    fn open_url(&self, _url: &str) {}
+    fn open_url(&self, url: &str) {
+        host::window_op(host::op::OPEN_URL, url);
+    }
 
-    fn on_open_urls(&self, _callback: Box<dyn FnMut(Vec<String>)>) {}
+    fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
+        *self.open_urls.borrow_mut() = Some(callback);
+    }
 
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
         Task::ready(Err(anyhow::anyhow!(
@@ -276,50 +490,85 @@ impl Platform for OhosPlatform {
 
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
-        let (tx, rx) = oneshot::channel();
-        tx.send(Ok(None)).ok();
-        rx
+        let (sender, receiver) = oneshot::channel();
+        let id = self.next_pick_id.get();
+        self.next_pick_id.set(id + 1);
+        self.pending_picks.borrow_mut().insert(id, sender);
+        let payload = format!(
+            "p{id}|{}|{}|{}",
+            options.files as u8, options.directories as u8, options.multiple as u8
+        );
+        host::window_op(host::op::PICK_PATHS, &payload);
+        receiver
     }
 
     fn prompt_for_new_path(
         &self,
-        _directory: &std::path::Path,
-        _suggested_name: Option<&str>,
+        directory: &std::path::Path,
+        suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
-        let (tx, rx) = oneshot::channel();
-        tx.send(Ok(None)).ok();
-        rx
+        let (sender, receiver) = oneshot::channel();
+        let id = self.next_pick_id.get();
+        self.next_pick_id.set(id + 1);
+        self.pending_new_paths.borrow_mut().insert(id, sender);
+        let payload = format!(
+            "n{id}|{}|{}",
+            directory.display(),
+            suggested_name.unwrap_or("")
+        );
+        host::window_op(host::op::PICK_NEW_PATH, &payload);
+        receiver
     }
 
     fn can_select_mixed_files_and_dirs(&self) -> bool {
         false
     }
 
-    fn reveal_path(&self, _path: &std::path::Path) {}
+    fn reveal_path(&self, path: &std::path::Path) {
+        host::window_op(host::op::REVEAL_PATH, &path.display().to_string());
+    }
 
-    fn open_with_system(&self, _path: &std::path::Path) {}
+    fn open_with_system(&self, path: &std::path::Path) {
+        host::window_op(host::op::OPEN_WITH, &path.display().to_string());
+    }
 
-    fn on_quit(&self, _callback: Box<dyn FnMut() -> bool>) {}
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
+        *self.on_quit.borrow_mut() = Some(callback);
+    }
 
-    fn on_reopen(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_reopen(&self, callback: Box<dyn FnMut()>) {
+        *self.on_reopen.borrow_mut() = Some(callback);
+    }
 
-    fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        *self.on_system_wake.borrow_mut() = Some(callback);
+    }
 
-    fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {}
+    fn set_menus(&self, menus: Vec<Menu>, _keymap: &Keymap) {
+        // OHOS has no system menu bar for application windows; keep the menus
+        // so the application can render its own (see get_menus).
+        *self.menus.borrow_mut() = menus.into_iter().map(Menu::owned).collect();
+    }
 
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
-        None
+        Some(self.menus.borrow().clone())
     }
 
     fn set_dock_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {}
 
-    fn on_app_menu_action(&self, _callback: Box<dyn FnMut(&dyn Action)>) {}
+    fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>) {
+        *self.app_menu_action.borrow_mut() = Some(callback);
+    }
 
-    fn on_will_open_app_menu(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_will_open_app_menu(&self, callback: Box<dyn FnMut()>) {
+        *self.app_menu_will_open.borrow_mut() = Some(callback);
+    }
 
-    fn on_validate_app_menu_command(&self, _callback: Box<dyn FnMut(&dyn Action) -> bool>) {}
+    fn on_validate_app_menu_command(&self, callback: Box<dyn FnMut(&dyn Action) -> bool>) {
+        *self.app_menu_validate.borrow_mut() = Some(callback);
+    }
 
     fn compositor_name(&self) -> &'static str {
         "OHOS"
@@ -335,7 +584,9 @@ impl Platform for OhosPlatform {
         ))
     }
 
-    fn set_cursor_style(&self, _style: CursorStyle) {}
+    fn set_cursor_style(&self, style: CursorStyle) {
+        host::window_op(host::op::SET_CURSOR, cursor_style_name(style));
+    }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
         false

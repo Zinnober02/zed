@@ -12,6 +12,8 @@
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::GpuSpecs;
+
 pub type LogFn = extern "C" fn(*const c_char);
 
 static LOG: AtomicUsize = AtomicUsize::new(0);
@@ -832,6 +834,48 @@ impl VkRenderer {
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    fn read_gpu_specs(&self) -> anyhow::Result<GpuSpecs> {
+        type PFN_vkGetPhysicalDeviceProperties = unsafe extern "C" fn(u64, *mut c_void);
+        let proc = self.inst_proc("vkGetPhysicalDeviceProperties");
+        if proc.is_null() {
+            anyhow::bail!("missing Vulkan symbol: vkGetPhysicalDeviceProperties");
+        }
+        let get_props: PFN_vkGetPhysicalDeviceProperties = unsafe { std::mem::transmute(proc) };
+        // VkPhysicalDeviceProperties is much larger than the fields read here,
+        // so a generously sized buffer keeps the driver from writing past it.
+        let mut raw = [0u8; 2048];
+        unsafe { get_props(self.physical_device, raw.as_mut_ptr() as *mut c_void) };
+        let api_version = u32::from_ne_bytes(raw[0..4].try_into().unwrap());
+        let driver_version = u32::from_ne_bytes(raw[4..8].try_into().unwrap());
+        let vendor_id = u32::from_ne_bytes(raw[8..12].try_into().unwrap());
+        let device_id = u32::from_ne_bytes(raw[12..16].try_into().unwrap());
+        let device_type = u32::from_ne_bytes(raw[16..20].try_into().unwrap());
+        let name_bytes = &raw[20..276];
+        let end = name_bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(name_bytes.len());
+        let device_name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
+        Ok(GpuSpecs {
+            // VK_PHYSICAL_DEVICE_TYPE_CPU = 4
+            is_software_emulated: device_type == 4,
+            device_name,
+            driver_name: format!(
+                "Vulkan {}.{}.{}",
+                api_version >> 22,
+                (api_version >> 12) & 0x3ff,
+                api_version & 0xfff
+            ),
+            driver_info: format!(
+                "vendor=0x{vendor_id:04x} device=0x{device_id:04x} driver=0x{driver_version:08x}"
+            ),
+        })
+    }
+
+    pub fn gpu_specs(&self) -> Option<GpuSpecs> {
+        self.read_gpu_specs().ok()
     }
 
     fn create_render_pass(&mut self) -> anyhow::Result<()> {

@@ -24,6 +24,7 @@ use crate::{
 
 use super::atlas::OhosAtlas;
 use super::display::OhosDisplay;
+use super::host;
 use super::platform::SurfaceState;
 use super::vk::VkRenderer;
 
@@ -80,6 +81,10 @@ pub(crate) struct WindowShared {
     modifiers: Cell<Modifiers>,
     active: Cell<bool>,
     hovered: Cell<bool>,
+    fullscreen: Cell<bool>,
+    appearance: Cell<WindowAppearance>,
+    /// Caret rectangle in logical window coordinates, for the IME panel.
+    ime_cursor: Cell<Bounds<Pixels>>,
     render_failure_logged: Cell<bool>,
     frame_count: Cell<u64>,
     atlas: Arc<OhosAtlas>,
@@ -119,6 +124,15 @@ impl WindowShared {
             modifiers: Cell::new(Modifiers::default()),
             active: Cell::new(true),
             hovered: Cell::new(true),
+            fullscreen: Cell::new(false),
+            appearance: Cell::new(WindowAppearance::Light),
+            ime_cursor: Cell::new(Bounds::new(
+                point(px(0.0), px(0.0)),
+                Size {
+                    width: px(2.0),
+                    height: px(20.0),
+                },
+            )),
             render_failure_logged: Cell::new(false),
             frame_count: Cell::new(0),
             atlas: Arc::new(OhosAtlas::new()),
@@ -138,14 +152,48 @@ impl WindowShared {
         self.callbacks.borrow_mut().request_frame = callback;
     }
 
-    /// Current editor text and caret (UTF-16), mirrored to the input method.
-    pub(crate) fn ime_context(&self) -> Option<(String, usize)> {
+    /// Current editor text, caret (UTF-16) and caret rect, mirrored to the
+    /// input method.
+    pub(crate) fn ime_context(&self) -> Option<(String, usize, Bounds<Pixels>)> {
+        let cursor = self.ime_cursor.get();
         let mut guard = self.input_handler.borrow_mut();
         let handler = guard.as_mut()?;
         let mut adjusted = None;
         let text = handler.text_for_range(0..usize::MAX, &mut adjusted)?;
         let selection = handler.selected_text_range(true)?;
-        Some((text, selection.range.end))
+        Some((text, selection.range.end, cursor))
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.get()
+    }
+
+    pub(crate) fn set_active(&self, active: bool) {
+        if self.active.get() == active {
+            return;
+        }
+        self.active.set(active);
+        let mut callback = self.callbacks.borrow_mut().active_status_change.take();
+        if let Some(callback) = callback.as_mut() {
+            callback(active);
+        }
+        self.callbacks.borrow_mut().active_status_change = callback;
+    }
+
+    pub(crate) fn set_fullscreen(&self, fullscreen: bool) {
+        self.fullscreen.set(fullscreen);
+    }
+
+    pub(crate) fn set_appearance(&self, appearance: WindowAppearance) {
+        if self.appearance.get() == appearance {
+            return;
+        }
+        self.appearance.set(appearance);
+        let mut callback = self.callbacks.borrow_mut().appearance_changed.take();
+        if let Some(callback) = callback.as_mut() {
+            callback();
+        }
+        self.callbacks.borrow_mut().appearance_changed = callback;
     }
 
     /// Apply an IME command to the focused input handler.
@@ -193,8 +241,14 @@ impl WindowShared {
                     handler.replace_text_in_range(Some(start..end), "");
                 }
             }
-            ImeCommand::Preview(text) => {
-                handler.replace_and_mark_text_in_range(None, text, None);
+            ImeCommand::Preview { text, start, end } => {
+                // start/end are UTF-16 offsets; -1/-1 means "the whole preview".
+                let range = if *start < 0 || *end < 0 {
+                    handler.marked_text_range()
+                } else {
+                    Some(*start as usize..*end as usize)
+                };
+                handler.replace_and_mark_text_in_range(range, text, None);
             }
             ImeCommand::ClearPreview => {
                 handler.unmark_text();
@@ -257,6 +311,12 @@ impl WindowShared {
                     renderer.size().0,
                     renderer.size().1
                 ));
+                if let Some(specs) = renderer.gpu_specs() {
+                    super::vk::log(&format!(
+                        "[gpui_ohos] GPU: {} | {} | {}",
+                        specs.device_name, specs.driver_name, specs.driver_info
+                    ));
+                }
                 *self.renderer.borrow_mut() = Some(renderer);
                 true
             }
@@ -406,7 +466,7 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn appearance(&self) -> WindowAppearance {
-        WindowAppearance::Light
+        self.shared.appearance.get()
     }
 
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
@@ -464,18 +524,27 @@ impl PlatformWindow for OhosWindow {
         WindowBackgroundAppearance::Opaque
     }
 
-    fn set_title(&mut self, _title: &str) {}
+    fn set_title(&mut self, title: &str) {
+        host::window_op(host::op::SET_TITLE, title);
+    }
 
     fn set_background_appearance(&self, _appearance: WindowBackgroundAppearance) {}
 
-    fn minimize(&self) {}
+    fn minimize(&self) {
+        host::window_op(host::op::MINIMIZE, "");
+    }
 
-    fn zoom(&self) {}
+    fn zoom(&self) {
+        host::window_op(host::op::MAXIMIZE, "");
+    }
 
-    fn toggle_fullscreen(&self) {}
+    fn toggle_fullscreen(&self) {
+        let target = if self.shared.fullscreen.get() { "0" } else { "1" };
+        host::window_op(host::op::SET_FULLSCREEN, target);
+    }
 
     fn is_fullscreen(&self) -> bool {
-        true
+        self.shared.fullscreen.get()
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
@@ -534,10 +603,16 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        None
+        self.shared
+            .renderer
+            .borrow()
+            .as_ref()
+            .and_then(|renderer| renderer.gpu_specs())
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        self.shared.ime_cursor.set(bounds);
+    }
 
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
@@ -545,20 +620,40 @@ impl PlatformWindow for OhosWindow {
 
     fn window_controls(&self) -> WindowControls {
         WindowControls {
-            fullscreen: false,
-            maximize: false,
+            fullscreen: true,
+            maximize: true,
             minimize: false,
             window_menu: false,
         }
     }
 
-    fn start_window_resize(&self, _edge: ResizeEdge) {}
+    fn start_window_resize(&self, edge: ResizeEdge) {
+        let value = match edge {
+            ResizeEdge::Top => "top",
+            ResizeEdge::TopRight => "top-right",
+            ResizeEdge::Right => "right",
+            ResizeEdge::BottomRight => "bottom-right",
+            ResizeEdge::Bottom => "bottom",
+            ResizeEdge::BottomLeft => "bottom-left",
+            ResizeEdge::Left => "left",
+            ResizeEdge::TopLeft => "top-left",
+        };
+        host::window_op(host::op::START_RESIZE, value);
+    }
 
-    fn request_decorations(&self, _decorations: crate::WindowDecorations) {}
+    fn request_decorations(&self, decorations: crate::WindowDecorations) {
+        let value = match decorations {
+            crate::WindowDecorations::Client => "client",
+            crate::WindowDecorations::Server => "server",
+        };
+        host::window_op(host::op::SET_DECOR, value);
+    }
 
     fn show_window_menu(&self, _position: Point<Pixels>) {}
 
-    fn start_window_move(&self) {}
+    fn start_window_move(&self) {
+        host::window_op(host::op::START_MOVE, "");
+    }
 }
 
 /// Solid quads become clear rectangles; glyph sprites become textured quads.

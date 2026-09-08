@@ -2,6 +2,7 @@ mod atlas;
 mod clipboard;
 mod dispatcher;
 mod display;
+mod host;
 mod inputmethod;
 mod keyboard;
 mod platform;
@@ -12,6 +13,8 @@ mod window;
 use std::{cell::RefCell, ffi::c_void, rc::{Rc, Weak}};
 
 pub use vk::LogFn;
+
+pub use host::HostOps;
 
 pub use inputmethod::{
     commit_text as ime_commit_text, delete_backward as ime_delete_backward,
@@ -119,6 +122,16 @@ where
     0
 }
 
+/// Install the host function pointers supplied by the ArkTS layer.
+pub fn set_host_ops(ops: HostOps) {
+    host::set_ops(ops);
+}
+
+/// Handle an event pushed from the ArkTS host.
+pub fn host_event(kind: i32, arg: &str) {
+    with_current(|platform| platform.handle_host_event(kind, arg));
+}
+
 /// XComponent surface changed size (rotation / resize).
 pub fn surface_resized(width: u32, height: u32) {
     vk::log(&format!("[gpui_ohos] surface_resized {}x{}", width, height));
@@ -137,8 +150,8 @@ pub fn tick() {
         for command in inputmethod::drain() {
             platform.handle_ime(command);
         }
-        if let Some((text, caret)) = platform.ime_context() {
-            inputmethod::update_context(&text, caret);
+        if let Some((text, caret, cursor)) = platform.ime_context() {
+            inputmethod::update_context(&text, caret, cursor);
         }
         platform.tick();
     });
