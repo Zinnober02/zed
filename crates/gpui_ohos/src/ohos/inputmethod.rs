@@ -22,6 +22,7 @@ pub(crate) enum ImeCommand {
     DeleteForward(usize),
     Preview(String),
     ClearPreview,
+    MoveCursor(i32),
 }
 
 static QUEUE: Mutex<Vec<ImeCommand>> = Mutex::new(Vec::new());
@@ -132,6 +133,14 @@ unsafe extern "C" fn on_get_right_text(
     write_text_slice(number, text, length, false);
 }
 
+unsafe extern "C" fn on_enter_key(_proxy: *mut c_void, _kind: i32) {
+    QUEUE.lock().unwrap().push(ImeCommand::Commit("\n".to_string()));
+}
+
+unsafe extern "C" fn on_move_cursor(_proxy: *mut c_void, direction: i32) {
+    QUEUE.lock().unwrap().push(ImeCommand::MoveCursor(direction));
+}
+
 unsafe extern "C" fn on_noop(_proxy: *mut c_void) {}
 unsafe extern "C" fn on_noop_i32(_proxy: *mut c_void, _value: i32) {}
 unsafe extern "C" fn on_noop_two(_proxy: *mut c_void, _a: i32, _b: i32) {}
@@ -235,8 +244,8 @@ pub(crate) fn attach() {
         set_finish(proxy, on_finish_preview as *const c_void);
         set_config(proxy, on_get_text_config as *const c_void);
         set_status(proxy, on_noop_i32 as *const c_void);
-        set_enter(proxy, on_noop_i32 as *const c_void);
-        set_move(proxy, on_noop_i32 as *const c_void);
+        set_enter(proxy, on_enter_key as *const c_void);
+        set_move(proxy, on_move_cursor as *const c_void);
         set_selection(proxy, on_noop_two as *const c_void);
         set_extend(proxy, on_noop_i32 as *const c_void);
         set_left(proxy, on_get_left_text as *const c_void);
@@ -244,7 +253,7 @@ pub(crate) fn attach() {
         set_index(proxy, on_text_index_at_cursor as *const c_void);
         set_private(proxy, on_private_command as *const c_void);
 
-        let options = options_create(false);
+        let options = options_create(true);
         let mut proxy_out: *mut c_void = std::ptr::null_mut();
         let code = attach(proxy, options, &mut proxy_out);
         super::vk::log(&format!("[gpui_ohos] IME attach code={code}"));

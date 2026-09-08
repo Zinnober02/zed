@@ -153,6 +153,25 @@ impl WindowShared {
     /// Apply an IME command to the focused input handler.
     pub(crate) fn handle_ime(&self, command: &super::inputmethod::ImeCommand) {
         use super::inputmethod::ImeCommand;
+        if let ImeCommand::MoveCursor(direction) = command {
+            let key = match direction {
+                1 => "up",
+                2 => "down",
+                3 => "left",
+                4 => "right",
+                _ => return,
+            };
+            self.dispatch_input(PlatformInput::KeyDown(crate::KeyDownEvent {
+                keystroke: crate::Keystroke {
+                    modifiers: Default::default(),
+                    key: key.to_string(),
+                    key_char: None,
+                },
+                is_held: false,
+                prefer_character_input: false,
+            }));
+            return;
+        }
         let mut guard = self.input_handler.borrow_mut();
         let Some(handler) = guard.as_mut() else {
             return;
@@ -182,6 +201,7 @@ impl WindowShared {
             ImeCommand::ClearPreview => {
                 handler.unmark_text();
             }
+            ImeCommand::MoveCursor(_) => {}
         }
     }
 
