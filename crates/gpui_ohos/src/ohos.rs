@@ -84,7 +84,6 @@ where
     ));
     let platform = new_platform();
     platform.set_surface(window, width, height);
-    inputmethod::attach();
     {
         let text_system = platform.text_system();
         let names = text_system.all_font_names();
@@ -105,6 +104,7 @@ where
     }
     Application::with_platform(platform.clone() as Rc<dyn Platform>).run(app);
     platform.launch();
+    inputmethod::attach();
     platform.request_frames();
     vk::log(&format!(
         "[gpui_ohos] launched, windows={}",

@@ -5,7 +5,7 @@
 //! forwards them to the focused window's PlatformInputHandler.
 
 use std::ffi::{c_char, c_int, c_void, CString};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
@@ -23,6 +23,7 @@ pub(crate) enum ImeCommand {
 
 static QUEUE: Mutex<Vec<ImeCommand>> = Mutex::new(Vec::new());
 static ATTACHED: Mutex<bool> = Mutex::new(false);
+static SET_INPUT_TYPE: OnceLock<unsafe extern "C" fn(*mut c_void, i32) -> i32> = OnceLock::new();
 
 fn utf16_to_string(text: *const u16, length: usize) -> String {
     if text.is_null() || length == 0 {
@@ -60,6 +61,13 @@ unsafe extern "C" fn on_preview(
     0
 }
 
+unsafe extern "C" fn on_get_text_config(_proxy: *mut c_void, config: *mut c_void) {
+    if let Some(set) = SET_INPUT_TYPE.get() {
+        // 1 = IME_TEXT_INPUT_TYPE_MULTILINE
+        set(config, 1);
+    }
+}
+
 unsafe extern "C" fn on_finish_preview(_proxy: *mut c_void) {
     QUEUE.lock().unwrap().push(ImeCommand::ClearPreview);
 }
@@ -95,6 +103,8 @@ pub(crate) fn attach() {
         type ProxySetDelete = unsafe extern "C" fn(*mut c_void, *const c_void) -> i32;
         type ProxySetPreview = unsafe extern "C" fn(*mut c_void, *const c_void) -> i32;
         type ProxySetFinish = unsafe extern "C" fn(*mut c_void, *const c_void) -> i32;
+        type ProxySetTextConfig = unsafe extern "C" fn(*mut c_void, *const c_void) -> i32;
+        type SetInputType = unsafe extern "C" fn(*mut c_void, i32) -> i32;
         type OptionsCreate = unsafe extern "C" fn(bool) -> *mut c_void;
         type ControllerAttach =
             unsafe extern "C" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32;
@@ -109,6 +119,11 @@ pub(crate) fn attach() {
             sym!("OH_TextEditorProxy_SetSetPreviewTextFunc", ProxySetPreview);
         let set_finish: ProxySetFinish =
             sym!("OH_TextEditorProxy_SetFinishTextPreviewFunc", ProxySetFinish);
+        let set_text_config: ProxySetTextConfig =
+            sym!("OH_TextEditorProxy_SetGetTextConfigFunc", ProxySetTextConfig);
+        let set_input_type: SetInputType =
+            sym!("OH_TextConfig_SetInputType", SetInputType);
+        let _ = SET_INPUT_TYPE.set(set_input_type);
         let options_create: OptionsCreate = sym!("OH_AttachOptions_Create", OptionsCreate);
         let attach: ControllerAttach =
             sym!("OH_InputMethodController_Attach", ControllerAttach);
@@ -122,8 +137,13 @@ pub(crate) fn attach() {
         set_delete(proxy, on_delete_backward as *const c_void);
         set_preview(proxy, on_preview as *const c_void);
         set_finish(proxy, on_finish_preview as *const c_void);
+        set_text_config(proxy, on_get_text_config as *const c_void);
 
         let options = options_create(false);
+        super::vk::log(&format!(
+            "[gpui_ohos] IME proxy={:p} options={:p}",
+            proxy, options
+        ));
         let mut proxy_out: *mut c_void = std::ptr::null_mut();
         let code = attach(proxy, options, &mut proxy_out);
         super::vk::log(&format!("[gpui_ohos] IME attach code={code}"));
