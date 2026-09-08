@@ -231,6 +231,13 @@ pub(crate) fn attach() {
         let mut proxy_out: *mut c_void = std::ptr::null_mut();
         let code = attach(proxy, options, &mut proxy_out);
         super::vk::log(&format!("[gpui_ohos] IME attach code={code}"));
+        if code == 0 && !proxy_out.is_null() {
+            type ShowTextInput = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+            let show: ShowTextInput =
+                sym!("OH_InputMethodProxy_ShowTextInput", ShowTextInput);
+            let show_code = show(proxy_out, options);
+            super::vk::log(&format!("[gpui_ohos] IME showTextInput code={show_code}"));
+        }
         *attached = true;
     }
 }
