@@ -140,6 +140,34 @@ impl WindowShared {
         self.callbacks.borrow_mut().request_frame = callback;
     }
 
+    /// Apply an IME command to the focused input handler.
+    pub(crate) fn handle_ime(&self, command: &super::inputmethod::ImeCommand) {
+        use super::inputmethod::ImeCommand;
+        let mut guard = self.input_handler.borrow_mut();
+        let Some(handler) = guard.as_mut() else {
+            return;
+        };
+        match command {
+            ImeCommand::Commit(text) => {
+                handler.replace_text_in_range(None, text);
+                handler.unmark_text();
+            }
+            ImeCommand::Backspace(count) => {
+                if let Some(selection) = handler.selected_text_range(true) {
+                    let end = selection.range.end;
+                    let start = end.saturating_sub(*count);
+                    handler.replace_text_in_range(Some(start..end), "");
+                }
+            }
+            ImeCommand::Preview(text) => {
+                handler.replace_and_mark_text_in_range(None, text, None);
+            }
+            ImeCommand::ClearPreview => {
+                handler.unmark_text();
+            }
+        }
+    }
+
     pub(crate) fn dispatch_input(&self, input: PlatformInput) -> DispatchEventResult {
         let mut callback = self.callbacks.borrow_mut().input.take();
         let mut result = DispatchEventResult::default();

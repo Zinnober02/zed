@@ -126,6 +126,13 @@ impl OhosPlatform {
         self.windows.borrow().clone()
     }
 
+    /// Forward an IME command to every window's input handler.
+    pub(crate) fn handle_ime(&self, command: super::inputmethod::ImeCommand) {
+        for window in self.windows() {
+            window.handle_ime(&command);
+        }
+    }
+
     /// Forward a modifier-state change to every window.
     pub(crate) fn dispatch_modifiers(&self, modifiers: Modifiers) {
         for window in self.windows() {

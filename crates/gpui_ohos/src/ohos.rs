@@ -2,6 +2,7 @@ mod atlas;
 mod clipboard;
 mod dispatcher;
 mod display;
+mod inputmethod;
 mod keyboard;
 mod platform;
 mod text_system;
@@ -83,6 +84,7 @@ where
     ));
     let platform = new_platform();
     platform.set_surface(window, width, height);
+    inputmethod::attach();
     {
         let text_system = platform.text_system();
         let names = text_system.all_font_names();
@@ -125,7 +127,12 @@ pub fn surface_destroyed() {
 
 /// One frame tick, driven by the ArkTS host (DisplaySync or setInterval).
 pub fn tick() {
-    with_current(|platform| platform.tick());
+    with_current(|platform| {
+        for command in inputmethod::drain() {
+            platform.handle_ime(command);
+        }
+        platform.tick();
+    });
 }
 
 fn map_button(button: u32) -> MouseButton {
