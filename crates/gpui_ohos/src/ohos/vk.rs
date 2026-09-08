@@ -567,6 +567,7 @@ pub struct VkRenderer {
     gpd: PFN_vkGetDeviceProcAddr,
     software: Option<SoftwareBuffer>,
     last_hash: Option<u64>,
+    text: Option<TextPipeline>,
 }
 
 impl VkRenderer {
@@ -823,6 +824,7 @@ impl VkRenderer {
             gpd,
             software: None,
             last_hash: None,
+            text: None,
         };
 
         renderer.create_render_pass()?;
@@ -1361,6 +1363,7 @@ const ST_BUFFER_CREATE_INFO: u32 = 12;
 const ST_MEMORY_ALLOCATE_INFO: u32 = 5;
 const ST_IMAGE_MEMORY_BARRIER: u32 = 45;
 const BUFFER_USAGE_TRANSFER_SRC: u32 = 0x0001;
+const BUFFER_USAGE_VERTEX_BUFFER: u32 = 0x0080;
 const MEMORY_PROPERTY_HOST_VISIBLE: u32 = 0x0002;
 const MEMORY_PROPERTY_HOST_COHERENT: u32 = 0x0004;
 const LAYOUT_TRANSFER_DST_OPTIMAL: u32 = 7;
@@ -1807,6 +1810,1109 @@ impl VkRenderer {
             anyhow::bail!("vkQueuePresentKHR failed: {pr}");
         }
         self.last_hash = Some(hash);
+        Ok(())
+    }
+}
+
+
+// ===========================================================================
+// GPU glyph pipeline (textured quads from the monochrome atlas)
+// ===========================================================================
+
+const ST_IMAGE_CREATE_INFO: u32 = 14;
+const ST_SAMPLER_CREATE_INFO: u32 = 31;
+const ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: u32 = 32;
+const ST_DESCRIPTOR_POOL_CREATE_INFO: u32 = 33;
+const ST_DESCRIPTOR_SET_ALLOCATE_INFO: u32 = 34;
+const ST_WRITE_DESCRIPTOR_SET: u32 = 35;
+const ST_PIPELINE_LAYOUT_CREATE_INFO: u32 = 30;
+const ST_SHADER_MODULE_CREATE_INFO: u32 = 16;
+const ST_PIPELINE_SHADER_STAGE_CREATE_INFO: u32 = 18;
+const ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO: u32 = 19;
+const ST_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO: u32 = 20;
+const ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO: u32 = 22;
+const ST_PIPELINE_RASTERIZATION_STATE_CREATE_INFO: u32 = 23;
+const ST_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO: u32 = 24;
+const ST_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO: u32 = 26;
+const ST_PIPELINE_DYNAMIC_STATE_CREATE_INFO: u32 = 27;
+const ST_GRAPHICS_PIPELINE_CREATE_INFO: u32 = 28;
+const IMAGE_TYPE_2D: u32 = 1;
+const IMAGE_TILING_OPTIMAL: u32 = 0;
+const IMAGE_LAYOUT_PREINITIALIZED: u32 = 8;
+const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0002;
+const IMAGE_USAGE_SAMPLED: u32 = 0x0004;
+const FORMAT_R8_UNORM: u32 = 9;
+const SAMPLE_COUNT_1: u32 = 1;
+const SHADER_STAGE_VERTEX: u32 = 0x1;
+const SHADER_STAGE_FRAGMENT: u32 = 0x10;
+const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: u32 = 1;
+const DESCRIPTOR_TYPE_SAMPLER: u32 = 0;
+const FILTER_NEAREST: u32 = 0;
+const FILTER_LINEAR: u32 = 1;
+const SAMPLER_MIPMAP_MODE_NEAREST: u32 = 0;
+const SAMPLER_ADDRESS_CLAMP_TO_EDGE: u32 = 2;
+const BORDER_COLOR_FLOAT_OPAQUE_WHITE: u32 = 1;
+const DYNAMIC_STATE_VIEWPORT: u32 = 0;
+const DYNAMIC_STATE_SCISSOR: u32 = 1;
+const TOPOLOGY_TRIANGLE_LIST: u32 = 3;
+const POLYGON_MODE_FILL: u32 = 0;
+const CULL_MODE_NONE: u32 = 0;
+const FRONT_FACE_COUNTER_CLOCKWISE: u32 = 0;
+const BLEND_FACTOR_SRC_ALPHA: u32 = 6;
+const BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: u32 = 7;
+const BLEND_OP_ADD: u32 = 0;
+const COLOR_COMPONENT_RGBA: u32 = 0xF;
+const VERTEX_INPUT_RATE_VERTEX: u32 = 0;
+const FORMAT_R32G32_SFLOAT: u32 = 103;
+const FORMAT_R32G32B32A32_SFLOAT: u32 = 109;
+const LAYOUT_SHADER_READ_ONLY_OPTIMAL: u32 = 5;
+const ACCESS_SHADER_READ: u32 = 0x20;
+const PIPELINE_STAGE_FRAGMENT_SHADER: u32 = 0x80;
+
+#[repr(C)]
+struct VkImageCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    image_type: u32,
+    format: u32,
+    extent: VkExtent3D,
+    mip_levels: u32,
+    array_layers: u32,
+    samples: u32,
+    tiling: u32,
+    usage: u32,
+    sharing_mode: u32,
+    queue_family_index_count: u32,
+    p_queue_family_indices: *const u32,
+    initial_layout: u32,
+}
+
+#[repr(C)]
+struct VkSamplerCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    mag_filter: u32,
+    min_filter: u32,
+    mipmap_mode: u32,
+    address_mode_u: u32,
+    address_mode_v: u32,
+    address_mode_w: u32,
+    mip_lod_bias: f32,
+    anisotropy_enable: u32,
+    max_anisotropy: f32,
+    compare_enable: u32,
+    compare_op: u32,
+    min_lod: f32,
+    max_lod: f32,
+    border_color: u32,
+    unnormalized_coordinates: u32,
+}
+
+#[repr(C)]
+struct VkDescriptorSetLayoutBinding {
+    binding: u32,
+    descriptor_type: u32,
+    descriptor_count: u32,
+    stage_flags: u32,
+    p_immutable_samplers: *const u64,
+}
+
+#[repr(C)]
+struct VkDescriptorSetLayoutCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    binding_count: u32,
+    p_bindings: *const VkDescriptorSetLayoutBinding,
+}
+
+#[repr(C)]
+struct VkDescriptorPoolSize {
+    ty: u32,
+    descriptor_count: u32,
+}
+
+#[repr(C)]
+struct VkDescriptorPoolCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    max_sets: u32,
+    pool_size_count: u32,
+    p_pool_sizes: *const VkDescriptorPoolSize,
+}
+
+#[repr(C)]
+struct VkDescriptorSetAllocateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    descriptor_pool: u64,
+    descriptor_set_count: u32,
+    p_set_layouts: *const u64,
+}
+
+#[repr(C)]
+struct VkDescriptorImageInfo {
+    sampler: u64,
+    image_view: u64,
+    image_layout: u32,
+}
+
+#[repr(C)]
+struct VkWriteDescriptorSet {
+    s_type: u32,
+    p_next: *const c_void,
+    dst_set: u64,
+    dst_binding: u32,
+    dst_array_element: u32,
+    descriptor_count: u32,
+    descriptor_type: u32,
+    p_image_info: *const VkDescriptorImageInfo,
+    p_buffer_info: *const c_void,
+    p_texel_buffer_view: *const c_void,
+}
+
+#[repr(C)]
+struct VkPipelineLayoutCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    set_layout_count: u32,
+    p_set_layouts: *const u64,
+    push_constant_range_count: u32,
+    p_push_constant_ranges: *const c_void,
+}
+
+#[repr(C)]
+struct VkShaderModuleCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    code_size: usize,
+    p_code: *const u32,
+}
+
+#[repr(C)]
+struct VkPipelineShaderStageCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    stage: u32,
+    module: u64,
+    p_name: *const c_char,
+    p_specialization_info: *const c_void,
+}
+
+#[repr(C)]
+struct VkVertexInputBindingDescription {
+    binding: u32,
+    stride: u32,
+    input_rate: u32,
+}
+
+#[repr(C)]
+struct VkVertexInputAttributeDescription {
+    location: u32,
+    binding: u32,
+    format: u32,
+    offset: u32,
+}
+
+#[repr(C)]
+struct VkPipelineVertexInputStateCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    vertex_binding_description_count: u32,
+    p_vertex_binding_descriptions: *const VkVertexInputBindingDescription,
+    vertex_attribute_description_count: u32,
+    p_vertex_attribute_descriptions: *const VkVertexInputAttributeDescription,
+}
+
+#[repr(C)]
+struct VkPipelineInputAssemblyStateCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    topology: u32,
+    primitive_restart_enable: u32,
+}
+
+#[repr(C)]
+struct VkViewport {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    min_depth: f32,
+    max_depth: f32,
+}
+
+#[repr(C)]
+struct VkPipelineViewportStateCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    viewport_count: u32,
+    p_viewports: *const VkViewport,
+    scissor_count: u32,
+    p_scissors: *const VkRect2D,
+}
+
+#[repr(C)]
+struct VkPipelineRasterizationStateCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    depth_clamp_enable: u32,
+    rasterizer_discard_enable: u32,
+    polygon_mode: u32,
+    cull_mode: u32,
+    front_face: u32,
+    depth_bias_enable: u32,
+    depth_bias_constant_factor: f32,
+    depth_bias_clamp: f32,
+    depth_bias_slope_factor: f32,
+    line_width: f32,
+}
+
+#[repr(C)]
+struct VkPipelineMultisampleStateCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    rasterization_samples: u32,
+    sample_shading_enable: u32,
+    min_sample_shading: f32,
+    p_sample_mask: *const u32,
+    alpha_to_coverage_enable: u32,
+    alpha_to_one_enable: u32,
+}
+
+#[repr(C)]
+struct VkPipelineColorBlendAttachmentState {
+    blend_enable: u32,
+    src_color_blend_factor: u32,
+    dst_color_blend_factor: u32,
+    color_blend_op: u32,
+    src_alpha_blend_factor: u32,
+    dst_alpha_blend_factor: u32,
+    alpha_blend_op: u32,
+    color_write_mask: u32,
+}
+
+#[repr(C)]
+struct VkPipelineColorBlendStateCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    logic_op_enable: u32,
+    logic_op: u32,
+    attachment_count: u32,
+    p_attachments: *const VkPipelineColorBlendAttachmentState,
+    blend_constants: [f32; 4],
+}
+
+#[repr(C)]
+struct VkPipelineDynamicStateCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    dynamic_state_count: u32,
+    p_dynamic_states: *const u32,
+}
+
+#[repr(C)]
+struct VkGraphicsPipelineCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    stage_count: u32,
+    p_stages: *const VkPipelineShaderStageCreateInfo,
+    p_vertex_input_state: *const VkPipelineVertexInputStateCreateInfo,
+    p_input_assembly_state: *const VkPipelineInputAssemblyStateCreateInfo,
+    p_tessellation_state: *const c_void,
+    p_viewport_state: *const VkPipelineViewportStateCreateInfo,
+    p_rasterization_state: *const VkPipelineRasterizationStateCreateInfo,
+    p_multisample_state: *const VkPipelineMultisampleStateCreateInfo,
+    p_depth_stencil_state: *const c_void,
+    p_color_blend_state: *const VkPipelineColorBlendStateCreateInfo,
+    p_dynamic_state: *const VkPipelineDynamicStateCreateInfo,
+    layout: u64,
+    render_pass: u64,
+    subpass: u32,
+    base_pipeline_handle: u64,
+    base_pipeline_index: i32,
+}
+
+type PFN_vkCreateImage = unsafe extern "C" fn(
+    *mut c_void,
+    *const VkImageCreateInfo,
+    *const c_void,
+    *mut u64,
+) -> i32;
+type PFN_vkGetImageMemoryRequirements =
+    unsafe extern "C" fn(*mut c_void, u64, *mut VkMemoryRequirements);
+type PFN_vkBindImageMemory = unsafe extern "C" fn(*mut c_void, u64, u64, u64) -> i32;
+type PFN_vkCreateSampler = unsafe extern "C" fn(
+    *mut c_void,
+    *const VkSamplerCreateInfo,
+    *const c_void,
+    *mut u64,
+) -> i32;
+type PFN_vkCreateDescriptorSetLayout = unsafe extern "C" fn(
+    *mut c_void,
+    *const VkDescriptorSetLayoutCreateInfo,
+    *const c_void,
+    *mut u64,
+) -> i32;
+type PFN_vkCreateDescriptorPool = unsafe extern "C" fn(
+    *mut c_void,
+    *const VkDescriptorPoolCreateInfo,
+    *const c_void,
+    *mut u64,
+) -> i32;
+type PFN_vkAllocateDescriptorSets = unsafe extern "C" fn(
+    *mut c_void,
+    *const VkDescriptorSetAllocateInfo,
+    *mut u64,
+) -> i32;
+type PFN_vkUpdateDescriptorSets =
+    unsafe extern "C" fn(*mut c_void, u32, *const VkWriteDescriptorSet, u32, *const c_void);
+type PFN_vkCreatePipelineLayout = unsafe extern "C" fn(
+    *mut c_void,
+    *const VkPipelineLayoutCreateInfo,
+    *const c_void,
+    *mut u64,
+) -> i32;
+type PFN_vkCreateShaderModule = unsafe extern "C" fn(
+    *mut c_void,
+    *const VkShaderModuleCreateInfo,
+    *const c_void,
+    *mut u64,
+) -> i32;
+type PFN_vkCreateGraphicsPipelines = unsafe extern "C" fn(
+    *mut c_void,
+    u64,
+    u32,
+    *const VkGraphicsPipelineCreateInfo,
+    *const c_void,
+    *mut u64,
+) -> i32;
+type PFN_vkCmdBindPipeline = unsafe extern "C" fn(*mut c_void, u32, u64);
+type PFN_vkCmdBindVertexBuffers = unsafe extern "C" fn(*mut c_void, u32, u32, *const u64, *const u64);
+type PFN_vkCmdBindDescriptorSets =
+    unsafe extern "C" fn(*mut c_void, u32, u64, u32, u32, *const u64, u32, *const u32);
+type PFN_vkCmdDraw = unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32);
+type PFN_vkCmdSetViewport = unsafe extern "C" fn(*mut c_void, u32, u32, *const VkViewport);
+type PFN_vkCmdSetScissor = unsafe extern "C" fn(*mut c_void, u32, u32, *const VkRect2D);
+
+#[derive(Clone, Copy)]
+pub struct GlyphVertex {
+    pub x: f32,
+    pub y: f32,
+    pub u: f32,
+    pub v: f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+struct TextPipeline {
+    descriptor_set_layout: u64,
+    descriptor_pool: u64,
+    descriptor_set: u64,
+    pipeline_layout: u64,
+    pipeline: u64,
+    image: u64,
+    #[allow(dead_code)]
+    image_memory: u64,
+    view: u64,
+    sampler: u64,
+    vertex_buffer: u64,
+    #[allow(dead_code)]
+    vertex_memory: u64,
+    vertex_mapped: *mut u8,
+    vertex_size: u64,
+    atlas_extent: (u32, u32),
+}
+
+fn load_spirv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glyph.spv"));
+    // The array is 4-byte aligned because it is a static byte slice of a
+    // multiple-of-4 length; reinterpret as u32 words.
+    unsafe { std::slice::from_raw_parts(BYTES.as_ptr() as *const u32, BYTES.len() / 4) }
+}
+
+
+impl VkRenderer {
+    fn create_text_pipeline(&mut self) -> anyhow::Result<()> {
+        let create_image: PFN_vkCreateImage =
+            dev_fn!(self, "vkCreateImage", PFN_vkCreateImage);
+        let image_reqs: PFN_vkGetImageMemoryRequirements =
+            dev_fn!(self, "vkGetImageMemoryRequirements", PFN_vkGetImageMemoryRequirements);
+        let bind_image: PFN_vkBindImageMemory =
+            dev_fn!(self, "vkBindImageMemory", PFN_vkBindImageMemory);
+        let create_view: PFN_vkCreateImageView =
+            dev_fn!(self, "vkCreateImageView", PFN_vkCreateImageView);
+        let create_sampler: PFN_vkCreateSampler =
+            dev_fn!(self, "vkCreateSampler", PFN_vkCreateSampler);
+        let alloc_mem: PFN_vkAllocateMemory = inst_fn!(self, "vkAllocateMemory", PFN_vkAllocateMemory);
+        let create_set_layout: PFN_vkCreateDescriptorSetLayout = dev_fn!(
+            self,
+            "vkCreateDescriptorSetLayout",
+            PFN_vkCreateDescriptorSetLayout
+        );
+        let create_pool: PFN_vkCreateDescriptorPool =
+            dev_fn!(self, "vkCreateDescriptorPool", PFN_vkCreateDescriptorPool);
+        let alloc_sets: PFN_vkAllocateDescriptorSets =
+            dev_fn!(self, "vkAllocateDescriptorSets", PFN_vkAllocateDescriptorSets);
+        let update_sets: PFN_vkUpdateDescriptorSets =
+            dev_fn!(self, "vkUpdateDescriptorSets", PFN_vkUpdateDescriptorSets);
+        let create_layout: PFN_vkCreatePipelineLayout =
+            dev_fn!(self, "vkCreatePipelineLayout", PFN_vkCreatePipelineLayout);
+        let create_shader: PFN_vkCreateShaderModule =
+            dev_fn!(self, "vkCreateShaderModule", PFN_vkCreateShaderModule);
+        let create_pipelines: PFN_vkCreateGraphicsPipelines = dev_fn!(
+            self,
+            "vkCreateGraphicsPipelines",
+            PFN_vkCreateGraphicsPipelines
+        );
+
+        const ATLAS: u32 = 2048;
+        let ici = VkImageCreateInfo {
+            s_type: ST_IMAGE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            image_type: IMAGE_TYPE_2D,
+            format: FORMAT_R8_UNORM,
+            extent: VkExtent3D { width: ATLAS, height: ATLAS, depth: 1 },
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SAMPLE_COUNT_1,
+            tiling: IMAGE_TILING_OPTIMAL,
+            usage: IMAGE_USAGE_TRANSFER_DST | IMAGE_USAGE_SAMPLED,
+            sharing_mode: SHARING_MODE_EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: std::ptr::null(),
+            initial_layout: LAYOUT_UNDEFINED,
+        };
+        let mut image: u64 = 0;
+        if unsafe { create_image(self.device, &ici, std::ptr::null(), &mut image) } != VK_SUCCESS {
+            anyhow::bail!("vkCreateImage failed");
+        }
+        let mut reqs = VkMemoryRequirements { size: 0, alignment: 0, memory_type_bits: 0 };
+        unsafe { image_reqs(self.device, image, &mut reqs) };
+        let memory_type = self.find_memory_type(reqs.memory_type_bits, 0)?;
+        let ai = VkMemoryAllocateInfo {
+            s_type: ST_MEMORY_ALLOCATE_INFO,
+            p_next: std::ptr::null(),
+            allocation_size: reqs.size,
+            memory_type_index: memory_type,
+        };
+        let mut image_memory: u64 = 0;
+        if unsafe { alloc_mem(self.device, &ai, std::ptr::null(), &mut image_memory) } != VK_SUCCESS {
+            anyhow::bail!("vkAllocateMemory (image) failed");
+        }
+        if unsafe { bind_image(self.device, image, image_memory, 0) } != VK_SUCCESS {
+            anyhow::bail!("vkBindImageMemory failed");
+        }
+        let ivci = VkImageViewCreateInfo {
+            s_type: ST_IMAGE_VIEW_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            image,
+            view_type: IMAGE_VIEW_TYPE_2D,
+            format: FORMAT_R8_UNORM,
+            components: VkComponentMapping { r: 0, g: 0, b: 0, a: 0 },
+            subresource_range: VkImageSubresourceRange {
+                aspect_mask: ASPECT_COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+        };
+        let mut view: u64 = 0;
+        if unsafe { create_view(self.device, &ivci, std::ptr::null(), &mut view) } != VK_SUCCESS {
+            anyhow::bail!("vkCreateImageView (atlas) failed");
+        }
+        let sci = VkSamplerCreateInfo {
+            s_type: ST_SAMPLER_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            mag_filter: FILTER_LINEAR,
+            min_filter: FILTER_LINEAR,
+            mipmap_mode: SAMPLER_MIPMAP_MODE_NEAREST,
+            address_mode_u: SAMPLER_ADDRESS_CLAMP_TO_EDGE,
+            address_mode_v: SAMPLER_ADDRESS_CLAMP_TO_EDGE,
+            address_mode_w: SAMPLER_ADDRESS_CLAMP_TO_EDGE,
+            mip_lod_bias: 0.0,
+            anisotropy_enable: 0,
+            max_anisotropy: 1.0,
+            compare_enable: 0,
+            compare_op: 0,
+            min_lod: 0.0,
+            max_lod: 0.0,
+            border_color: BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+            unnormalized_coordinates: 0,
+        };
+        let mut sampler: u64 = 0;
+        if unsafe { create_sampler(self.device, &sci, std::ptr::null(), &mut sampler) } != VK_SUCCESS {
+            anyhow::bail!("vkCreateSampler failed");
+        }
+
+        let binding = VkDescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1,
+            stage_flags: SHADER_STAGE_FRAGMENT,
+            p_immutable_samplers: std::ptr::null(),
+        };
+        let dslci = VkDescriptorSetLayoutCreateInfo {
+            s_type: ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            binding_count: 1,
+            p_bindings: &binding,
+        };
+        let mut descriptor_set_layout: u64 = 0;
+        if unsafe {
+            create_set_layout(self.device, &dslci, std::ptr::null(), &mut descriptor_set_layout)
+        } != VK_SUCCESS
+        {
+            anyhow::bail!("vkCreateDescriptorSetLayout failed");
+        }
+        let pool_size = VkDescriptorPoolSize {
+            ty: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1,
+        };
+        let dpci = VkDescriptorPoolCreateInfo {
+            s_type: ST_DESCRIPTOR_POOL_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            max_sets: 1,
+            pool_size_count: 1,
+            p_pool_sizes: &pool_size,
+        };
+        let mut descriptor_pool: u64 = 0;
+        if unsafe { create_pool(self.device, &dpci, std::ptr::null(), &mut descriptor_pool) }
+            != VK_SUCCESS
+        {
+            anyhow::bail!("vkCreateDescriptorPool failed");
+        }
+        let dsai = VkDescriptorSetAllocateInfo {
+            s_type: ST_DESCRIPTOR_SET_ALLOCATE_INFO,
+            p_next: std::ptr::null(),
+            descriptor_pool,
+            descriptor_set_count: 1,
+            p_set_layouts: &descriptor_set_layout,
+        };
+        let mut descriptor_set: u64 = 0;
+        if unsafe { alloc_sets(self.device, &dsai, &mut descriptor_set) } != VK_SUCCESS {
+            anyhow::bail!("vkAllocateDescriptorSets failed");
+        }
+        let image_info = VkDescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        let write = VkWriteDescriptorSet {
+            s_type: ST_WRITE_DESCRIPTOR_SET,
+            p_next: std::ptr::null(),
+            dst_set: descriptor_set,
+            dst_binding: 0,
+            dst_array_element: 0,
+            descriptor_count: 1,
+            descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            p_image_info: &image_info,
+            p_buffer_info: std::ptr::null(),
+            p_texel_buffer_view: std::ptr::null(),
+        };
+        unsafe { update_sets(self.device, 1, &write, 0, std::ptr::null()) };
+
+        let plci = VkPipelineLayoutCreateInfo {
+            s_type: ST_PIPELINE_LAYOUT_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            set_layout_count: 1,
+            p_set_layouts: &descriptor_set_layout,
+            push_constant_range_count: 0,
+            p_push_constant_ranges: std::ptr::null(),
+        };
+        let mut pipeline_layout: u64 = 0;
+        if unsafe { create_layout(self.device, &plci, std::ptr::null(), &mut pipeline_layout) }
+            != VK_SUCCESS
+        {
+            anyhow::bail!("vkCreatePipelineLayout failed");
+        }
+
+        let spirv = load_spirv();
+        let smci = VkShaderModuleCreateInfo {
+            s_type: ST_SHADER_MODULE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            code_size: spirv.len() * 4,
+            p_code: spirv.as_ptr(),
+        };
+        let mut shader: u64 = 0;
+        if unsafe { create_shader(self.device, &smci, std::ptr::null(), &mut shader) } != VK_SUCCESS {
+            anyhow::bail!("vkCreateShaderModule failed");
+        }
+        let entry = CString::new("vs_main").unwrap();
+        let frag_entry = CString::new("fs_main").unwrap();
+        let stages = [
+            VkPipelineShaderStageCreateInfo {
+                s_type: ST_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: SHADER_STAGE_VERTEX,
+                module: shader,
+                p_name: entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+            VkPipelineShaderStageCreateInfo {
+                s_type: ST_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: SHADER_STAGE_FRAGMENT,
+                module: shader,
+                p_name: frag_entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+        ];
+        let vertex_binding = VkVertexInputBindingDescription {
+            binding: 0,
+            stride: 32,
+            input_rate: VERTEX_INPUT_RATE_VERTEX,
+        };
+        let attributes = [
+            VkVertexInputAttributeDescription { location: 0, binding: 0, format: FORMAT_R32G32_SFLOAT, offset: 0 },
+            VkVertexInputAttributeDescription { location: 1, binding: 0, format: FORMAT_R32G32_SFLOAT, offset: 8 },
+            VkVertexInputAttributeDescription { location: 2, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 16 },
+        ];
+        let visci = VkPipelineVertexInputStateCreateInfo {
+            s_type: ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            vertex_binding_description_count: 1,
+            p_vertex_binding_descriptions: &vertex_binding,
+            vertex_attribute_description_count: 3,
+            p_vertex_attribute_descriptions: attributes.as_ptr(),
+        };
+        let iasci = VkPipelineInputAssemblyStateCreateInfo {
+            s_type: ST_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            topology: TOPOLOGY_TRIANGLE_LIST,
+            primitive_restart_enable: 0,
+        };
+        let viewport = VkViewport {
+            x: 0.0,
+            y: 0.0,
+            width: self.width as f32,
+            height: self.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = VkRect2D {
+            offset: [0, 0],
+            extent: VkExtent2D { width: self.width, height: self.height },
+        };
+        let vpsci = VkPipelineViewportStateCreateInfo {
+            s_type: ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            viewport_count: 1,
+            p_viewports: &viewport,
+            scissor_count: 1,
+            p_scissors: &scissor,
+        };
+        let rsci = VkPipelineRasterizationStateCreateInfo {
+            s_type: ST_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            depth_clamp_enable: 0,
+            rasterizer_discard_enable: 0,
+            polygon_mode: POLYGON_MODE_FILL,
+            cull_mode: CULL_MODE_NONE,
+            front_face: FRONT_FACE_COUNTER_CLOCKWISE,
+            depth_bias_enable: 0,
+            depth_bias_constant_factor: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_bias_slope_factor: 0.0,
+            line_width: 1.0,
+        };
+        let msci = VkPipelineMultisampleStateCreateInfo {
+            s_type: ST_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            rasterization_samples: SAMPLE_COUNT_1,
+            sample_shading_enable: 0,
+            min_sample_shading: 1.0,
+            p_sample_mask: std::ptr::null(),
+            alpha_to_coverage_enable: 0,
+            alpha_to_one_enable: 0,
+        };
+        let blend_attachment = VkPipelineColorBlendAttachmentState {
+            blend_enable: 1,
+            src_color_blend_factor: BLEND_FACTOR_SRC_ALPHA,
+            dst_color_blend_factor: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            color_blend_op: BLEND_OP_ADD,
+            src_alpha_blend_factor: BLEND_FACTOR_SRC_ALPHA,
+            dst_alpha_blend_factor: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            alpha_blend_op: BLEND_OP_ADD,
+            color_write_mask: COLOR_COMPONENT_RGBA,
+        };
+        let cbsci = VkPipelineColorBlendStateCreateInfo {
+            s_type: ST_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            logic_op_enable: 0,
+            logic_op: 0,
+            attachment_count: 1,
+            p_attachments: &blend_attachment,
+            blend_constants: [0.0; 4],
+        };
+        let dynamic_states = [DYNAMIC_STATE_VIEWPORT, DYNAMIC_STATE_SCISSOR];
+        let dsci = VkPipelineDynamicStateCreateInfo {
+            s_type: ST_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            dynamic_state_count: 2,
+            p_dynamic_states: dynamic_states.as_ptr(),
+        };
+        let gpci = VkGraphicsPipelineCreateInfo {
+            s_type: ST_GRAPHICS_PIPELINE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage_count: 2,
+            p_stages: stages.as_ptr(),
+            p_vertex_input_state: &visci,
+            p_input_assembly_state: &iasci,
+            p_tessellation_state: std::ptr::null(),
+            p_viewport_state: &vpsci,
+            p_rasterization_state: &rsci,
+            p_multisample_state: &msci,
+            p_depth_stencil_state: std::ptr::null(),
+            p_color_blend_state: &cbsci,
+            p_dynamic_state: &dsci,
+            layout: pipeline_layout,
+            render_pass: self.render_pass,
+            subpass: 0,
+            base_pipeline_handle: 0,
+            base_pipeline_index: -1,
+        };
+        let mut pipeline: u64 = 0;
+        if unsafe { create_pipelines(self.device, 0, 1, &gpci, std::ptr::null(), &mut pipeline) }
+            != VK_SUCCESS
+        {
+            anyhow::bail!("vkCreateGraphicsPipelines failed");
+        }
+
+        let vertex_size: u64 = 2 * 1024 * 1024;
+        let (vertex_buffer, vertex_memory, vertex_mapped) =
+            self.create_host_buffer(vertex_size, BUFFER_USAGE_VERTEX_BUFFER)?;
+
+        self.text = Some(TextPipeline {
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_set,
+            pipeline_layout,
+            pipeline,
+            image,
+            image_memory,
+            view,
+            sampler,
+            vertex_buffer,
+            vertex_memory,
+            vertex_mapped,
+            vertex_size,
+            atlas_extent: (ATLAS, ATLAS),
+        });
+        Ok(())
+    }
+
+    fn create_host_buffer(&self, size: u64, usage: u32) -> anyhow::Result<(u64, u64, *mut u8)> {
+        let create_buffer: PFN_vkCreateBuffer = inst_fn!(self, "vkCreateBuffer", PFN_vkCreateBuffer);
+        let get_reqs: PFN_vkGetBufferMemoryRequirements = inst_fn!(
+            self,
+            "vkGetBufferMemoryRequirements",
+            PFN_vkGetBufferMemoryRequirements
+        );
+        let alloc_mem: PFN_vkAllocateMemory = inst_fn!(self, "vkAllocateMemory", PFN_vkAllocateMemory);
+        let bind_mem: PFN_vkBindBufferMemory =
+            inst_fn!(self, "vkBindBufferMemory", PFN_vkBindBufferMemory);
+        let map_mem: PFN_vkMapMemory = inst_fn!(self, "vkMapMemory", PFN_vkMapMemory);
+        let bci = VkBufferCreateInfo {
+            s_type: ST_BUFFER_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            size,
+            usage,
+            sharing_mode: SHARING_MODE_EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: std::ptr::null(),
+        };
+        let mut buffer: u64 = 0;
+        if unsafe { create_buffer(self.device, &bci, std::ptr::null(), &mut buffer) } != VK_SUCCESS {
+            anyhow::bail!("vkCreateBuffer failed");
+        }
+        let mut reqs = VkMemoryRequirements { size: 0, alignment: 0, memory_type_bits: 0 };
+        unsafe { get_reqs(self.device, buffer, &mut reqs) };
+        let memory_type = self.find_memory_type(
+            reqs.memory_type_bits,
+            MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT,
+        )?;
+        let ai = VkMemoryAllocateInfo {
+            s_type: ST_MEMORY_ALLOCATE_INFO,
+            p_next: std::ptr::null(),
+            allocation_size: reqs.size,
+            memory_type_index: memory_type,
+        };
+        let mut memory: u64 = 0;
+        if unsafe { alloc_mem(self.device, &ai, std::ptr::null(), &mut memory) } != VK_SUCCESS {
+            anyhow::bail!("vkAllocateMemory failed");
+        }
+        if unsafe { bind_mem(self.device, buffer, memory, 0) } != VK_SUCCESS {
+            anyhow::bail!("vkBindBufferMemory failed");
+        }
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        if unsafe { map_mem(self.device, memory, 0, VK_WHOLE_SIZE, 0, &mut mapped) } != VK_SUCCESS {
+            anyhow::bail!("vkMapMemory failed");
+        }
+        Ok((buffer, memory, mapped as *mut u8))
+    }
+
+    pub fn render_scene(
+        &mut self,
+        color: [f32; 4],
+        rects: &[ClearRect],
+        vertices: &[GlyphVertex],
+        uploads: &[super::atlas::AtlasUpload],
+    ) -> anyhow::Result<()> {
+        if self.text.is_none() {
+            self.create_text_pipeline()?;
+        }
+        let copy_image: PFN_vkCmdCopyBufferToImage =
+            dev_fn!(self, "vkCmdCopyBufferToImage", PFN_vkCmdCopyBufferToImage);
+        let pipeline_barrier: PFN_vkCmdPipelineBarrier =
+            dev_fn!(self, "vkCmdPipelineBarrier", PFN_vkCmdPipelineBarrier);
+        unsafe {
+            (self.fns.wait_for_fences)(self.device, 1, &self.in_flight, 1, u64::MAX);
+            (self.fns.reset_fences)(self.device, 1, &self.in_flight);
+        }
+        let mut image_index: u32 = 0;
+        let ar = unsafe {
+            (self.fns.acquire_next_image)(
+                self.device, self.swapchain, u64::MAX, self.image_available, 0, &mut image_index,
+            )
+        };
+        if ar == VK_ERROR_OUT_OF_DATE_KHR {
+            let (w, h) = (self.width, self.height);
+            self.resize(w, h)?;
+            return Ok(());
+        }
+        if ar != VK_SUCCESS {
+            anyhow::bail!("vkAcquireNextImageKHR failed: {ar}");
+        }
+        let vertex_bytes = std::mem::size_of_val(vertices);
+        {
+            let text = self.text.as_ref().expect("text pipeline");
+            if vertex_bytes as u64 > text.vertex_size {
+                anyhow::bail!("glyph vertex buffer too small");
+            }
+            if !vertices.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        vertices.as_ptr() as *const u8,
+                        text.vertex_mapped,
+                        vertex_bytes,
+                    );
+                }
+            }
+        }
+        unsafe { (self.fns.reset_command_buffer)(self.command_buffer, 0) };
+        let cbbi = VkCommandBufferBeginInfo {
+            s_type: ST_COMMAND_BUFFER_BEGIN_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            p_inheritance_info: std::ptr::null(),
+        };
+        if unsafe { (self.fns.begin_command_buffer)(self.command_buffer, &cbbi) } != VK_SUCCESS {
+            anyhow::bail!("vkBeginCommandBuffer failed");
+        }
+        if !uploads.is_empty() {
+            let total: u64 = uploads.iter().map(|u| (u.width * u.height) as u64).sum();
+            let (staging_buffer, staging_memory, staging_mapped) =
+                self.create_host_buffer(total.max(4), BUFFER_USAGE_TRANSFER_SRC)?;
+            let mut offset: u64 = 0;
+            let mut regions = Vec::with_capacity(uploads.len());
+            for upload in uploads {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        upload.data.as_ptr(),
+                        staging_mapped.add(offset as usize),
+                        upload.data.len(),
+                    );
+                }
+                regions.push(VkBufferImageCopy {
+                    buffer_offset: offset,
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: VkImageSubresourceLayers {
+                        aspect_mask: ASPECT_COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset: VkOffset3D { x: upload.x as i32, y: upload.y as i32, z: 0 },
+                    image_extent: VkExtent3D { width: upload.width, height: upload.height, depth: 1 },
+                });
+                offset += upload.data.len() as u64;
+            }
+            let text = self.text.as_ref().expect("text pipeline");
+            let range = VkImageSubresourceRange {
+                aspect_mask: ASPECT_COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let to_dst = VkImageMemoryBarrier {
+                s_type: ST_IMAGE_MEMORY_BARRIER,
+                p_next: std::ptr::null(),
+                src_access_mask: ACCESS_SHADER_READ,
+                dst_access_mask: ACCESS_TRANSFER_WRITE,
+                old_layout: LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                new_layout: LAYOUT_TRANSFER_DST_OPTIMAL,
+                src_queue_family_index: QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: QUEUE_FAMILY_IGNORED,
+                image: text.image,
+                subresource_range: range,
+            };
+            let to_read = VkImageMemoryBarrier {
+                s_type: ST_IMAGE_MEMORY_BARRIER,
+                p_next: std::ptr::null(),
+                src_access_mask: ACCESS_TRANSFER_WRITE,
+                dst_access_mask: ACCESS_SHADER_READ,
+                old_layout: LAYOUT_TRANSFER_DST_OPTIMAL,
+                new_layout: LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                src_queue_family_index: QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: QUEUE_FAMILY_IGNORED,
+                image: text.image,
+                subresource_range: range,
+            };
+            unsafe {
+                pipeline_barrier(
+                    self.command_buffer,
+                    PIPELINE_STAGE_FRAGMENT_SHADER,
+                    PIPELINE_STAGE_TRANSFER,
+                    0, 0, std::ptr::null(), 0, std::ptr::null(), 1, &to_dst,
+                );
+                copy_image(
+                    self.command_buffer,
+                    staging_buffer,
+                    text.image,
+                    LAYOUT_TRANSFER_DST_OPTIMAL,
+                    regions.len() as u32,
+                    regions.as_ptr(),
+                );
+                pipeline_barrier(
+                    self.command_buffer,
+                    PIPELINE_STAGE_TRANSFER,
+                    PIPELINE_STAGE_FRAGMENT_SHADER,
+                    0, 0, std::ptr::null(), 0, std::ptr::null(), 1, &to_read,
+                );
+            }
+            let _ = (staging_memory, staging_buffer);
+        }
+        let clear = VkClearValue { clear_color: VkClearColorValue { f: color } };
+        let area = VkRect2D { offset: [0, 0], extent: VkExtent2D { width: self.width, height: self.height } };
+        let rpbi = VkRenderPassBeginInfo {
+            s_type: ST_RENDER_PASS_BEGIN_INFO,
+            p_next: std::ptr::null(),
+            render_pass: self.render_pass,
+            framebuffer: self.framebuffers[image_index as usize],
+            render_area: area,
+            clear_value_count: 1,
+            p_clear_values: &clear,
+        };
+        unsafe { (self.fns.begin_render_pass)(self.command_buffer, &rpbi, SUBPASS_CONTENTS_INLINE) };
+        for rect in rects {
+            self.cmd_clear_rect(*rect);
+        }
+        if !vertices.is_empty() {
+            let bind_pipeline: PFN_vkCmdBindPipeline = dev_fn!(self, "vkCmdBindPipeline", PFN_vkCmdBindPipeline);
+            let bind_vertex: PFN_vkCmdBindVertexBuffers =
+                dev_fn!(self, "vkCmdBindVertexBuffers", PFN_vkCmdBindVertexBuffers);
+            let bind_sets: PFN_vkCmdBindDescriptorSets =
+                dev_fn!(self, "vkCmdBindDescriptorSets", PFN_vkCmdBindDescriptorSets);
+            let draw: PFN_vkCmdDraw = dev_fn!(self, "vkCmdDraw", PFN_vkCmdDraw);
+            let set_viewport: PFN_vkCmdSetViewport = dev_fn!(self, "vkCmdSetViewport", PFN_vkCmdSetViewport);
+            let set_scissor: PFN_vkCmdSetScissor = dev_fn!(self, "vkCmdSetScissor", PFN_vkCmdSetScissor);
+            let text = self.text.as_ref().expect("text pipeline");
+            let viewport = VkViewport {
+                x: 0.0, y: 0.0,
+                width: self.width as f32, height: self.height as f32,
+                min_depth: 0.0, max_depth: 1.0,
+            };
+            let scissor = VkRect2D { offset: [0, 0], extent: VkExtent2D { width: self.width, height: self.height } };
+            unsafe {
+                set_viewport(self.command_buffer, 0, 1, &viewport);
+                set_scissor(self.command_buffer, 0, 1, &scissor);
+                bind_pipeline(self.command_buffer, BIND_POINT_GRAPHICS, text.pipeline);
+                bind_vertex(self.command_buffer, 0, 1, &text.vertex_buffer, &0u64);
+                bind_sets(
+                    self.command_buffer, BIND_POINT_GRAPHICS, text.pipeline_layout, 0, 1,
+                    &text.descriptor_set, 0, std::ptr::null(),
+                );
+                draw(self.command_buffer, vertices.len() as u32, 1, 0, 0);
+            }
+        }
+        unsafe {
+            (self.fns.cmd_end_render_pass)(self.command_buffer);
+            (self.fns.end_command_buffer)(self.command_buffer);
+        }
+        let wait_stage = [PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT];
+        let cmds: [*const c_void; 1] = [self.command_buffer];
+        let si = VkSubmitInfo {
+            s_type: ST_SUBMIT_INFO,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 1,
+            p_wait_semaphores: &self.image_available,
+            p_wait_dst_stage_mask: wait_stage.as_ptr(),
+            command_buffer_count: 1,
+            p_command_buffers: cmds.as_ptr(),
+            signal_semaphore_count: 1,
+            p_signal_semaphores: &self.render_finished,
+        };
+        if unsafe { (self.fns.queue_submit)(self.queue, 1, &si, self.in_flight) } != VK_SUCCESS {
+            anyhow::bail!("vkQueueSubmit failed");
+        }
+        unsafe { (self.fns.wait_for_fences)(self.device, 1, &self.in_flight, 1, u64::MAX) };
+        let pi = VkPresentInfoKHR {
+            s_type: ST_PRESENT_INFO_KHR,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 1,
+            p_wait_semaphores: &self.render_finished,
+            swapchain_count: 1,
+            p_swapchains: &self.swapchain,
+            p_image_indices: &image_index,
+            p_results: std::ptr::null_mut(),
+        };
+        let pr = unsafe { (self.fns.queue_present)(self.queue, &pi) };
+        if pr == VK_ERROR_OUT_OF_DATE_KHR {
+            let (w, h) = (self.width, self.height);
+            self.resize(w, h)?;
+            return Ok(());
+        }
+        if pr != VK_SUCCESS {
+            anyhow::bail!("vkQueuePresentKHR failed: {pr}");
+        }
         Ok(())
     }
 }

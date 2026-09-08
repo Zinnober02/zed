@@ -289,12 +289,13 @@ impl WindowShared {
                 scene.monochrome_sprites.len()
             ));
         }
-        let mut framebuffer = self.framebuffer.borrow_mut();
+        let rects = collect_clear_rects(scene);
+        let uploads = self.atlas.take_uploads();
+        let (atlas_w, atlas_h) = self.atlas.texture_size(AtlasTextureKind::Monochrome);
         if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
-            let (w, h) = renderer.size();
-            framebuffer.resize(w as usize * h as usize * 4, 0);
-            composite(scene, &mut framebuffer, w, h, &self.atlas, renderer.needs_bgra_swap());
-            if let Err(error) = renderer.render_software(&framebuffer, hash) {
+            let (width, height) = renderer.size();
+            let vertices = build_glyph_vertices(scene, width, height, atlas_w, atlas_h);
+            if let Err(error) = renderer.render_scene(CLEAR_COLOR, &rects, &vertices, &uploads) {
                 super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
             }
         }
@@ -560,6 +561,85 @@ impl PlatformWindow for OhosWindow {
     fn show_window_menu(&self, _position: Point<Pixels>) {}
 
     fn start_window_move(&self) {}
+}
+
+/// Solid quads become clear rectangles; glyph sprites become textured quads.
+fn collect_clear_rects(scene: &Scene) -> Vec<super::vk::ClearRect> {
+    let mut rects = Vec::with_capacity(scene.quads.len());
+    for quad in &scene.quads {
+        let Some(color) = quad.background.as_solid() else {
+            continue;
+        };
+        let rgba = color.to_rgb();
+        if rgba.a < 0.996 {
+            continue;
+        }
+        let x = quad.bounds.origin.x.as_f32();
+        let y = quad.bounds.origin.y.as_f32();
+        let width = quad.bounds.size.width.as_f32();
+        let height = quad.bounds.size.height.as_f32();
+        if width <= 0.0 || height <= 0.0 {
+            continue;
+        }
+        rects.push(super::vk::ClearRect {
+            x: x as i32,
+            y: y as i32,
+            width: width as u32,
+            height: height as u32,
+            color: [rgba.r, rgba.g, rgba.b, 1.0],
+        });
+    }
+    rects
+}
+
+fn build_glyph_vertices(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    atlas_width: u32,
+    atlas_height: u32,
+) -> Vec<super::vk::GlyphVertex> {
+    let mut vertices = Vec::with_capacity(scene.monochrome_sprites.len() * 6);
+    let screen_width = width as f32;
+    let screen_height = height as f32;
+    let atlas_width = atlas_width as f32;
+    let atlas_height = atlas_height as f32;
+    for sprite in &scene.monochrome_sprites {
+        let x = sprite.bounds.origin.x.as_f32();
+        let y = sprite.bounds.origin.y.as_f32();
+        let sprite_width = sprite.bounds.size.width.as_f32();
+        let sprite_height = sprite.bounds.size.height.as_f32();
+        if sprite_width <= 0.0 || sprite_height <= 0.0 {
+            continue;
+        }
+        let tile = sprite.tile.bounds;
+        let u0 = tile.origin.x.0 as f32 / atlas_width;
+        let v0 = tile.origin.y.0 as f32 / atlas_height;
+        let u1 = (tile.origin.x.0 + tile.size.width.0) as f32 / atlas_width;
+        let v1 = (tile.origin.y.0 + tile.size.height.0) as f32 / atlas_height;
+        let color = sprite.color.to_rgb();
+        let x0 = x / screen_width * 2.0 - 1.0;
+        let y0 = 1.0 - y / screen_height * 2.0;
+        let x1 = (x + sprite_width) / screen_width * 2.0 - 1.0;
+        let y1 = 1.0 - (y + sprite_height) / screen_height * 2.0;
+        let vertex = |px: f32, py: f32, u: f32, v: f32| super::vk::GlyphVertex {
+            x: px,
+            y: py,
+            u,
+            v,
+            r: color.r,
+            g: color.g,
+            b: color.b,
+            a: color.a,
+        };
+        vertices.push(vertex(x0, y0, u0, v0));
+        vertices.push(vertex(x1, y0, u1, v0));
+        vertices.push(vertex(x1, y1, u1, v1));
+        vertices.push(vertex(x0, y0, u0, v0));
+        vertices.push(vertex(x1, y1, u1, v1));
+        vertices.push(vertex(x0, y1, u0, v1));
+    }
+    vertices
 }
 
 /// Cheap identity of the rendered scene, used to skip unchanged frames.
