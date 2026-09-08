@@ -5,7 +5,7 @@ use futures::channel::oneshot;
 
 use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
+    Keymap, Menu, MenuItem, Modifiers, OwnedMenu, PathPromptOptions, Platform, PlatformInput,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task,
     ThermalState, WindowAppearance, WindowParams,
@@ -124,6 +124,35 @@ impl OhosPlatform {
     /// Snapshot of live window state, for input routing and frame ticks.
     pub(crate) fn windows(&self) -> Vec<Rc<WindowShared>> {
         self.windows.borrow().clone()
+    }
+
+    /// Forward a modifier-state change to every window.
+    pub(crate) fn dispatch_modifiers(&self, modifiers: Modifiers) {
+        for window in self.windows() {
+            window.dispatch_input(PlatformInput::ModifiersChanged(
+                crate::ModifiersChangedEvent {
+                    modifiers,
+                    capslock: crate::Capslock::default(),
+                },
+            ));
+        }
+    }
+
+    /// Forward a key press or release to every window.
+    pub(crate) fn dispatch_key(&self, down: bool, keystroke: crate::Keystroke) {
+        for window in self.windows() {
+            if down {
+                window.dispatch_input(PlatformInput::KeyDown(crate::KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }));
+            } else {
+                window.dispatch_input(PlatformInput::KeyUp(crate::KeyUpEvent {
+                    keystroke: keystroke.clone(),
+                }));
+            }
+        }
     }
 }
 

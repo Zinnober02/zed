@@ -165,3 +165,102 @@ pub fn scroll(x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) {
         }
     });
 }
+
+thread_local! {
+    /// Keyboard modifier state, tracked from XComponent key events.
+    static MODIFIERS: std::cell::Cell<crate::Modifiers> =
+        std::cell::Cell::new(crate::Modifiers::default());
+}
+
+/// XComponent key event (action: 0 = down, 1 = up).
+pub fn key_event(action: i32, code: i32) {
+    let down = action == 0;
+    MODIFIERS.with(|cell| {
+        let mut modifiers = cell.get();
+        match code {
+            2072 | 2073 => modifiers.control = down,
+            2047 | 2048 => modifiers.shift = down,
+            2045 | 2046 => modifiers.alt = down,
+            2076 | 2077 => modifiers.platform = down,
+            _ => {}
+        }
+        cell.set(modifiers);
+    });
+    let modifiers = MODIFIERS.with(|cell| cell.get());
+
+    if matches!(code, 2072 | 2073 | 2047 | 2048 | 2045 | 2046 | 2076 | 2077) {
+        with_current(|platform| platform.dispatch_modifiers(modifiers));
+        return;
+    }
+
+    let Some((key, character)) = ohos_key(code) else {
+        vk::log(&format!("[gpui_ohos] unmapped key code={code}"));
+        return;
+    };
+    let key_char = if modifiers.control || modifiers.platform {
+        None
+    } else {
+        character.map(|ch| {
+            if modifiers.shift {
+                ch.to_uppercase().to_string()
+            } else {
+                ch.to_string()
+            }
+        })
+    };
+    let keystroke = crate::Keystroke {
+        modifiers,
+        key,
+        key_char,
+    };
+    vk::log(&format!(
+        "[gpui_ohos] key {} {}",
+        if down { "down" } else { "up" },
+        keystroke
+    ));
+    with_current(|platform| platform.dispatch_key(down, keystroke));
+}
+
+/// Map an OHOS key code to a GPUI key name and the character it types.
+fn ohos_key(code: i32) -> Option<(String, Option<char>)> {
+    Some(match code {
+        2000..=2009 => {
+            let ch = (b'0' + (code - 2000) as u8) as char;
+            (ch.to_string(), Some(ch))
+        }
+        2017..=2042 => {
+            let ch = (b'a' + (code - 2017) as u8) as char;
+            (ch.to_string(), Some(ch))
+        }
+        2012 => ("up".to_string(), None),
+        2013 => ("down".to_string(), None),
+        2014 => ("left".to_string(), None),
+        2015 => ("right".to_string(), None),
+        2043 => (",".to_string(), Some(',')),
+        2044 => (".".to_string(), Some('.')),
+        2049 => ("tab".to_string(), None),
+        2050 => ("space".to_string(), Some(' ')),
+        2054 => ("enter".to_string(), None),
+        2055 => ("backspace".to_string(), None),
+        2056 => ("\u{60}".to_string(), Some('\u{60}')),
+        2057 => ("-".to_string(), Some('-')),
+        2058 => ("=".to_string(), Some('=')),
+        2059 => ("[".to_string(), Some('[')),
+        2060 => ("]".to_string(), Some(']')),
+        2061 => ("\\".to_string(), Some('\\')),
+        2062 => (";".to_string(), Some(';')),
+        2063 => ("'".to_string(), Some('\'')),
+        2064 => ("/".to_string(), Some('/')),
+        2065 => ("@".to_string(), Some('@')),
+        2066 => ("+".to_string(), Some('+')),
+        2068 => ("pageup".to_string(), None),
+        2069 => ("pagedown".to_string(), None),
+        2070 => ("escape".to_string(), None),
+        2071 => ("delete".to_string(), None),
+        2081 => ("home".to_string(), None),
+        2082 => ("end".to_string(), None),
+        2083 => ("insert".to_string(), None),
+        2090..=2101 => (format!("f{}", code - 2089), None),
+        _ => return None,
+    })
+}
