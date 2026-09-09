@@ -1,0 +1,16 @@
+#!/usr/bin/sh
+# Cargo wrapper for the aarch64-unknown-linux-ohos target.
+#
+# aws-lc-sys builds its C library with CMake; the OHOS NDK ships the toolchain
+# file and llvm-ar, but CMake needs to be told about them explicitly.
+set -e
+sdk=${OHOS_NDK:-/storage/Users/currentUser/deveco_tools/sdk/default/openharmony/native}
+export AWS_LC_SYS_CMAKE_BUILDER=1
+export CMAKE_TOOLCHAIN_FILE="$sdk/build/cmake/ohos.toolchain.cmake"
+export OHOS_ARCH=arm64-v8a
+export OHOS_PLATFORM=OHOS
+export OHOS_STL=c++_shared
+export CMAKE_AR="$sdk/llvm/bin/llvm-ar"
+export CMAKE_RANLIB="$sdk/llvm/bin/llvm-ranlib"
+export AR_aarch64_unknown_linux_ohos="$sdk/llvm/bin/llvm-ar"
+exec cargo "$@"
