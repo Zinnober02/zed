@@ -147,6 +147,11 @@ pub fn read_clipboard() -> Option<String> {
     clipboard::read_text()
 }
 
+/// Write plain text to the system clipboard. No permission required.
+pub fn write_clipboard(text: &str) -> bool {
+    clipboard::write_text(text)
+}
+
 /// Take the folder URI the host restored from persisted authorization.
 pub fn take_restore_folder() -> Option<String> {
     with_current(|platform| platform.take_restore_folder()).flatten()
