@@ -230,10 +230,10 @@ fn map_button(button: u32) -> MouseButton {
     }
 }
 
-// XComponent reports pointer coordinates in device pixels; GPUI works in
-// logical pixels, so divide by the window scale.
+// The ArkUI NDK reports pointer coordinates in logical pixels, which is what
+// GPUI works in.
 fn logical(value: f32) -> crate::Pixels {
-    crate::px(value / window::SCALE)
+    crate::px(value)
 }
 
 pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
@@ -282,14 +282,16 @@ pub fn scroll(id: &str, x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) 
 }
 
 thread_local! {
-    /// Keyboard modifier state, tracked from XComponent key events.
+    /// Keyboard modifier state, tracked from NDK key events.
     static MODIFIERS: std::cell::Cell<crate::Modifiers> =
         std::cell::Cell::new(crate::Modifiers::default());
 }
 
-/// XComponent key event (action: 0 = down, 1 = up).
-pub fn key_event(id: &str, action: i32, code: i32) {
-    let down = action == 0;
+fn is_modifier_key(code: i32) -> bool {
+    matches!(code, 2072 | 2073 | 2047 | 2048 | 2045 | 2046 | 2076 | 2077)
+}
+
+fn update_modifiers(code: i32, down: bool) -> crate::Modifiers {
     MODIFIERS.with(|cell| {
         let mut modifiers = cell.get();
         match code {
@@ -300,14 +302,68 @@ pub fn key_event(id: &str, action: i32, code: i32) {
             _ => {}
         }
         cell.set(modifiers);
-    });
-    let modifiers = MODIFIERS.with(|cell| cell.get());
+        modifiers
+    })
+}
 
-    if matches!(code, 2072 | 2073 | 2047 | 2048 | 2045 | 2046 | 2076 | 2077) {
+/// Keys GPUI must see before the input method: modifiers, navigation and any
+/// shortcut combination. Everything else is text and goes to the input method.
+fn is_gpui_key(code: i32, modifiers: crate::Modifiers) -> bool {
+    is_modifier_key(code)
+        || modifiers.control
+        || modifiers.alt
+        || modifiers.platform
+        || matches!(
+            code,
+            2012 | 2013 | 2014 | 2015 // arrows
+                | 2049 // tab
+                | 2054 // enter
+                | 2055 // backspace
+                | 2068 | 2069 // page up / down
+                | 2070 // escape
+                | 2071 // delete
+                | 2081 | 2082 // home / end
+                | 2083 // insert
+                | 2090..=2101 // function keys
+        )
+}
+
+/// Pre-IME key event. Returns true to consume it so the input method never
+/// sees it.
+pub fn key_pre_ime(id: &str, action: i32, code: i32, _unicode: i32) -> bool {
+    let down = action == 0;
+    let modifiers = update_modifiers(code, down);
+    if is_modifier_key(code) {
+        with_current(|platform| platform.dispatch_modifiers(id, modifiers));
+        return true;
+    }
+    if !is_gpui_key(code, modifiers) {
+        return false;
+    }
+    dispatch_key(id, down, code, modifiers, None);
+    true
+}
+
+/// Post-IME key event (action: 0 = down, 1 = up). The NDK reports the Unicode
+/// value for printable keys.
+pub fn key_event(id: &str, action: i32, code: i32, unicode: i32) {
+    let down = action == 0;
+    let modifiers = update_modifiers(code, down);
+    if is_modifier_key(code) {
         with_current(|platform| platform.dispatch_modifiers(id, modifiers));
         return;
     }
+    let unicode = u32::try_from(unicode).ok().filter(|value| *value > 0);
+    dispatch_key(id, down, code, modifiers, unicode);
+}
 
+fn dispatch_key(
+    id: &str,
+    down: bool,
+    code: i32,
+    modifiers: crate::Modifiers,
+    unicode: Option<u32>,
+) {
     let Some((key, character)) = ohos_key(code) else {
         vk::log(&format!("[gpui_ohos] unmapped key code={code}"));
         return;
@@ -315,13 +371,16 @@ pub fn key_event(id: &str, action: i32, code: i32) {
     let key_char = if modifiers.control || modifiers.platform {
         None
     } else {
-        character.map(|ch| {
-            if modifiers.shift {
-                ch.to_uppercase().to_string()
-            } else {
-                ch.to_string()
-            }
-        })
+        unicode
+            .and_then(char::from_u32)
+            .or(character)
+            .map(|ch| {
+                if modifiers.shift {
+                    ch.to_uppercase().to_string()
+                } else {
+                    ch.to_string()
+                }
+            })
     };
     let keystroke = crate::Keystroke {
         modifiers,
