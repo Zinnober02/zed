@@ -122,6 +122,40 @@ where
     0
 }
 
+/// Read a file the user picked, through the descriptor the host opened.
+pub fn read_picked_file(fd: i32) -> Result<String, String> {
+    host::read_fd(fd).map_err(|error| error.to_string())
+}
+
+/// Overwrite a file the user picked, through its descriptor.
+pub fn write_picked_file(fd: i32, data: &str) -> Result<(), String> {
+    host::write_fd(fd, data).map_err(|error| error.to_string())
+}
+
+/// Open a picked file read/write and return its descriptor.
+pub fn open_picked_file(uri: &str) -> Option<i32> {
+    host::open_file(uri)
+}
+
+/// List a picked directory as (name, is_directory, uri).
+pub fn list_picked_dir(uri: &str) -> Vec<(String, bool, String)> {
+    host::list_dir(uri)
+}
+
+/// Pick files/folders and return the host's raw answer lines
+/// ("f|fd|name" for files, "d|uri" for folders).
+pub fn pick_items(
+    files: bool,
+    directories: bool,
+    multiple: bool,
+) -> futures::channel::oneshot::Receiver<Vec<String>> {
+    with_current(|platform| platform.pick_raw(files, directories, multiple)).unwrap_or_else(|| {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let _ = sender.send(Vec::new());
+        receiver
+    })
+}
+
 /// Install the host function pointers supplied by the ArkTS layer.
 pub fn set_host_ops(ops: HostOps) {
     host::set_ops(ops);

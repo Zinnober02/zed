@@ -65,8 +65,8 @@ pub(crate) struct OhosPlatform {
     on_reopen: RefCell<Option<Box<dyn FnMut()>>>,
     on_system_wake: RefCell<Option<Box<dyn FnMut()>>>,
     appearance: Cell<WindowAppearance>,
-    pending_picks: RefCell<HashMap<u64, oneshot::Sender<Result<Option<Vec<PathBuf>>>>>>,
-    pending_new_paths: RefCell<HashMap<u64, oneshot::Sender<Result<Option<PathBuf>>>>>,
+    /// Raw host picker answers: "f|fd|name" for files, "d|uri" for folders.
+    pending_picks: RefCell<HashMap<u64, oneshot::Sender<Vec<String>>>>,
     next_pick_id: Cell<u64>,
     /// Window rect in physical pixels: (x, y, width, height).
     window_rect: Cell<(f32, f32, f32, f32)>,
@@ -105,7 +105,6 @@ impl OhosPlatform {
             on_system_wake: RefCell::new(None),
             appearance: Cell::new(appearance),
             pending_picks: RefCell::new(HashMap::new()),
-            pending_new_paths: RefCell::new(HashMap::new()),
             next_pick_id: Cell::new(1),
             window_rect: Cell::new(window_rect),
         })
@@ -172,24 +171,14 @@ impl OhosPlatform {
             },
             host::event::PICK_RESULT => {
                 let (token, rest) = arg.split_once('\t').unwrap_or((arg, ""));
-                let kind = token.chars().next().unwrap_or('p');
                 let id: u64 = token[1..].parse().unwrap_or(0);
-                if kind == 'n' {
-                    if let Some(sender) = self.pending_new_paths.borrow_mut().remove(&id) {
-                        let path = rest
-                            .lines()
-                            .find(|line| !line.is_empty())
-                            .map(PathBuf::from);
-                        let _ = sender.send(Ok(path));
-                    }
-                } else if let Some(sender) = self.pending_picks.borrow_mut().remove(&id) {
-                    let paths: Vec<PathBuf> = rest
+                if let Some(sender) = self.pending_picks.borrow_mut().remove(&id) {
+                    let lines: Vec<String> = rest
                         .lines()
                         .filter(|line| !line.is_empty())
-                        .map(PathBuf::from)
+                        .map(str::to_string)
                         .collect();
-                    let answer = if paths.is_empty() { Ok(None) } else { Ok(Some(paths)) };
-                    let _ = sender.send(answer);
+                    let _ = sender.send(lines);
                 }
             }
             _ => {}
@@ -202,6 +191,26 @@ impl OhosPlatform {
 
     pub(crate) fn window_rect(&self) -> (f32, f32, f32, f32) {
         self.window_rect.get()
+    }
+
+    /// Pick files/folders, returning the host's raw answer lines
+    /// ("f|fd|name" for files, "d|uri" for folders).
+    pub(crate) fn pick_raw(
+        &self,
+        files: bool,
+        directories: bool,
+        multiple: bool,
+    ) -> oneshot::Receiver<Vec<String>> {
+        let (sender, receiver) = oneshot::channel();
+        let id = self.next_pick_id.get();
+        self.next_pick_id.set(id + 1);
+        self.pending_picks.borrow_mut().insert(id, sender);
+        let payload = format!(
+            "p{id}|{}|{}|{}",
+            files as u8, directories as u8, multiple as u8
+        );
+        host::window_op(host::op::PICK_PATHS, &payload);
+        receiver
     }
 
     pub(crate) fn set_surface(&self, window: *mut c_void, width: u32, height: u32) {
@@ -343,6 +352,20 @@ fn cursor_style_name(style: CursorStyle) -> &'static str {
         CursorStyle::DragCopy => "CURSOR_COPY",
         CursorStyle::ContextualMenu => "CURSOR_CIRCLE",
     }
+}
+
+/// Encode a raw picker answer as the opaque handle GPUI passes around:
+/// "f|fd|name" becomes "fd:<fd>", "d|uri" becomes "dir:<uri>".
+fn picked_handle(line: &str) -> PathBuf {
+    if let Some(rest) = line.strip_prefix("f|") {
+        if let Some((fd, _name)) = rest.split_once('|') {
+            return PathBuf::from(format!("fd:{fd}"));
+        }
+    }
+    if let Some(uri) = line.strip_prefix("d|") {
+        return PathBuf::from(format!("dir:{uri}"));
+    }
+    PathBuf::from(line)
 }
 
 /// Parse a host rect string of the form "x,y,w,h" (physical pixels).
@@ -492,15 +515,25 @@ impl Platform for OhosPlatform {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        let raw = self.pick_raw(options.files, options.directories, options.multiple);
         let (sender, receiver) = oneshot::channel();
-        let id = self.next_pick_id.get();
-        self.next_pick_id.set(id + 1);
-        self.pending_picks.borrow_mut().insert(id, sender);
-        let payload = format!(
-            "p{id}|{}|{}|{}",
-            options.files as u8, options.directories as u8, options.multiple as u8
-        );
-        host::window_op(host::op::PICK_PATHS, &payload);
+        self.foreground_executor
+            .spawn(async move {
+                let answer = match raw.await {
+                    Ok(lines) => {
+                        let paths: Vec<PathBuf> =
+                            lines.iter().map(|line| picked_handle(line)).collect();
+                        if paths.is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(paths))
+                        }
+                    }
+                    Err(_) => Ok(None),
+                };
+                let _ = sender.send(answer);
+            })
+            .detach();
         receiver
     }
 
@@ -509,17 +542,27 @@ impl Platform for OhosPlatform {
         directory: &std::path::Path,
         suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
-        let (sender, receiver) = oneshot::channel();
+        let (sender, raw) = oneshot::channel();
         let id = self.next_pick_id.get();
         self.next_pick_id.set(id + 1);
-        self.pending_new_paths.borrow_mut().insert(id, sender);
+        self.pending_picks.borrow_mut().insert(id, sender);
         let payload = format!(
             "n{id}|{}|{}",
             directory.display(),
             suggested_name.unwrap_or("")
         );
         host::window_op(host::op::PICK_NEW_PATH, &payload);
-        receiver
+        let (tx, rx) = oneshot::channel();
+        self.foreground_executor
+            .spawn(async move {
+                let answer = match raw.await {
+                    Ok(lines) => Ok(lines.first().map(|line| picked_handle(line))),
+                    Err(_) => Ok(None),
+                };
+                let _ = tx.send(answer);
+            })
+            .detach();
+        rx
     }
 
     fn can_select_mixed_files_and_dirs(&self) -> bool {

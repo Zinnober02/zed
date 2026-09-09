@@ -6,7 +6,7 @@
 //! (focus, window status, color mode, lifecycle, picker results) arrive back
 //! through \`host_event\`.
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::OnceLock;
 
 /// Commands the backend sends to the host. Fire-and-forget.
@@ -35,6 +35,10 @@ pub(crate) mod query {
     pub const COLOR_MODE: i32 = 102;
     pub const WINDOW_ID: i32 = 103;
     pub const DISPLAY: i32 = 104;
+    /// Open a picked file read/write and return its descriptor.
+    pub const OPEN_FILE: i32 = 105;
+    /// List a picked directory: "name|isDir|uri" per line.
+    pub const LIST_DIR: i32 = 106;
 }
 
 /// Events the host pushes into the backend.
@@ -102,4 +106,73 @@ pub(crate) fn cstr(ptr: *const c_char) -> String {
         return String::new();
     }
     unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+}
+
+const SEEK_SET: i32 = 0;
+
+unsafe extern "C" {
+    fn read(fd: i32, buffer: *mut c_void, count: usize) -> isize;
+    fn write(fd: i32, buffer: *const c_void, count: usize) -> isize;
+    fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
+    fn ftruncate(fd: i32, length: i64) -> i32;
+}
+
+/// Read a picked public file through the descriptor the host opened for it.
+pub(crate) fn read_fd(fd: i32) -> std::io::Result<String> {
+    unsafe { lseek(fd, 0, SEEK_SET) };
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = unsafe { read(fd, buffer.as_mut_ptr() as *mut c_void, buffer.len()) };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count == 0 {
+            break;
+        }
+        out.extend_from_slice(&buffer[..count as usize]);
+    }
+    String::from_utf8(out)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Replace a picked public file's contents through its descriptor.
+pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
+    unsafe {
+        ftruncate(fd, 0);
+        lseek(fd, 0, SEEK_SET);
+    }
+    let bytes = data.as_bytes();
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let count =
+            unsafe { write(fd, bytes[written..].as_ptr() as *const c_void, bytes.len() - written) };
+        if count <= 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        written += count as usize;
+    }
+    Ok(())
+}
+
+/// Ask the host to open a picked file read/write, returning its descriptor.
+pub(crate) fn open_file(uri: &str) -> Option<i32> {
+    query(query::OPEN_FILE, uri)?.trim().parse().ok()
+}
+
+/// Ask the host to list a picked directory as (name, is_dir, uri).
+pub(crate) fn list_dir(uri: &str) -> Vec<(String, bool, String)> {
+    let Some(answer) = query(query::LIST_DIR, uri) else {
+        return Vec::new();
+    };
+    answer
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '|');
+            let name = parts.next()?.to_string();
+            let is_dir = parts.next()? == "1";
+            let child_uri = parts.next()?.to_string();
+            Some((name, is_dir, child_uri))
+        })
+        .collect()
 }
