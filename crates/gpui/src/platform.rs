@@ -18,15 +18,18 @@ mod test;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 mod visual_test;
 
+// OHOS reports target_os = "linux" but has no X11/scap, so exclude it here.
 #[cfg(all(
     feature = "screen-capture",
-    any(target_os = "windows", target_os = "linux", target_os = "freebsd",)
+    any(target_os = "windows", target_os = "linux", target_os = "freebsd"),
+    not(target_env = "ohos"),
 ))]
 pub mod scap_screen_capture;
 
 #[cfg(all(
     any(target_os = "windows", target_os = "linux"),
-    feature = "screen-capture"
+    feature = "screen-capture",
+    not(target_env = "ohos"),
 ))]
 pub(crate) type PlatformScreenCaptureFrame = scap::frame::Frame;
 #[cfg(not(feature = "screen-capture"))]
