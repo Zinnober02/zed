@@ -49,6 +49,8 @@ pub(crate) mod event {
     pub const LIFECYCLE: i32 = 4;
     pub const PICK_RESULT: i32 = 5;
     pub const WINDOW_RECT: i32 = 6;
+    /// A folder URI to restore after the app restarts.
+    pub const RESTORE_FOLDER: i32 = 7;
 }
 
 /// Function pointers implemented by the ArkTS host.

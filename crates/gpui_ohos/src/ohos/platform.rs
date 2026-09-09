@@ -68,6 +68,8 @@ pub(crate) struct OhosPlatform {
     /// Raw host picker answers: "f|fd|name" for files, "d|uri" for folders.
     pending_picks: RefCell<HashMap<u64, oneshot::Sender<Vec<String>>>>,
     next_pick_id: Cell<u64>,
+    /// Folder URI the host restored from its persisted authorization.
+    restore_folder: RefCell<Option<String>>,
     /// Window rect in physical pixels: (x, y, width, height).
     window_rect: Cell<(f32, f32, f32, f32)>,
 }
@@ -106,6 +108,7 @@ impl OhosPlatform {
             appearance: Cell::new(appearance),
             pending_picks: RefCell::new(HashMap::new()),
             next_pick_id: Cell::new(1),
+            restore_folder: RefCell::new(None),
             window_rect: Cell::new(window_rect),
         })
     }
@@ -169,6 +172,11 @@ impl OhosPlatform {
                 }
                 _ => {}
             },
+            host::event::RESTORE_FOLDER => {
+                if !arg.is_empty() {
+                    *self.restore_folder.borrow_mut() = Some(arg.to_string());
+                }
+            }
             host::event::PICK_RESULT => {
                 let (token, rest) = arg.split_once('\t').unwrap_or((arg, ""));
                 let id: u64 = token[1..].parse().unwrap_or(0);
@@ -191,6 +199,10 @@ impl OhosPlatform {
 
     pub(crate) fn window_rect(&self) -> (f32, f32, f32, f32) {
         self.window_rect.get()
+    }
+
+    pub(crate) fn take_restore_folder(&self) -> Option<String> {
+        self.restore_folder.borrow_mut().take()
     }
 
     /// Pick files/folders, returning the host's raw answer lines

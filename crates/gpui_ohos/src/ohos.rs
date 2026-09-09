@@ -142,6 +142,11 @@ pub fn list_picked_dir(uri: &str) -> Vec<(String, bool, String)> {
     host::list_dir(uri)
 }
 
+/// Take the folder URI the host restored from persisted authorization.
+pub fn take_restore_folder() -> Option<String> {
+    with_current(|platform| platform.take_restore_folder()).flatten()
+}
+
 /// Pick files/folders and return the host's raw answer lines
 /// ("f|fd|name" for files, "d|uri" for folders).
 pub fn pick_items(
