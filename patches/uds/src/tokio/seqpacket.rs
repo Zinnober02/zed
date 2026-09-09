@@ -1,4 +1,4 @@
-use crate::{nonblocking, UnixSocketAddr, ConnCredentials};
+use crate::{ConnCredentials, UnixSocketAddr, nonblocking};
 
 use std::io::{self, IoSlice, IoSliceMut};
 use std::net::Shutdown;
@@ -29,8 +29,7 @@ impl UnixSeqpacketConn {
         Self::from_nonblocking(conn)
     }
     /// Binds to an address before connecting to a listening seqpacet socket.
-    pub fn connect_from_addr(from: &UnixSocketAddr,  to: &UnixSocketAddr)
-    -> io::Result<Self> {
+    pub fn connect_from_addr(from: &UnixSocketAddr, to: &UnixSocketAddr) -> io::Result<Self> {
         let conn = nonblocking::UnixSeqpacketConn::connect_from_to_unix_addr(from, to)?;
         Self::from_nonblocking(conn)
     }
@@ -72,7 +71,7 @@ impl UnixSeqpacketConn {
     }
 
     /// Shuts down the read, write, or both halves of this connection.
-    pub fn shutdown(&self,  how: Shutdown) -> Result<(), io::Error> {
+    pub fn shutdown(&self, how: Shutdown) -> Result<(), io::Error> {
         self.io.get_ref().shutdown(how)
     }
 
@@ -100,7 +99,7 @@ impl UnixSeqpacketConn {
     ///
     /// The default security context is `unconfined`, without any trailing NUL.  
     /// A buffor of 50 bytes is probably always big enough.
-    pub fn initial_peer_selinux_context(&self,  buffer: &mut[u8]) -> Result<usize, io::Error> {
+    pub fn initial_peer_selinux_context(&self, buffer: &mut [u8]) -> Result<usize, io::Error> {
         self.io.get_ref().initial_peer_selinux_context(buffer)
     }
 
@@ -112,49 +111,74 @@ impl UnixSeqpacketConn {
 
 impl UnixSeqpacketConn {
     /// Sends a packet to the socket's peer.
-    pub async fn send(&mut self,  packet: &[u8]) -> io::Result<usize> {
-        self.io.async_io(Interest::WRITABLE, |conn| conn.send(packet) ).await
+    pub async fn send(&mut self, packet: &[u8]) -> io::Result<usize> {
+        self.io
+            .async_io(Interest::WRITABLE, |conn| conn.send(packet))
+            .await
     }
     /// Receives a packet from the socket's peer.
-    pub async fn recv(&mut self,  buffer: &mut[u8]) -> io::Result<usize> {
-        self.io.async_io(Interest::READABLE, |conn| conn.recv(buffer) ).await
+    pub async fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.io
+            .async_io(Interest::READABLE, |conn| conn.recv(buffer))
+            .await
     }
 
     /// Sends a packet assembled from multiple byte slices.
-    pub async fn send_vectored<'a, 'b>
-    (&'a mut self,  slices: &'b [IoSlice<'b>]) -> io::Result<usize> {
-        self.io.async_io(Interest::WRITABLE, |conn| conn.send_vectored(slices) ).await
+    pub async fn send_vectored<'a, 'b>(
+        &'a mut self,
+        slices: &'b [IoSlice<'b>],
+    ) -> io::Result<usize> {
+        self.io
+            .async_io(Interest::WRITABLE, |conn| conn.send_vectored(slices))
+            .await
     }
     /// Receives a packet and places the bytes across multiple buffers.
-    pub async fn recv_vectored<'a, 'b>
-    (&'a mut self,  buffers: &'b mut [IoSliceMut<'b>]) -> io::Result<usize> {
-        self.io.async_io(
-                Interest::READABLE,
-                |conn| conn.recv_vectored(buffers).map(|(received, _)| received )
-        ).await
+    pub async fn recv_vectored<'a, 'b>(
+        &'a mut self,
+        buffers: &'b mut [IoSliceMut<'b>],
+    ) -> io::Result<usize> {
+        self.io
+            .async_io(Interest::READABLE, |conn| {
+                conn.recv_vectored(buffers).map(|(received, _)| received)
+            })
+            .await
     }
 
     /// Receives a packet without removing it from the incoming queue.
-    pub async fn peek(&mut self,  buffer: &mut[u8]) -> io::Result<usize> {
-        self.io.async_io(Interest::READABLE, |conn| conn.peek(buffer) ).await
+    pub async fn peek(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.io
+            .async_io(Interest::READABLE, |conn| conn.peek(buffer))
+            .await
     }
     /// Reads a packet into multiple buffers without removing it from the incoming queue.
-    pub async fn peek_vectored<'a, 'b>
-    (&'a mut self,  buffers: &'b mut [IoSliceMut<'b>]) -> io::Result<usize> {
-        self.io.async_io(
-                Interest::READABLE,
-                |conn| conn.peek_vectored(buffers).map(|(received, _)| received )
-        ).await
+    pub async fn peek_vectored<'a, 'b>(
+        &'a mut self,
+        buffers: &'b mut [IoSliceMut<'b>],
+    ) -> io::Result<usize> {
+        self.io
+            .async_io(Interest::READABLE, |conn| {
+                conn.peek_vectored(buffers).map(|(received, _)| received)
+            })
+            .await
     }
 
     /// Sends a packet with associated file descriptors.
-    pub async fn send_fds(&mut self,  bytes: &[u8],  fds: &[RawFd]) -> io::Result<usize> {
-        self.io.async_io(Interest::WRITABLE, |conn| conn.send_fds(bytes, fds) ).await
+    pub async fn send_fds(&mut self, bytes: &[u8], fds: &[RawFd]) -> io::Result<usize> {
+        self.io
+            .async_io(Interest::WRITABLE, |conn| conn.send_fds(bytes, fds))
+            .await
     }
     /// Receives a packet and associated file descriptors.
-    pub async fn recv_fds(&mut self,  byte_buffer: &mut[u8],  fd_buffer: &mut[RawFd])
-    -> io::Result<(usize, bool, usize)> {
-        self.io.async_io(Interest::READABLE, |conn| conn.recv_fds(byte_buffer, fd_buffer) ).await
+    pub async fn recv_fds(
+        &mut self,
+        byte_buffer: &mut [u8],
+        fd_buffer: &mut [RawFd],
+    ) -> io::Result<(usize, bool, usize)> {
+        self.io
+            .async_io(Interest::READABLE, |conn| {
+                conn.recv_fds(byte_buffer, fd_buffer)
+            })
+            .await
     }
 }
 
@@ -175,8 +199,6 @@ impl IntoRawFd for UnixSeqpacketConn {
         self.io.into_inner().into_raw_fd()
     }
 }
-
-
 
 /// An I/O object representing a Unix Sequenced-packet socket.
 pub struct UnixSeqpacketListener {
@@ -200,8 +222,9 @@ impl UnixSeqpacketListener {
     }
 
     /// Creates a tokio-compatible listener from an existing nonblocking listener.
-    pub fn from_nonblocking(listener: nonblocking::UnixSeqpacketListener)
-    -> Result<Self, io::Error> {
+    pub fn from_nonblocking(
+        listener: nonblocking::UnixSeqpacketListener,
+    ) -> Result<Self, io::Error> {
         match AsyncFd::with_interest(listener, Interest::READABLE) {
             Ok(io) => Ok(Self { io }),
             Err(e) => Err(e),
@@ -225,10 +248,10 @@ impl UnixSeqpacketListener {
 
     /// Accepts a new incoming connection to this listener.
     pub async fn accept(&mut self) -> io::Result<(UnixSeqpacketConn, UnixSocketAddr)> {
-        let (conn, addr) = self.io.async_io(
-                Interest::READABLE,
-                |inner| inner.accept_unix_addr()
-        ).await?;
+        let (conn, addr) = self
+            .io
+            .async_io(Interest::READABLE, |inner| inner.accept_unix_addr())
+            .await?;
         let conn = UnixSeqpacketConn::from_nonblocking(conn)?;
         Ok((conn, addr))
     }

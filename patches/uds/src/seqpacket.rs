@@ -1,79 +1,101 @@
 use std::io::{self, ErrorKind, IoSlice, IoSliceMut};
 use std::mem;
 use std::net::Shutdown;
-use std::os::unix::io::{RawFd, FromRawFd, AsRawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::Path;
 use std::time::Duration;
 
-use libc::{SOCK_SEQPACKET, MSG_EOR, MSG_PEEK, c_void, close, send, recv};
+use libc::{MSG_EOR, MSG_PEEK, SOCK_SEQPACKET, c_void, close, recv, send};
 
 #[cfg(feature = "mio_08")]
-use mio_08::{event::Source as Source_08, unix::SourceFd as SourceFd_08, Interest as Interest_08, Registry as Registry_08, Token as Token_08};
+use mio_08::{
+    Interest as Interest_08, Registry as Registry_08, Token as Token_08,
+    event::Source as Source_08, unix::SourceFd as SourceFd_08,
+};
 
 use crate::addr::*;
-use crate::helpers::*;
 use crate::ancillary::*;
 use crate::credentials::*;
+use crate::helpers::*;
 
 /// Implements traits apropriate for any file-descriptor-wrapping type.
-macro_rules! impl_rawfd_traits {($type:tt) => {
-    impl FromRawFd for $type {
-        unsafe fn from_raw_fd(fd: RawFd) -> Self {
-            $type { fd }
+macro_rules! impl_rawfd_traits {
+    ($type:tt) => {
+        impl FromRawFd for $type {
+            unsafe fn from_raw_fd(fd: RawFd) -> Self {
+                $type { fd }
+            }
         }
-    }
-    impl AsRawFd for $type {
-        fn as_raw_fd(&self) -> RawFd {
-            self.fd
+        impl AsRawFd for $type {
+            fn as_raw_fd(&self) -> RawFd {
+                self.fd
+            }
         }
-    }
-    impl IntoRawFd for $type {
-        fn into_raw_fd(self) -> RawFd {
-            let fd = self.fd;
-            mem::forget(self);
-            fd
+        impl IntoRawFd for $type {
+            fn into_raw_fd(self) -> RawFd {
+                let fd = self.fd;
+                mem::forget(self);
+                fd
+            }
         }
-    }
-    impl Drop for $type {
-        fn drop(&mut self) {
-            let _ = unsafe { close(self.fd) };
+        impl Drop for $type {
+            fn drop(&mut self) {
+                let _ = unsafe { close(self.fd) };
+            }
         }
-    }
-}}
+    };
+}
 
 /// Implements `mio::Evented` and `mio::Source` for a fd-wrapping type.
-macro_rules! impl_mio_if_enabled {($type:tt) => {
-    #[cfg(feature = "mio_08")]
-    impl Source_08 for $type {
-        fn register(&mut self,  registry: &Registry_08,  token: Token_08,  interest: Interest_08)
-        -> Result<(), io::Error> {
-            SourceFd_08(&self.fd).register(registry, token, interest)
+macro_rules! impl_mio_if_enabled {
+    ($type:tt) => {
+        #[cfg(feature = "mio_08")]
+        impl Source_08 for $type {
+            fn register(
+                &mut self,
+                registry: &Registry_08,
+                token: Token_08,
+                interest: Interest_08,
+            ) -> Result<(), io::Error> {
+                SourceFd_08(&self.fd).register(registry, token, interest)
+            }
+            fn reregister(
+                &mut self,
+                registry: &Registry_08,
+                token: Token_08,
+                interest: Interest_08,
+            ) -> Result<(), io::Error> {
+                SourceFd_08(&self.fd).reregister(registry, token, interest)
+            }
+            fn deregister(&mut self, registry: &Registry_08) -> Result<(), io::Error> {
+                SourceFd_08(&self.fd).deregister(registry)
+            }
         }
-        fn reregister(&mut self,  registry: &Registry_08,  token: Token_08,  interest: Interest_08)
-        -> Result<(), io::Error> {
-            SourceFd_08(&self.fd).reregister(registry, token, interest)
-        }
-        fn deregister(&mut self,  registry: &Registry_08) -> Result<(), io::Error> {
-            SourceFd_08(&self.fd).deregister(registry)
-        }
-    }
 
-    #[cfg(feature = "mio_08")]
-    impl<'a> Source_08 for &'a $type {
-        fn register(&mut self,  registry: &Registry_08,  token: Token_08,  interest: Interest_08)
-        -> Result<(), io::Error> {
-            SourceFd_08(&self.fd).register(registry, token, interest)
+        #[cfg(feature = "mio_08")]
+        impl<'a> Source_08 for &'a $type {
+            fn register(
+                &mut self,
+                registry: &Registry_08,
+                token: Token_08,
+                interest: Interest_08,
+            ) -> Result<(), io::Error> {
+                SourceFd_08(&self.fd).register(registry, token, interest)
+            }
+            fn reregister(
+                &mut self,
+                registry: &Registry_08,
+                token: Token_08,
+                interest: Interest_08,
+            ) -> Result<(), io::Error> {
+                SourceFd_08(&self.fd).reregister(registry, token, interest)
+            }
+            fn deregister(&mut self, registry: &Registry_08) -> Result<(), io::Error> {
+                SourceFd_08(&self.fd).deregister(registry)
+            }
         }
-        fn reregister(&mut self,  registry: &Registry_08,  token: Token_08,  interest: Interest_08)
-        -> Result<(), io::Error> {
-            SourceFd_08(&self.fd).reregister(registry, token, interest)
-        }
-        fn deregister(&mut self,  registry: &Registry_08) -> Result<(), io::Error> {
-            SourceFd_08(&self.fd).deregister(registry)
-        }
-    }
-}}
-
+    };
+}
 
 /// An unix domain sequential packet connection.
 ///
@@ -105,8 +127,8 @@ macro_rules! impl_mio_if_enabled {($type:tt) => {
 ///
 /// What is sent separately is received separately:
 ///
-#[cfg_attr(not(target_vendor="apple"), doc="```")]
-#[cfg_attr(target_vendor="apple", doc="```no_run")]
+#[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+#[cfg_attr(target_vendor = "apple", doc = "```no_run")]
 /// let (a, b) = uds::UnixSeqpacketConn::pair().expect("Cannot create seqpacket pair");
 ///
 /// a.send(b"first").unwrap();
@@ -121,8 +143,8 @@ macro_rules! impl_mio_if_enabled {($type:tt) => {
 ///
 /// Connect to a listener on a socket file and write to it:
 ///
-#[cfg_attr(not(target_vendor="apple"), doc="```")]
-#[cfg_attr(target_vendor="apple", doc="```no_run")]
+#[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+#[cfg_attr(target_vendor = "apple", doc = "```no_run")]
 /// use uds::{UnixSeqpacketListener, UnixSeqpacketConn};
 ///
 /// # let _ = std::fs::remove_file("seqpacket.socket"); // pre-emptively delete just in case
@@ -140,8 +162,11 @@ macro_rules! impl_mio_if_enabled {($type:tt) => {
 ///
 /// Connect to a listener on an abstract address:
 ///
-#[cfg_attr(any(target_os="linux", target_os="android"), doc="```")]
-#[cfg_attr(not(any(target_os="linux", target_os="android")), doc="```no_run")]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), doc = "```")]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    doc = "```no_run"
+)]
 /// use uds::{UnixSeqpacketListener, UnixSeqpacketConn, UnixSocketAddr};
 ///
 /// let addr = UnixSocketAddr::new("@seqpacket example").unwrap();
@@ -157,7 +182,7 @@ pub struct UnixSeqpacketConn {
     fd: RawFd,
 }
 
-impl_rawfd_traits!{UnixSeqpacketConn}
+impl_rawfd_traits! {UnixSeqpacketConn}
 
 impl UnixSeqpacketConn {
     /// Connects to an unix seqpacket server listening at `path`.
@@ -171,24 +196,30 @@ impl UnixSeqpacketConn {
     /// Connects to an unix seqpacket server listening at `addr`.
     pub fn connect_unix_addr(addr: &UnixSocketAddr) -> Result<Self, io::Error> {
         let socket = Socket::new(SOCK_SEQPACKET, false)?;
-        set_unix_addr(socket.as_raw_fd(), SetAddr::PEER,  addr)?;
-        Ok(UnixSeqpacketConn { fd: socket.into_raw_fd() })
+        set_unix_addr(socket.as_raw_fd(), SetAddr::PEER, addr)?;
+        Ok(UnixSeqpacketConn {
+            fd: socket.into_raw_fd(),
+        })
     }
     /// Binds to an address before connecting to a listening seqpacet socket.
-    pub fn connect_from_to_unix_addr(from: &UnixSocketAddr,  to: &UnixSocketAddr)
-    -> Result<Self, io::Error> {
+    pub fn connect_from_to_unix_addr(
+        from: &UnixSocketAddr,
+        to: &UnixSocketAddr,
+    ) -> Result<Self, io::Error> {
         let socket = Socket::new(SOCK_SEQPACKET, false)?;
         set_unix_addr(socket.as_raw_fd(), SetAddr::LOCAL, from)?;
         set_unix_addr(socket.as_raw_fd(), SetAddr::PEER, to)?;
-        Ok(UnixSeqpacketConn { fd: socket.into_raw_fd() })
+        Ok(UnixSeqpacketConn {
+            fd: socket.into_raw_fd(),
+        })
     }
 
     /// Creates a pair of unix-domain seqpacket conneections connected to each other.
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// let (a, b) = uds::UnixSeqpacketConn::pair().unwrap();
     /// assert!(a.local_unix_addr().unwrap().is_unnamed());
     /// assert!(b.local_unix_addr().unwrap().is_unnamed());
@@ -198,8 +229,12 @@ impl UnixSeqpacketConn {
     /// ```
     pub fn pair() -> Result<(Self, Self), io::Error> {
         let (a, b) = Socket::pair(SOCK_SEQPACKET, false)?;
-        let a = UnixSeqpacketConn { fd: a.into_raw_fd() };
-        let b = UnixSeqpacketConn { fd: b.into_raw_fd() };
+        let a = UnixSeqpacketConn {
+            fd: a.into_raw_fd(),
+        };
+        let b = UnixSeqpacketConn {
+            fd: b.into_raw_fd(),
+        };
         Ok((a, b))
     }
 
@@ -226,27 +261,25 @@ impl UnixSeqpacketConn {
     ///
     /// The default security context is `unconfined`, without any trailing NUL.  
     /// A buffor of 50 bytes is probably always big enough.
-    pub fn initial_peer_selinux_context(&self,  buf: &mut[u8]) -> Result<usize, io::Error> {
+    pub fn initial_peer_selinux_context(&self, buf: &mut [u8]) -> Result<usize, io::Error> {
         selinux_context(self.as_raw_fd(), buf)
     }
 
-
     /// Sends a packet to the peer.
-    pub fn send(&self,  packet: &[u8]) -> Result<usize, io::Error> {
+    pub fn send(&self, packet: &[u8]) -> Result<usize, io::Error> {
         let ptr = packet.as_ptr() as *const c_void;
         let flags = MSG_NOSIGNAL | MSG_EOR;
         let sent = cvt_r!(unsafe { send(self.fd, ptr, packet.len(), flags) })?;
         Ok(sent as usize)
     }
     /// Receives a packet from the peer.
-    pub fn recv(&self,  buffer: &mut[u8]) -> Result<usize, io::Error> {
+    pub fn recv(&self, buffer: &mut [u8]) -> Result<usize, io::Error> {
         let ptr = buffer.as_ptr() as *mut c_void;
         let received = cvt_r!(unsafe { recv(self.fd, ptr, buffer.len(), MSG_NOSIGNAL) })?;
         Ok(received as usize)
     }
     /// Sends a packet assembled from multiple byte slices.
-    pub fn send_vectored(&self,  slices: &[IoSlice])
-    -> Result<usize, io::Error> {
+    pub fn send_vectored(&self, slices: &[IoSlice]) -> Result<usize, io::Error> {
         // Can't use writev() because we need to pass flags,
         // and the flags accepted by pwritev2() aren't the one we need to pass.
         send_ancillary(self.as_raw_fd(), None, MSG_EOR, slices, &[], None)
@@ -255,27 +288,33 @@ impl UnixSeqpacketConn {
     ///
     /// The returned `bool` indicates whether the packet was truncated due to
     /// too short buffers.
-    pub fn recv_vectored(&self,  buffers: &mut[IoSliceMut])
-    -> Result<(usize, bool), io::Error> {
-        recv_ancillary(self.fd, None, 0, buffers, &mut[])
-            .map(|(bytes, ancillary)| (bytes, ancillary.message_truncated()) )
+    pub fn recv_vectored(&self, buffers: &mut [IoSliceMut]) -> Result<(usize, bool), io::Error> {
+        recv_ancillary(self.fd, None, 0, buffers, &mut [])
+            .map(|(bytes, ancillary)| (bytes, ancillary.message_truncated()))
     }
     /// Sends a packet with associated file descriptors.
-    pub fn send_fds(&self,  bytes: &[u8],  fds: &[RawFd])
-    -> Result<usize, io::Error> {
+    pub fn send_fds(&self, bytes: &[u8], fds: &[RawFd]) -> Result<usize, io::Error> {
         send_ancillary(self.fd, None, MSG_EOR, &[IoSlice::new(bytes)], fds, None)
     }
     /// Receives a packet and associated file descriptors.
-    pub fn recv_fds(&self,  byte_buffer: &mut[u8],  fd_buffer: &mut[RawFd])
-    -> Result<(usize, bool, usize), io::Error> {
-        recv_fds(self.fd, None, &mut[IoSliceMut::new(byte_buffer)], fd_buffer)
+    pub fn recv_fds(
+        &self,
+        byte_buffer: &mut [u8],
+        fd_buffer: &mut [RawFd],
+    ) -> Result<(usize, bool, usize), io::Error> {
+        recv_fds(
+            self.fd,
+            None,
+            &mut [IoSliceMut::new(byte_buffer)],
+            fd_buffer,
+        )
     }
     /// Receives a packet without removing it from the incoming queue.
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// let (a, b) = uds::UnixSeqpacketConn::pair().unwrap();
     /// a.send(b"hello").unwrap();
     /// let mut buf = [0u8; 10];
@@ -286,7 +325,7 @@ impl UnixSeqpacketConn {
     /// assert_eq!(b.recv(&mut buf).unwrap(), 5);
     /// assert_eq!(&buf[..5], b"hello");
     /// ```
-    pub fn peek(&self,  buffer: &mut[u8]) -> Result<usize, io::Error> {
+    pub fn peek(&self, buffer: &mut [u8]) -> Result<usize, io::Error> {
         let ptr = buffer.as_ptr() as *mut c_void;
         let flags = MSG_NOSIGNAL | MSG_PEEK;
         let received = cvt_r!(unsafe { recv(self.fd, ptr, buffer.len(), flags) })?;
@@ -296,22 +335,21 @@ impl UnixSeqpacketConn {
     ///
     /// The returned `bool` indicates whether the packet was truncated due to
     /// the combined buffers being too small.
-    pub fn peek_vectored(&self,  buffers: &mut[IoSliceMut])
-    -> Result<(usize, bool), io::Error> {
-        recv_ancillary(self.fd, None, MSG_PEEK, buffers, &mut[])
-            .map(|(bytes, ancillary)| (bytes, ancillary.message_truncated()) )
+    pub fn peek_vectored(&self, buffers: &mut [IoSliceMut]) -> Result<(usize, bool), io::Error> {
+        recv_ancillary(self.fd, None, MSG_PEEK, buffers, &mut [])
+            .map(|(bytes, ancillary)| (bytes, ancillary.message_truncated()))
     }
 
     /// Returns the value of the `SO_ERROR` option.
     ///
     /// This might only provide errors generated from nonblocking `connect()`s,
-    /// which this library doesn't support. It is therefore unlikely to be 
+    /// which this library doesn't support. It is therefore unlikely to be
     /// useful, but is provided for parity with stream counterpart in std.
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// let (a, b) = uds::UnixSeqpacketConn::pair().unwrap();
     /// drop(b);
     ///
@@ -322,15 +360,14 @@ impl UnixSeqpacketConn {
         take_error(self.fd)
     }
 
-
     /// Creates a new file descriptor also pointing to this side of this connection.
     ///
     /// # Examples
     ///
     /// Both new and old can send and receive, and share queues:
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// let (a1, b) = uds::nonblocking::UnixSeqpacketConn::pair().unwrap();
     /// let a2 = a1.try_clone().unwrap();
     ///
@@ -353,8 +390,8 @@ impl UnixSeqpacketConn {
     ///
     /// Clone can still be used after the first one has been closed:
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// let (a, b1) = uds::nonblocking::UnixSeqpacketConn::pair().unwrap();
     /// a.send(b"hello").unwrap();
     ///
@@ -364,7 +401,9 @@ impl UnixSeqpacketConn {
     /// ```
     pub fn try_clone(&self) -> Result<Self, io::Error> {
         let cloned = Socket::try_clone_from(self.fd)?;
-        Ok(UnixSeqpacketConn { fd: cloned.into_raw_fd() })
+        Ok(UnixSeqpacketConn {
+            fd: cloned.into_raw_fd(),
+        })
     }
 
     /// Sets the read timeout to the duration specified.
@@ -383,8 +422,14 @@ impl UnixSeqpacketConn {
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(any(target_vendor="apple", target_os="illumos", target_os="solaris")), doc="```")]
-    #[cfg_attr(any(target_vendor="apple", target_os="illumos", target_os="solaris"), doc="```no_run")]
+    #[cfg_attr(
+        not(any(target_vendor = "apple", target_os = "illumos", target_os = "solaris")),
+        doc = "```"
+    )]
+    #[cfg_attr(
+        any(target_vendor = "apple", target_os = "illumos", target_os = "solaris"),
+        doc = "```no_run"
+    )]
     /// use std::io::ErrorKind;
     /// use std::time::Duration;
     /// use uds::UnixSeqpacketConn;
@@ -394,8 +439,7 @@ impl UnixSeqpacketConn {
     /// let error = a.recv(&mut[0; 1024]).unwrap_err();
     /// assert_eq!(error.kind(), ErrorKind::WouldBlock);
     /// ```
-    pub fn set_read_timeout(&self,  timeout: Option<Duration>)
-    -> Result<(), io::Error> {
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), io::Error> {
         set_timeout(self.fd, TimeoutDirection::READ, timeout)
     }
     /// Returns the read timeout of this socket.
@@ -407,8 +451,14 @@ impl UnixSeqpacketConn {
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(any(target_vendor="apple", target_os="illumos", target_os="solaris")), doc="```")]
-    #[cfg_attr(any(target_vendor="apple", target_os="illumos", target_os="solaris"), doc="```no_run")]
+    #[cfg_attr(
+        not(any(target_vendor = "apple", target_os = "illumos", target_os = "solaris")),
+        doc = "```"
+    )]
+    #[cfg_attr(
+        any(target_vendor = "apple", target_os = "illumos", target_os = "solaris"),
+        doc = "```no_run"
+    )]
     /// use uds::UnixSeqpacketConn;
     /// use std::time::Duration;
     ///
@@ -433,8 +483,14 @@ impl UnixSeqpacketConn {
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(any(target_vendor="apple", target_os="illumos", target_os="solaris")), doc="```")]
-    #[cfg_attr(any(target_vendor="apple", target_os="illumos", target_os="solaris"), doc="```no_run")]
+    #[cfg_attr(
+        not(any(target_vendor = "apple", target_os = "illumos", target_os = "solaris")),
+        doc = "```"
+    )]
+    #[cfg_attr(
+        any(target_vendor = "apple", target_os = "illumos", target_os = "solaris"),
+        doc = "```no_run"
+    )]
     /// # use std::io::ErrorKind;
     /// # use std::time::Duration;
     /// # use uds::UnixSeqpacketConn;
@@ -448,8 +504,7 @@ impl UnixSeqpacketConn {
     ///     }
     /// }
     /// ```
-    pub fn set_write_timeout(&self,  timeout: Option<Duration>)
-    -> Result<(), io::Error> {
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), io::Error> {
         set_timeout(self.fd, TimeoutDirection::WRITE, timeout)
     }
     /// Returns the write timeout of this socket.
@@ -458,8 +513,8 @@ impl UnixSeqpacketConn {
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// let conn = uds::UnixSeqpacketConn::pair().unwrap().0;
     /// assert!(conn.write_timeout().unwrap().is_none());
     /// ```
@@ -476,8 +531,8 @@ impl UnixSeqpacketConn {
     ///
     /// Trying to receive when there are no packets waiting:
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// # use std::io::ErrorKind;
     /// # use uds::UnixSeqpacketConn;
     /// let (a, b) = UnixSeqpacketConn::pair().expect("create seqpacket pair");
@@ -487,8 +542,8 @@ impl UnixSeqpacketConn {
     ///
     /// Trying to send when the OS buffer for the connection is full:
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// # use std::io::ErrorKind;
     /// # use uds::UnixSeqpacketConn;
     /// let (a, b) = UnixSeqpacketConn::pair().expect("create seqpacket pair");
@@ -500,7 +555,7 @@ impl UnixSeqpacketConn {
     ///     }
     /// }
     /// ```
-    pub fn set_nonblocking(&self,  nonblocking: bool) -> Result<(), io::Error> {
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), io::Error> {
         set_nonblocking(self.fd, nonblocking)
     }
 
@@ -516,8 +571,6 @@ impl UnixSeqpacketConn {
     }
 }
 
-
-
 /// An unix domain listener for sequential packet connections.
 ///
 /// See [`UnixSeqpacketConn`](struct.UnixSeqpacketConn.html) for a description
@@ -525,8 +578,8 @@ impl UnixSeqpacketConn {
 ///
 /// # Examples
 ///
-#[cfg_attr(not(target_vendor="apple"), doc="```")]
-#[cfg_attr(target_vendor="apple", doc="```no_run")]
+#[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+#[cfg_attr(target_vendor = "apple", doc = "```no_run")]
 /// # let _ = std::fs::remove_file("seqpacket_listener.socket");
 /// let listener = uds::UnixSeqpacketListener::bind("seqpacket_listener.socket")
 ///     .expect("Create seqpacket listener");
@@ -538,9 +591,9 @@ impl UnixSeqpacketConn {
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct UnixSeqpacketListener {
-    fd: RawFd
+    fd: RawFd,
 }
-impl_rawfd_traits!{UnixSeqpacketListener}
+impl_rawfd_traits! {UnixSeqpacketListener}
 impl UnixSeqpacketListener {
     /// Creates a socket that listens for seqpacket connections on the specified socket file.
     pub fn bind<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
@@ -552,7 +605,9 @@ impl UnixSeqpacketListener {
         let socket = Socket::new(SOCK_SEQPACKET, false)?;
         set_unix_addr(socket.as_raw_fd(), SetAddr::LOCAL, addr)?;
         socket.start_listening()?;
-        Ok(UnixSeqpacketListener { fd: socket.into_raw_fd() })
+        Ok(UnixSeqpacketListener {
+            fd: socket.into_raw_fd(),
+        })
     }
 
     /// Returns the address the socket is listening on.
@@ -561,10 +616,11 @@ impl UnixSeqpacketListener {
     }
 
     /// Accepts a new incoming connection to this listener.
-    pub fn accept_unix_addr(&self)
-    -> Result<(UnixSeqpacketConn, UnixSocketAddr), io::Error> {
+    pub fn accept_unix_addr(&self) -> Result<(UnixSeqpacketConn, UnixSocketAddr), io::Error> {
         let (socket, addr) = Socket::accept_from(self.fd, false)?;
-        let conn = UnixSeqpacketConn { fd: socket.into_raw_fd() };
+        let conn = UnixSeqpacketConn {
+            fd: socket.into_raw_fd(),
+        };
         Ok((conn, addr))
     }
 
@@ -580,7 +636,9 @@ impl UnixSeqpacketListener {
     /// Creates a new file descriptor listening for the same connections.
     pub fn try_clone(&self) -> Result<Self, io::Error> {
         let cloned = Socket::try_clone_from(self.fd)?;
-        Ok(UnixSeqpacketListener { fd: cloned.into_raw_fd() })
+        Ok(UnixSeqpacketListener {
+            fd: cloned.into_raw_fd(),
+        })
     }
 
     /// Sets a maximum duration to wait in a single `accept()` on this socket.
@@ -599,8 +657,11 @@ impl UnixSeqpacketListener {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os="linux", target_os="android"), doc="```")]
-    #[cfg_attr(not(any(target_os="linux", target_os="android")), doc="```no_run")]
+    #[cfg_attr(any(target_os = "linux", target_os = "android"), doc = "```")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        doc = "```no_run"
+    )]
     /// # use uds::{UnixSeqpacketListener, UnixSocketAddr};
     /// # use std::io::ErrorKind;
     /// # use std::time::Duration;
@@ -611,19 +672,20 @@ impl UnixSeqpacketListener {
     /// let err = listener.accept_unix_addr().unwrap_err();
     /// assert_eq!(err.kind(), ErrorKind::WouldBlock);
     /// ```
-    pub fn set_timeout(&self,  timeout: Option<Duration>)
-    -> Result<(), io::Error> {
+    pub fn set_timeout(&self, timeout: Option<Duration>) -> Result<(), io::Error> {
         match set_timeout(self.fd, TimeoutDirection::READ, timeout) {
             #[cfg(any(
-                target_vendor="apple", target_os="freebsd",
-                target_os="netbsd",
-                target_os="illumos", target_os="solaris",
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "illumos",
+                target_os = "solaris",
             ))]
             Ok(()) if timeout.is_some() => Err(io::Error::new(
                 ErrorKind::InvalidInput,
-                "listener timeouts are not supported on this OS"
+                "listener timeouts are not supported on this OS",
             )),
-            result => result
+            result => result,
         }
     }
     /// Returns the timeout for `accept()` on this socket.
@@ -635,8 +697,11 @@ impl UnixSeqpacketListener {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os="linux", target_os="android"), doc="```")]
-    #[cfg_attr(not(any(target_os="linux", target_os="android")), doc="```no_run")]
+    #[cfg_attr(any(target_os = "linux", target_os = "android"), doc = "```")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        doc = "```no_run"
+    )]
     /// # use uds::{UnixSeqpacketListener, UnixSocketAddr};
     /// # use std::time::Duration;
     /// #
@@ -660,8 +725,8 @@ impl UnixSeqpacketListener {
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// # use std::io::ErrorKind;
     /// # use uds::{UnixSocketAddr, UnixSeqpacketListener};
     /// #
@@ -672,12 +737,10 @@ impl UnixSeqpacketListener {
     /// assert_eq!(listener.accept_unix_addr().unwrap_err().kind(), ErrorKind::WouldBlock);
     /// # std::fs::remove_file("nonblocking_seqpacket_listener.socket").expect("delete socket file");
     /// ```
-    pub fn set_nonblocking(&self,  nonblocking: bool) -> Result<(), io::Error> {
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), io::Error> {
         set_nonblocking(self.fd, nonblocking)
     }
 }
-
-
 
 /// A non-blocking unix domain sequential-packet connection.
 ///
@@ -698,8 +761,8 @@ impl UnixSeqpacketListener {
 ///
 /// Sending or receiving when it would block a normal socket:
 ///
-#[cfg_attr(not(target_vendor="apple"), doc="```")]
-#[cfg_attr(target_vendor="apple", doc="```no_run")]
+#[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+#[cfg_attr(target_vendor = "apple", doc = "```no_run")]
 /// use uds::nonblocking::UnixSeqpacketConn;
 /// use std::io::ErrorKind;
 ///
@@ -719,9 +782,9 @@ impl UnixSeqpacketListener {
 ///
 /// Registering with mio (v0.8):
 ///
-#[cfg_attr(all(feature="mio_08", not(target_vendor="apple")), doc="```")]
-#[cfg_attr(all(feature="mio_08", target_vendor="apple"), doc="```no_run")]
-#[cfg_attr(not(feature="mio_08"), doc="```no_compile")]
+#[cfg_attr(all(feature = "mio_08", not(target_vendor = "apple")), doc = "```")]
+#[cfg_attr(all(feature = "mio_08", target_vendor = "apple"), doc = "```no_run")]
+#[cfg_attr(not(feature = "mio_08"), doc = "```no_compile")]
 /// use uds::nonblocking::UnixSeqpacketConn;
 /// use mio_08::{Poll, Events, Token, Interest};
 /// use std::io::ErrorKind;
@@ -749,8 +812,8 @@ pub struct NonblockingUnixSeqpacketConn {
     fd: RawFd,
 }
 
-impl_rawfd_traits!{NonblockingUnixSeqpacketConn}
-impl_mio_if_enabled!{NonblockingUnixSeqpacketConn}
+impl_rawfd_traits! {NonblockingUnixSeqpacketConn}
+impl_mio_if_enabled! {NonblockingUnixSeqpacketConn}
 
 // can't Deref<Target=UnixSeqpacketConn> because that would include try_clone()
 // and later set_(read|write)_timeout()
@@ -767,23 +830,29 @@ impl NonblockingUnixSeqpacketConn {
     pub fn connect_unix_addr(addr: &UnixSocketAddr) -> Result<Self, io::Error> {
         let socket = Socket::new(SOCK_SEQPACKET, true)?;
         set_unix_addr(socket.as_raw_fd(), SetAddr::PEER, addr)?;
-        Ok(NonblockingUnixSeqpacketConn { fd: socket.into_raw_fd() })
+        Ok(NonblockingUnixSeqpacketConn {
+            fd: socket.into_raw_fd(),
+        })
     }
     /// Binds to an address before connecting to a listening seqpacket socket.
-    pub fn connect_from_to_unix_addr(from: &UnixSocketAddr,  to: &UnixSocketAddr)
-    -> Result<Self, io::Error> {
+    pub fn connect_from_to_unix_addr(
+        from: &UnixSocketAddr,
+        to: &UnixSocketAddr,
+    ) -> Result<Self, io::Error> {
         let socket = Socket::new(SOCK_SEQPACKET, true)?;
         set_unix_addr(socket.as_raw_fd(), SetAddr::LOCAL, from)?;
         set_unix_addr(socket.as_raw_fd(), SetAddr::PEER, to)?;
-        Ok(NonblockingUnixSeqpacketConn { fd: socket.into_raw_fd() })
+        Ok(NonblockingUnixSeqpacketConn {
+            fd: socket.into_raw_fd(),
+        })
     }
 
     /// Creates a pair of nonblocking unix-domain seqpacket conneections connected to each other.
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// let (a, b) = uds::nonblocking::UnixSeqpacketConn::pair().unwrap();
     /// assert!(a.local_unix_addr().unwrap().is_unnamed());
     /// assert!(b.local_unix_addr().unwrap().is_unnamed());
@@ -793,8 +862,12 @@ impl NonblockingUnixSeqpacketConn {
     /// ```
     pub fn pair() -> Result<(Self, Self), io::Error> {
         let (a, b) = Socket::pair(SOCK_SEQPACKET, true)?;
-        let a = NonblockingUnixSeqpacketConn { fd: a.into_raw_fd() };
-        let b = NonblockingUnixSeqpacketConn { fd: b.into_raw_fd() };
+        let a = NonblockingUnixSeqpacketConn {
+            fd: a.into_raw_fd(),
+        };
+        let b = NonblockingUnixSeqpacketConn {
+            fd: b.into_raw_fd(),
+        };
         Ok((a, b))
     }
 
@@ -821,26 +894,25 @@ impl NonblockingUnixSeqpacketConn {
     ///
     /// The default security context is `unconfined`, without any trailing NUL.  
     /// A buffor of 50 bytes is probably always big enough.
-    pub fn initial_peer_selinux_context(&self,  buf: &mut[u8]) -> Result<usize, io::Error> {
+    pub fn initial_peer_selinux_context(&self, buf: &mut [u8]) -> Result<usize, io::Error> {
         selinux_context(self.as_raw_fd(), buf)
     }
 
     /// Sends a packet to the peer.
-    pub fn send(&self,  packet: &[u8]) -> Result<usize, io::Error> {
+    pub fn send(&self, packet: &[u8]) -> Result<usize, io::Error> {
         let ptr = packet.as_ptr() as *const c_void;
         let flags = MSG_NOSIGNAL | MSG_EOR;
         let sent = cvt_r!(unsafe { send(self.fd, ptr, packet.len(), flags) })?;
         Ok(sent as usize)
     }
     /// Receives a packet from the peer.
-    pub fn recv(&self,  buffer: &mut[u8]) -> Result<usize, io::Error> {
+    pub fn recv(&self, buffer: &mut [u8]) -> Result<usize, io::Error> {
         let ptr = buffer.as_ptr() as *mut c_void;
         let received = cvt_r!(unsafe { recv(self.fd, ptr, buffer.len(), MSG_NOSIGNAL) })?;
         Ok(received as usize)
     }
     /// Sends a packet assembled from multiple byte slices.
-    pub fn send_vectored(&self,  slices: &[IoSlice])
-    -> Result<usize, io::Error> {
+    pub fn send_vectored(&self, slices: &[IoSlice]) -> Result<usize, io::Error> {
         // Can't use writev() because we need to pass flags,
         // and the flags accepted by pwritev2() aren't the one we need to pass.
         send_ancillary(self.as_raw_fd(), None, MSG_EOR, slices, &[], None)
@@ -849,27 +921,33 @@ impl NonblockingUnixSeqpacketConn {
     ///
     /// The returned `bool` indicates whether the packet was truncated due to
     /// too short buffers.
-    pub fn recv_vectored(&self,  buffers: &mut[IoSliceMut])
-    -> Result<(usize, bool), io::Error> {
-        recv_ancillary(self.fd, None, 0, buffers, &mut[])
-            .map(|(bytes, ancillary)| (bytes, ancillary.message_truncated()) )
+    pub fn recv_vectored(&self, buffers: &mut [IoSliceMut]) -> Result<(usize, bool), io::Error> {
+        recv_ancillary(self.fd, None, 0, buffers, &mut [])
+            .map(|(bytes, ancillary)| (bytes, ancillary.message_truncated()))
     }
     /// Sends a packet with associated file descriptors.
-    pub fn send_fds(&self,  bytes: &[u8],  fds: &[RawFd])
-    -> Result<usize, io::Error> {
+    pub fn send_fds(&self, bytes: &[u8], fds: &[RawFd]) -> Result<usize, io::Error> {
         send_ancillary(self.fd, None, MSG_EOR, &[IoSlice::new(bytes)], fds, None)
     }
     /// Receives a packet and associated file descriptors.
-    pub fn recv_fds(&self,  byte_buffer: &mut[u8],  fd_buffer: &mut[RawFd])
-    -> Result<(usize, bool, usize), io::Error> {
-        recv_fds(self.fd, None, &mut[IoSliceMut::new(byte_buffer)], fd_buffer)
+    pub fn recv_fds(
+        &self,
+        byte_buffer: &mut [u8],
+        fd_buffer: &mut [RawFd],
+    ) -> Result<(usize, bool, usize), io::Error> {
+        recv_fds(
+            self.fd,
+            None,
+            &mut [IoSliceMut::new(byte_buffer)],
+            fd_buffer,
+        )
     }
     /// Receives a packet without removing it from the incoming queue.
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// # use std::io::ErrorKind::*;
     /// let (a, b) = uds::nonblocking::UnixSeqpacketConn::pair().unwrap();
     /// let mut buf = [0u8; 10];
@@ -881,7 +959,7 @@ impl NonblockingUnixSeqpacketConn {
     /// assert_eq!(&buf[..5], b"hello");
     /// assert_eq!(b.peek(&mut buf).unwrap_err().kind(), WouldBlock);
     /// ```
-    pub fn peek(&self,  buffer: &mut[u8]) -> Result<usize, io::Error> {
+    pub fn peek(&self, buffer: &mut [u8]) -> Result<usize, io::Error> {
         let ptr = buffer.as_ptr() as *mut c_void;
         let flags = MSG_NOSIGNAL | MSG_PEEK;
         let received = cvt_r!(unsafe { recv(self.fd, ptr, buffer.len(), flags) })?;
@@ -891,22 +969,21 @@ impl NonblockingUnixSeqpacketConn {
     ///
     /// The returned `bool` indicates whether the packet was truncated due to
     /// the combined buffers being too small.
-    pub fn peek_vectored(&self,  buffers: &mut[IoSliceMut])
-    -> Result<(usize, bool), io::Error> {
-        recv_ancillary(self.fd, None, MSG_PEEK, buffers, &mut[])
-            .map(|(bytes, ancillary)| (bytes, ancillary.message_truncated()) )
+    pub fn peek_vectored(&self, buffers: &mut [IoSliceMut]) -> Result<(usize, bool), io::Error> {
+        recv_ancillary(self.fd, None, MSG_PEEK, buffers, &mut [])
+            .map(|(bytes, ancillary)| (bytes, ancillary.message_truncated()))
     }
 
     /// Returns the value of the `SO_ERROR` option.
     ///
     /// This might only provide errors generated from nonblocking `connect()`s,
-    /// which this library doesn't support. It is therefore unlikely to be 
+    /// which this library doesn't support. It is therefore unlikely to be
     /// useful, but is provided for parity with `mio`s `UnixStream`.
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// let (a, _b) = uds::nonblocking::UnixSeqpacketConn::pair().unwrap();
     ///
     /// assert!(a.recv(&mut[0u8; 1024]).is_err());
@@ -916,13 +993,12 @@ impl NonblockingUnixSeqpacketConn {
         take_error(self.fd)
     }
 
-
     /// Creates a new file descriptor also pointing to this side of this connection.
     ///
     /// # Examples
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// # use uds::nonblocking::UnixSeqpacketConn;
     /// # use std::io::ErrorKind;
     /// #
@@ -939,7 +1015,9 @@ impl NonblockingUnixSeqpacketConn {
     pub fn try_clone(&self) -> Result<Self, io::Error> {
         let cloned = Socket::try_clone_from(self.fd)?;
         // nonblockingness is shared and therefore inherited
-        Ok(NonblockingUnixSeqpacketConn { fd: cloned.into_raw_fd() })
+        Ok(NonblockingUnixSeqpacketConn {
+            fd: cloned.into_raw_fd(),
+        })
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -953,8 +1031,6 @@ impl NonblockingUnixSeqpacketConn {
         Ok(())
     }
 }
-
-
 
 /// A non-blocking unix domain listener for sequential-packet connections.
 ///
@@ -971,8 +1047,8 @@ impl NonblockingUnixSeqpacketConn {
 ///
 /// # Examples
 ///
-#[cfg_attr(not(target_vendor="apple"), doc="```")]
-#[cfg_attr(target_vendor="apple", doc="```no_run")]
+#[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+#[cfg_attr(target_vendor = "apple", doc = "```no_run")]
 /// use uds::nonblocking::{UnixSeqpacketListener, UnixSeqpacketConn};
 /// use std::io::ErrorKind;
 ///
@@ -993,9 +1069,9 @@ impl NonblockingUnixSeqpacketConn {
 ///
 /// Registering with mio v0.8:
 ///
-#[cfg_attr(all(feature="mio_08", not(target_vendor="apple")), doc="```")]
-#[cfg_attr(all(feature="mio_08", target_vendor="apple"), doc="```no_run")]
-#[cfg_attr(not(feature="mio_08"), doc="```no_compile")]
+#[cfg_attr(all(feature = "mio_08", not(target_vendor = "apple")), doc = "```")]
+#[cfg_attr(all(feature = "mio_08", target_vendor = "apple"), doc = "```no_run")]
+#[cfg_attr(not(feature = "mio_08"), doc = "```no_compile")]
 /// use uds::nonblocking::{UnixSeqpacketListener, UnixSeqpacketConn};
 /// use mio_08::{Poll, Events, Token, Interest};
 /// use std::io::ErrorKind;
@@ -1023,11 +1099,11 @@ impl NonblockingUnixSeqpacketConn {
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct NonblockingUnixSeqpacketListener {
-    fd: RawFd
+    fd: RawFd,
 }
 
-impl_rawfd_traits!{NonblockingUnixSeqpacketListener}
-impl_mio_if_enabled!{NonblockingUnixSeqpacketListener}
+impl_rawfd_traits! {NonblockingUnixSeqpacketListener}
+impl_mio_if_enabled! {NonblockingUnixSeqpacketListener}
 
 impl NonblockingUnixSeqpacketListener {
     /// Creates a socket that listens for seqpacket connections on the specified socket file.
@@ -1040,7 +1116,9 @@ impl NonblockingUnixSeqpacketListener {
         let socket = Socket::new(SOCK_SEQPACKET, true)?;
         set_unix_addr(socket.as_raw_fd(), SetAddr::LOCAL, addr)?;
         socket.start_listening()?;
-        Ok(NonblockingUnixSeqpacketListener { fd: socket.into_raw_fd() })
+        Ok(NonblockingUnixSeqpacketListener {
+            fd: socket.into_raw_fd(),
+        })
     }
 
     /// Returns the address this listener was bound to.
@@ -1054,8 +1132,8 @@ impl NonblockingUnixSeqpacketListener {
     ///
     /// Doesn't block if no connections are waiting:
     ///
-    #[cfg_attr(not(target_vendor="apple"), doc="```")]
-    #[cfg_attr(target_vendor="apple", doc="```no_run")]
+    #[cfg_attr(not(target_vendor = "apple"), doc = "```")]
+    #[cfg_attr(target_vendor = "apple", doc = "```no_run")]
     /// # use uds::nonblocking::UnixSeqpacketListener;
     /// # use std::io::ErrorKind;
     /// #
@@ -1065,10 +1143,13 @@ impl NonblockingUnixSeqpacketListener {
     /// assert_eq!(listener.accept_unix_addr().unwrap_err().kind(), ErrorKind::WouldBlock);
     /// std::fs::remove_file("nonblocking_seqpacket_listener.socket").unwrap();
     /// ```
-    pub fn accept_unix_addr(&self)
-    -> Result<(NonblockingUnixSeqpacketConn, UnixSocketAddr), io::Error> {
+    pub fn accept_unix_addr(
+        &self,
+    ) -> Result<(NonblockingUnixSeqpacketConn, UnixSocketAddr), io::Error> {
         let (socket, addr) = Socket::accept_from(self.fd, true)?;
-        let conn = NonblockingUnixSeqpacketConn { fd: socket.into_raw_fd() };
+        let conn = NonblockingUnixSeqpacketConn {
+            fd: socket.into_raw_fd(),
+        };
         Ok((conn, addr))
     }
 
@@ -1080,8 +1161,11 @@ impl NonblockingUnixSeqpacketListener {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os="linux", target_os="android"), doc="```")]
-    #[cfg_attr(not(any(target_os="linux", target_os="android")), doc="```no_run")]
+    #[cfg_attr(any(target_os = "linux", target_os = "android"), doc = "```")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        doc = "```no_run"
+    )]
     /// let listener = uds::nonblocking::UnixSeqpacketListener::bind_unix_addr(
     ///     &uds::UnixSocketAddr::new("@nonblocking_take_error").unwrap()
     /// ).unwrap();
@@ -1097,6 +1181,8 @@ impl NonblockingUnixSeqpacketListener {
     pub fn try_clone(&self) -> Result<Self, io::Error> {
         let cloned = Socket::try_clone_from(self.fd)?;
         // nonblockingness is shared and therefore inherited
-        Ok(NonblockingUnixSeqpacketListener { fd: cloned.into_raw_fd() })
+        Ok(NonblockingUnixSeqpacketListener {
+            fd: cloned.into_raw_fd(),
+        })
     }
 }

@@ -1,15 +1,15 @@
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-use std::os::unix::net::UnixStream as stdUnixStream;
-use std::os::unix::net::UnixListener as stdUnixListener;
 use std::io;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::net::UnixListener as stdUnixListener;
+use std::os::unix::net::UnixStream as stdUnixStream;
 
-use tokio::net::{UnixStream, UnixListener, UnixDatagram};
+use tokio::net::{UnixDatagram, UnixListener, UnixStream};
 
 use libc::SOCK_STREAM;
 
 use crate::addr::UnixSocketAddr;
-use crate::helpers::*;
 use crate::credentials::*;
+use crate::helpers::*;
 
 mod private {
     use super::*;
@@ -35,11 +35,17 @@ pub trait UnixStreamExt: AsRawFd + private::Sealed {
     }
 
     /// Creates a connection to a listening path-based or abstract named socket.
-    fn connect_to_unix_addr(addr: &UnixSocketAddr) -> Result<Self, io::Error> where Self: Sized;
+    fn connect_to_unix_addr(addr: &UnixSocketAddr) -> Result<Self, io::Error>
+    where
+        Self: Sized;
 
     /// Creates a path-based or abstract-named socket and connects to a listening socket.
-    fn connect_from_to_unix_addr(from: &UnixSocketAddr,  to: &UnixSocketAddr)
-    -> Result<Self, io::Error> where Self: Sized;
+    fn connect_from_to_unix_addr(
+        from: &UnixSocketAddr,
+        to: &UnixSocketAddr,
+    ) -> Result<Self, io::Error>
+    where
+        Self: Sized;
 
     /// Returns the credentials of the process that created the other end of this stream.
     fn initial_peer_credentials(&self) -> Result<ConnCredentials, io::Error> {
@@ -53,7 +59,7 @@ pub trait UnixStreamExt: AsRawFd + private::Sealed {
     ///
     /// The default security context is `unconfined`, without any trailing NUL.  
     /// A buffor of 50 bytes is probably always big enough.
-    fn initial_peer_selinux_context(&self,  buffer: &mut[u8]) -> Result<usize, io::Error> {
+    fn initial_peer_selinux_context(&self, buffer: &mut [u8]) -> Result<usize, io::Error> {
         selinux_context(self.as_raw_fd(), buffer)
     }
 }
@@ -64,8 +70,10 @@ impl UnixStreamExt for UnixStream {
         set_unix_addr(socket.as_raw_fd(), SetAddr::PEER, addr)?;
         UnixStream::from_std(unsafe { stdUnixStream::from_raw_fd(socket.into_raw_fd()) })
     }
-    fn connect_from_to_unix_addr(from: &UnixSocketAddr,  to: &UnixSocketAddr)
-    -> Result<Self, io::Error> {
+    fn connect_from_to_unix_addr(
+        from: &UnixSocketAddr,
+        to: &UnixSocketAddr,
+    ) -> Result<Self, io::Error> {
         let socket = Socket::new(SOCK_STREAM, true)?;
         set_unix_addr(socket.as_raw_fd(), SetAddr::LOCAL, from)?;
         set_unix_addr(socket.as_raw_fd(), SetAddr::PEER, to)?;
@@ -81,7 +89,9 @@ pub trait UnixListenerExt: AsRawFd + private::Sealed {
     type Conn;
 
     /// Creates a socket bound to a `UnixSocketAddr` and starts listening on it.
-    fn bind_unix_addr(on: &UnixSocketAddr) -> Result<Self, io::Error> where Self: Sized;
+    fn bind_unix_addr(on: &UnixSocketAddr) -> Result<Self, io::Error>
+    where
+        Self: Sized;
 
     /// Returns the address this socket is listening on.
     fn local_unix_addr(&self) -> Result<UnixSocketAddr, io::Error> {
@@ -108,8 +118,11 @@ pub trait UnixDatagramExt: AsRawFd + private::Sealed {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os="linux", target_os="android"), doc="```")]
-    #[cfg_attr(not(any(target_os="linux", target_os="android")), doc="```no_run")]
+    #[cfg_attr(any(target_os = "linux", target_os = "android"), doc = "```")]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        doc = "```no_run"
+    )]
     /// # use tokio::net::UnixDatagram;
     /// # use uds::{tokio::UnixDatagramExt, UnixSocketAddr};
     /// #
@@ -136,7 +149,9 @@ pub trait UnixDatagramExt: AsRawFd + private::Sealed {
     /// # Ok(())
     /// # }
     /// ```
-    fn bind_unix_addr(addr: &UnixSocketAddr) -> Result<Self, io::Error> where Self: Sized;
+    fn bind_unix_addr(addr: &UnixSocketAddr) -> Result<Self, io::Error>
+    where
+        Self: Sized;
 
     /// Returns the address of this socket, as a type that fully supports abstract addresses.
     fn local_unix_addr(&self) -> Result<UnixSocketAddr, io::Error> {
@@ -148,11 +163,11 @@ pub trait UnixDatagramExt: AsRawFd + private::Sealed {
     }
 
     /// Creates a path or abstract name for the socket.
-    fn bind_to_unix_addr(&self,  addr: &UnixSocketAddr) -> Result<(), io::Error> {
+    fn bind_to_unix_addr(&self, addr: &UnixSocketAddr) -> Result<(), io::Error> {
         set_unix_addr(self.as_raw_fd(), SetAddr::LOCAL, addr)
     }
     /// Connects the socket to a path-based or abstract named socket.
-    fn connect_to_unix_addr(&self,  addr: &UnixSocketAddr) -> Result<(), io::Error> {
+    fn connect_to_unix_addr(&self, addr: &UnixSocketAddr) -> Result<(), io::Error> {
         set_unix_addr(self.as_raw_fd(), SetAddr::PEER, addr)
     }
 
@@ -187,7 +202,7 @@ pub trait UnixDatagramExt: AsRawFd + private::Sealed {
     /// or if running under kubernetes.
     ///
     /// The default security context is the string `unconfined`.
-    fn initial_pair_selinux_context(&self,  buffer: &mut[u8]) -> Result<usize, io::Error> {
+    fn initial_pair_selinux_context(&self, buffer: &mut [u8]) -> Result<usize, io::Error> {
         selinux_context(self.as_raw_fd(), buffer)
     }
 }
@@ -198,8 +213,8 @@ impl UnixDatagramExt for UnixDatagram {
             Ok(socket) => match socket.bind_to_unix_addr(addr) {
                 Ok(()) => Ok(socket),
                 Err(e) => Err(e),
-            }
-            Err(e) => Err(e)
+            },
+            Err(e) => Err(e),
         }
     }
 }
