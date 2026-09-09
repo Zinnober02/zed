@@ -43,12 +43,18 @@ smallvec.workspace = true
 ui.workspace = true
 util.workspace = true
 
-[target.'cfg(not(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd")))'.dependencies]
+# OHOS uses the mock client like Windows-GNU and FreeBSD: no WebRTC, and
+# libwebrtc would pull GLib in.
+[target.'cfg(not(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd", target_env = "ohos")))'.dependencies]
 libwebrtc.workspace = true
 livekit.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio = { workspace = true, features = ["time"] }
+
+# OHOS reports target_os = "linux" but uses the mock client, so it needs no
+# WebRTC bindings.
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
 webrtc-sys.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies]

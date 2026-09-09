@@ -1,0 +1,18 @@
+#!/usr/bin/sh
+# Diagnostic pkg-config stub for the OHOS target.
+#
+# OHOS has none of the Linux system libraries (X11, ALSA, GLib), so their
+# build scripts cannot find them. This stub answers every query so that
+# `cargo check` can run past them and reveal the Rust-level issues. It is not
+# used for real builds.
+case "$1" in
+    --version) echo "0.29.2" ;;
+    --modversion) echo "1.0.0" ;;
+    --libs) echo "" ;;
+    --libs-only-l) echo "" ;;
+    --libs-only-L) echo "" ;;
+    --cflags) echo "" ;;
+    --variable=*) echo "" ;;
+    *) exit 0 ;;
+esac
+exit 0
