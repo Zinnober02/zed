@@ -58,6 +58,11 @@ visual-tests = [
     "title_bar/test-support",
 ]
 
+# The startup logic lives in the library so the OHOS entry point can share it.
+[lib]
+name = "zed_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "zed"
 path = "src/main.rs"
