@@ -32,7 +32,9 @@ pub mod scap_screen_capture;
     not(target_env = "ohos"),
 ))]
 pub(crate) type PlatformScreenCaptureFrame = scap::frame::Frame;
-#[cfg(not(feature = "screen-capture"))]
+// OHOS has no screen-capture backend; keep the type defined so the rest of
+// the crate still compiles with the feature enabled.
+#[cfg(any(not(feature = "screen-capture"), target_env = "ohos"))]
 pub(crate) type PlatformScreenCaptureFrame = ();
 #[cfg(all(target_os = "macos", feature = "screen-capture"))]
 pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBuffer;
