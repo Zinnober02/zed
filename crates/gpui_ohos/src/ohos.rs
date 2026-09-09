@@ -143,6 +143,11 @@ pub fn list_picked_dir(uri: &str) -> Vec<(String, bool, String)> {
     host::list_dir(uri)
 }
 
+/// Logical pixels per device pixel used by the backend renderer.
+pub fn scale() -> f32 {
+    window::SCALE
+}
+
 /// Read the system clipboard. Needs ohos.permission.READ_PASTEBOARD.
 pub fn read_clipboard() -> Option<String> {
     clipboard::read_text()
