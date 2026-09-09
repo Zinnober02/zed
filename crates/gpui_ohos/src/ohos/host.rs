@@ -6,7 +6,7 @@
 //! (focus, window status, color mode, lifecycle, picker results) arrive back
 //! through \`host_event\`.
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{CString, c_char, c_void};
 use std::sync::OnceLock;
 
 /// Commands the backend sends to the host. Fire-and-forget.
@@ -24,7 +24,6 @@ pub(crate) mod op {
     pub const SET_CURSOR: i32 = 11;
     pub const PICK_PATHS: i32 = 12;
     pub const PICK_NEW_PATH: i32 = 13;
-    pub const SET_MENUS: i32 = 14;
     pub const REQUEST_FOCUS: i32 = 15;
     /// Create another OHOS window with an XComponent named by the argument.
     pub const CREATE_WINDOW: i32 = 16;
@@ -33,10 +32,7 @@ pub(crate) mod op {
 /// Synchronous queries. The host writes a UTF-8 answer into the buffer.
 pub(crate) mod query {
     pub const WINDOW_RECT: i32 = 100;
-    pub const WINDOW_STATUS: i32 = 101;
     pub const COLOR_MODE: i32 = 102;
-    pub const WINDOW_ID: i32 = 103;
-    pub const DISPLAY: i32 = 104;
     /// Open a picked file read/write and return its descriptor.
     pub const OPEN_FILE: i32 = 105;
     /// List a picked directory: "name|isDir|uri" per line.
@@ -93,7 +89,14 @@ pub(crate) fn query(op: i32, arg: &str) -> Option<String> {
     let call = ops.query?;
     let arg = CString::new(arg).ok()?;
     let mut buffer = vec![0u8; 4096];
-    let written = unsafe { call(op, arg.as_ptr(), buffer.as_mut_ptr() as *mut c_char, buffer.len()) };
+    let written = unsafe {
+        call(
+            op,
+            arg.as_ptr(),
+            buffer.as_mut_ptr() as *mut c_char,
+            buffer.len(),
+        )
+    };
     if written < 0 {
         return None;
     }
@@ -102,14 +105,6 @@ pub(crate) fn query(op: i32, arg: &str) -> Option<String> {
         buffer.pop();
     }
     String::from_utf8(buffer).ok()
-}
-
-/// Convert a host-provided C string to an owned Rust string.
-pub(crate) fn cstr(ptr: *const c_char) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
 }
 
 const SEEK_SET: i32 = 0;
@@ -149,8 +144,13 @@ pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
     let bytes = data.as_bytes();
     let mut written = 0usize;
     while written < bytes.len() {
-        let count =
-            unsafe { write(fd, bytes[written..].as_ptr() as *const c_void, bytes.len() - written) };
+        let count = unsafe {
+            write(
+                fd,
+                bytes[written..].as_ptr() as *const c_void,
+                bytes.len() - written,
+            )
+        };
         if count <= 0 {
             return Err(std::io::Error::last_os_error());
         }

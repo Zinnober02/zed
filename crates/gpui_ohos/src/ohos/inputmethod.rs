@@ -5,7 +5,7 @@
 //! drains the queue on the UI thread and pushes text/selection updates back to
 //! the input method, which is what makes it enter composing mode.
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -20,11 +20,7 @@ pub(crate) enum ImeCommand {
     Commit(String),
     Backspace(usize),
     DeleteForward(usize),
-    Preview {
-        text: String,
-        start: i32,
-        end: i32,
-    },
+    Preview { text: String, start: i32, end: i32 },
     ClearPreview,
     MoveCursor(i32),
 }
@@ -99,8 +95,10 @@ unsafe extern "C" fn on_finish_preview(_proxy: *mut c_void) {
 
 unsafe extern "C" fn on_get_text_config(_proxy: *mut c_void, config: *mut c_void) {
     if let Some(set) = SET_INPUT_TYPE.get() {
+        // SAFETY: the host passes a valid config object and the setter is the
+        // one registered by the input method framework.
         // 1 = IME_TEXT_INPUT_TYPE_MULTILINE
-        set(config, 1);
+        unsafe { set(config, 1) };
     }
 }
 
@@ -119,10 +117,14 @@ unsafe extern "C" fn write_text_slice(number: i32, text: *mut u16, length: *mut 
         &chars[caret..(caret + count).min(chars.len())]
     };
     if !text.is_null() && !length.is_null() {
-        let capacity = *length;
-        let copied = slice.len().min(capacity);
-        std::ptr::copy_nonoverlapping(slice.as_ptr(), text, copied);
-        *length = copied;
+        // SAFETY: both pointers are non-null and the capacity came from the
+        // caller, which owns a buffer of that size.
+        unsafe {
+            let capacity = *length;
+            let copied = slice.len().min(capacity);
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), text, copied);
+            *length = copied;
+        }
     }
 }
 
@@ -132,7 +134,8 @@ unsafe extern "C" fn on_get_left_text(
     text: *mut u16,
     length: *mut usize,
 ) {
-    write_text_slice(number, text, length, true);
+    // SAFETY: the pointers come straight from the input method.
+    unsafe { write_text_slice(number, text, length, true) };
 }
 
 unsafe extern "C" fn on_get_right_text(
@@ -141,15 +144,22 @@ unsafe extern "C" fn on_get_right_text(
     text: *mut u16,
     length: *mut usize,
 ) {
-    write_text_slice(number, text, length, false);
+    // SAFETY: the pointers come straight from the input method.
+    unsafe { write_text_slice(number, text, length, false) };
 }
 
 unsafe extern "C" fn on_enter_key(_proxy: *mut c_void, _kind: i32) {
-    QUEUE.lock().unwrap().push(ImeCommand::Commit("\n".to_string()));
+    QUEUE
+        .lock()
+        .unwrap()
+        .push(ImeCommand::Commit("\n".to_string()));
 }
 
 unsafe extern "C" fn on_move_cursor(_proxy: *mut c_void, direction: i32) {
-    QUEUE.lock().unwrap().push(ImeCommand::MoveCursor(direction));
+    QUEUE
+        .lock()
+        .unwrap()
+        .push(ImeCommand::MoveCursor(direction));
 }
 
 unsafe extern "C" fn on_noop(_proxy: *mut c_void) {}
@@ -193,40 +203,29 @@ pub(crate) fn attach() {
         type ProxySet = unsafe extern "C" fn(*mut c_void, *const c_void) -> i32;
         type SetInputType = unsafe extern "C" fn(*mut c_void, i32) -> i32;
         type OptionsCreate = unsafe extern "C" fn(bool) -> *mut c_void;
-        type Attach =
-            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32;
+        type Attach = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32;
         type ShowTextInput = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
         type HideTextInput = unsafe extern "C" fn(*mut c_void) -> i32;
-        type NotifySelection =
-            unsafe extern "C" fn(*mut c_void, *mut u16, usize, i32, i32) -> i32;
+        type NotifySelection = unsafe extern "C" fn(*mut c_void, *mut u16, usize, i32, i32) -> i32;
         type NotifyCursor = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
         type CursorCreate = unsafe extern "C" fn(f64, f64, f64, f64) -> *mut c_void;
 
         let proxy_create: ProxyCreate = sym!("OH_TextEditorProxy_Create", ProxyCreate);
         let set_insert: ProxySet = sym!("OH_TextEditorProxy_SetInsertTextFunc", ProxySet);
-        let set_backward: ProxySet =
-            sym!("OH_TextEditorProxy_SetDeleteBackwardFunc", ProxySet);
+        let set_backward: ProxySet = sym!("OH_TextEditorProxy_SetDeleteBackwardFunc", ProxySet);
         let set_forward: ProxySet = sym!("OH_TextEditorProxy_SetDeleteForwardFunc", ProxySet);
-        let set_preview: ProxySet =
-            sym!("OH_TextEditorProxy_SetSetPreviewTextFunc", ProxySet);
-        let set_finish: ProxySet =
-            sym!("OH_TextEditorProxy_SetFinishTextPreviewFunc", ProxySet);
-        let set_config: ProxySet =
-            sym!("OH_TextEditorProxy_SetGetTextConfigFunc", ProxySet);
-        let set_status: ProxySet =
-            sym!("OH_TextEditorProxy_SetSendKeyboardStatusFunc", ProxySet);
+        let set_preview: ProxySet = sym!("OH_TextEditorProxy_SetSetPreviewTextFunc", ProxySet);
+        let set_finish: ProxySet = sym!("OH_TextEditorProxy_SetFinishTextPreviewFunc", ProxySet);
+        let set_config: ProxySet = sym!("OH_TextEditorProxy_SetGetTextConfigFunc", ProxySet);
+        let set_status: ProxySet = sym!("OH_TextEditorProxy_SetSendKeyboardStatusFunc", ProxySet);
         let set_enter: ProxySet = sym!("OH_TextEditorProxy_SetSendEnterKeyFunc", ProxySet);
         let set_move: ProxySet = sym!("OH_TextEditorProxy_SetMoveCursorFunc", ProxySet);
         let set_selection: ProxySet =
             sym!("OH_TextEditorProxy_SetHandleSetSelectionFunc", ProxySet);
-        let set_extend: ProxySet =
-            sym!("OH_TextEditorProxy_SetHandleExtendActionFunc", ProxySet);
-        let set_left: ProxySet =
-            sym!("OH_TextEditorProxy_SetGetLeftTextOfCursorFunc", ProxySet);
-        let set_right: ProxySet =
-            sym!("OH_TextEditorProxy_SetGetRightTextOfCursorFunc", ProxySet);
-        let set_index: ProxySet =
-            sym!("OH_TextEditorProxy_SetGetTextIndexAtCursorFunc", ProxySet);
+        let set_extend: ProxySet = sym!("OH_TextEditorProxy_SetHandleExtendActionFunc", ProxySet);
+        let set_left: ProxySet = sym!("OH_TextEditorProxy_SetGetLeftTextOfCursorFunc", ProxySet);
+        let set_right: ProxySet = sym!("OH_TextEditorProxy_SetGetRightTextOfCursorFunc", ProxySet);
+        let set_index: ProxySet = sym!("OH_TextEditorProxy_SetGetTextIndexAtCursorFunc", ProxySet);
         let set_private: ProxySet =
             sym!("OH_TextEditorProxy_SetReceivePrivateCommandFunc", ProxySet);
         let set_input_type: SetInputType = sym!("OH_TextConfig_SetInputType", SetInputType);
@@ -238,7 +237,9 @@ pub(crate) fn attach() {
         // must not abort the whole attach.
         let hide_raw = dlsym(
             lib,
-            CString::new("OH_InputMethodProxy_HideKeyboard").unwrap().as_ptr(),
+            CString::new("OH_InputMethodProxy_HideKeyboard")
+                .unwrap()
+                .as_ptr(),
         );
         let hide_text_input: Option<HideTextInput> = if hide_raw.is_null() {
             super::vk::log("[gpui_ohos] missing IME symbol: OH_InputMethodProxy_HideKeyboard");
@@ -322,7 +323,9 @@ pub fn show() {
     }
     // 12800009 IME_ERR_DETACHED: the system unbinds the client when the window
     // loses focus, and a detached client rejects ShowTextInput. Bind again.
-    super::vk::log(&format!("[gpui_ohos] IME show failed code={code}; re-attaching"));
+    super::vk::log(&format!(
+        "[gpui_ohos] IME show failed code={code}; re-attaching"
+    ));
     *ATTACHED.lock().unwrap() = false;
     *IME_CONTEXT.lock().unwrap() = (String::new(), 0, (0.0, 0.0, 2.0, 20.0));
     attach();
@@ -383,15 +386,24 @@ pub(crate) fn update_context(text: &str, caret: usize, cursor: (f64, f64, f64, f
 }
 
 pub fn commit_text(text: &str) {
-    QUEUE.lock().unwrap().push(ImeCommand::Commit(text.to_string()));
+    QUEUE
+        .lock()
+        .unwrap()
+        .push(ImeCommand::Commit(text.to_string()));
 }
 
 pub fn delete_backward(length: usize) {
-    QUEUE.lock().unwrap().push(ImeCommand::Backspace(length.max(1)));
+    QUEUE
+        .lock()
+        .unwrap()
+        .push(ImeCommand::Backspace(length.max(1)));
 }
 
 pub fn delete_forward(length: usize) {
-    QUEUE.lock().unwrap().push(ImeCommand::DeleteForward(length.max(1)));
+    QUEUE
+        .lock()
+        .unwrap()
+        .push(ImeCommand::DeleteForward(length.max(1)));
 }
 
 pub fn preview_text(text: &str) {

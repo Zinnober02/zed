@@ -14,12 +14,12 @@ use raw_window_handle::{
 };
 
 use crate::{
-    AtlasTextureKind, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, ForegroundExecutor,
+    AtlasTextureKind, Bounds, Capslock, Decorations, DispatchEventResult, ForegroundExecutor,
     GpuSpecs, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, ScrollDelta,
-    ScrollWheelEvent, Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowParams, point, px,
+    ScrollWheelEvent, Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowParams, point, px,
 };
 
 use super::atlas::OhosAtlas;
@@ -99,7 +99,7 @@ pub(crate) struct WindowShared {
 impl WindowShared {
     pub(crate) fn new(
         surface: Rc<RefCell<SurfaceState>>,
-        params: WindowParams,
+        _params: WindowParams,
         foreground_executor: ForegroundExecutor,
     ) -> Rc<Self> {
         let (w, h) = {
@@ -417,16 +417,6 @@ impl WindowShared {
             touch_phase: phase,
         }));
     }
-
-    pub(crate) fn set_modifiers(&self, modifiers: Modifiers) {
-        self.modifiers.set(modifiers);
-        self.dispatch_input(PlatformInput::ModifiersChanged(
-            crate::ModifiersChangedEvent {
-                modifiers,
-                capslock: Capslock::default(),
-            },
-        ));
-    }
 }
 
 pub(crate) struct OhosWindow {
@@ -521,7 +511,12 @@ impl PlatformWindow for OhosWindow {
 
     fn activate(&self) {
         self.shared.active.set(true);
-        let mut callback = self.shared.callbacks.borrow_mut().active_status_change.take();
+        let mut callback = self
+            .shared
+            .callbacks
+            .borrow_mut()
+            .active_status_change
+            .take();
         if let Some(cb) = callback.as_mut() {
             cb(true);
         }
@@ -555,7 +550,11 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn toggle_fullscreen(&self) {
-        let target = if self.shared.fullscreen.get() { "0" } else { "1" };
+        let target = if self.shared.fullscreen.get() {
+            "0"
+        } else {
+            "1"
+        };
         host::window_op(host::op::SET_FULLSCREEN, target);
     }
 
@@ -599,10 +598,7 @@ impl PlatformWindow for OhosWindow {
         self.shared.callbacks.borrow_mut().appearance_changed = Some(callback);
     }
 
-    fn on_hit_test_window_control(
-        &self,
-        callback: Box<dyn FnMut() -> Option<WindowControlArea>>,
-    ) {
+    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
         self.shared.callbacks.borrow_mut().hit_test_window_control = Some(callback);
     }
 
@@ -773,8 +769,20 @@ fn scene_hash(scene: &Scene) -> u64 {
     for sprite in &scene.monochrome_sprites {
         sprite.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
         sprite.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
-        sprite.bounds.size.width.as_f32().to_bits().hash(&mut hasher);
-        sprite.bounds.size.height.as_f32().to_bits().hash(&mut hasher);
+        sprite
+            .bounds
+            .size
+            .width
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        sprite
+            .bounds
+            .size
+            .height
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
         sprite.tile.bounds.origin.x.0.hash(&mut hasher);
         sprite.tile.bounds.origin.y.0.hash(&mut hasher);
         sprite.tile.bounds.size.width.0.hash(&mut hasher);
@@ -787,4 +795,3 @@ fn scene_hash(scene: &Scene) -> u64 {
     }
     hasher.finish()
 }
-

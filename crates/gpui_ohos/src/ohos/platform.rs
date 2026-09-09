@@ -12,8 +12,8 @@ use futures::channel::oneshot;
 
 use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    Keymap, Menu, MenuItem, Modifiers, OwnedMenu, PathPromptOptions, Platform, PlatformInput,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    Keymap, Menu, MenuItem, Modifiers, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay,
+    PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task,
     ThermalState, WindowAppearance, WindowParams,
 };
@@ -196,14 +196,6 @@ impl OhosPlatform {
             }
             _ => {}
         }
-    }
-
-    pub(crate) fn appearance(&self) -> WindowAppearance {
-        self.appearance.get()
-    }
-
-    pub(crate) fn window_rect(&self) -> (f32, f32, f32, f32) {
-        self.window_rect.get()
     }
 
     pub(crate) fn take_restore_folder(&self) -> Option<String> {

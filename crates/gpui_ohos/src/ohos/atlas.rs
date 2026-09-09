@@ -25,6 +25,8 @@ fn bytes_per_pixel(kind: AtlasTextureKind) -> usize {
 }
 
 pub(crate) struct AtlasTexture {
+    /// Part of the atlas identity; only one texture kind is used today.
+    #[allow(dead_code)]
     pub kind: AtlasTextureKind,
     pub width: u32,
     pub height: u32,
@@ -33,6 +35,8 @@ pub(crate) struct AtlasTexture {
 
 /// A dirty region to upload into the GPU atlas texture.
 pub(crate) struct AtlasUpload {
+    /// See AtlasTexture::kind.
+    #[allow(dead_code)]
     pub kind: AtlasTextureKind,
     pub x: u32,
     pub y: u32,
@@ -148,18 +152,15 @@ impl PlatformAtlas for OhosAtlas {
 
         let kind = key.texture_kind();
         let kind_idx = kind as usize;
-        let Some(alloc) = state.allocators[kind_idx]
-            .allocate(size2(glyph_size.width.0, glyph_size.height.0))
+        let Some(alloc) =
+            state.allocators[kind_idx].allocate(size2(glyph_size.width.0, glyph_size.height.0))
         else {
             return Ok(None);
         };
         let rect = alloc.rectangle;
         let bounds = Bounds {
             origin: point(DevicePixels(rect.min.x), DevicePixels(rect.min.y)),
-            size: size(
-                DevicePixels(rect.width()),
-                DevicePixels(rect.height()),
-            ),
+            size: size(DevicePixels(rect.width()), DevicePixels(rect.height())),
         };
 
         let bpp = bytes_per_pixel(kind);
@@ -170,8 +171,7 @@ impl PlatformAtlas for OhosAtlas {
             let dst = (rect.min.y as usize + row) * dst_stride + rect.min.x as usize * bpp;
             let src = row * src_stride;
             if src + src_stride <= bytes.len() && dst + src_stride <= texture.cpu.len() {
-                texture.cpu[dst..dst + src_stride]
-                    .copy_from_slice(&bytes[src..src + src_stride]);
+                texture.cpu[dst..dst + src_stride].copy_from_slice(&bytes[src..src + src_stride]);
             }
         }
         state.dirty.push((kind, bounds));

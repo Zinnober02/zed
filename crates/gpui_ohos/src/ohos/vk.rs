@@ -9,7 +9,7 @@
 
 #![allow(non_camel_case_types)]
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::GpuSpecs;
@@ -48,7 +48,6 @@ const VK_STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0;
 const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
 const VK_STRUCTURE_TYPE_SURFACE_CREATE_INFO_OHOS: u32 = 1000685000;
 const VK_API_VERSION_1_0: u32 = 1 << 22;
-const VK_MAX_EXTENSION_NAME_SIZE: usize = 256;
 const OHOS_SURFACE_EXT: &str = "VK_OHOS_surface";
 
 const ST_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
@@ -343,13 +342,8 @@ struct VkClearRect {
     layer_count: u32,
 }
 
-type PFN_vkCmdClearAttachments = unsafe extern "C" fn(
-    *mut c_void,
-    u32,
-    *const VkClearAttachment,
-    u32,
-    *const VkClearRect,
-);
+type PFN_vkCmdClearAttachments =
+    unsafe extern "C" fn(*mut c_void, u32, *const VkClearAttachment, u32, *const VkClearRect);
 
 /// A solid rectangle painted over the base clear color, in surface pixels.
 #[derive(Clone, Copy)]
@@ -451,7 +445,8 @@ type PFN_vkCreateSwapchainKHR = unsafe extern "C" fn(
     *mut u64,
 ) -> i32;
 type PFN_vkDestroySwapchainKHR = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
-type PFN_vkGetSwapchainImagesKHR = unsafe extern "C" fn(*mut c_void, u64, *mut u32, *mut u64) -> i32;
+type PFN_vkGetSwapchainImagesKHR =
+    unsafe extern "C" fn(*mut c_void, u64, *mut u32, *mut u64) -> i32;
 type PFN_vkCreateImageView =
     unsafe extern "C" fn(*mut c_void, *const VkImageViewCreateInfo, *const c_void, *mut u64) -> i32;
 type PFN_vkDestroyImageView = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
@@ -490,12 +485,8 @@ type PFN_vkCreateFence =
     unsafe extern "C" fn(*mut c_void, *const VkFenceCreateInfo, *const c_void, *mut u64) -> i32;
 type PFN_vkWaitForFences = unsafe extern "C" fn(*mut c_void, u32, *const u64, u32, u64) -> i32;
 type PFN_vkResetFences = unsafe extern "C" fn(*mut c_void, u32, *const u64) -> i32;
-type PFN_vkCreateSemaphore = unsafe extern "C" fn(
-    *mut c_void,
-    *const VkSemaphoreCreateInfo,
-    *const c_void,
-    *mut u64,
-) -> i32;
+type PFN_vkCreateSemaphore =
+    unsafe extern "C" fn(*mut c_void, *const VkSemaphoreCreateInfo, *const c_void, *mut u64) -> i32;
 type PFN_vkCreateSurfaceOHOS = unsafe extern "C" fn(
     *mut c_void,
     *const VkSurfaceCreateInfoOHOS,
@@ -579,7 +570,8 @@ impl VkRenderer {
             anyhow::bail!("dlopen(libvulkan.so) failed");
         }
 
-        let gpa_sym = unsafe { dlsym(lib, CString::new("vkGetInstanceProcAddr").unwrap().as_ptr()) };
+        let gpa_sym =
+            unsafe { dlsym(lib, CString::new("vkGetInstanceProcAddr").unwrap().as_ptr()) };
         if gpa_sym.is_null() {
             anyhow::bail!("dlsym(vkGetInstanceProcAddr) failed");
         }
@@ -620,7 +612,12 @@ impl VkRenderer {
             anyhow::bail!("vkCreateInstance failed: {vr}");
         }
 
-        let cs_raw = unsafe { gpa(instance, CString::new("vkCreateSurfaceOHOS").unwrap().as_ptr()) };
+        let cs_raw = unsafe {
+            gpa(
+                instance,
+                CString::new("vkCreateSurfaceOHOS").unwrap().as_ptr(),
+            )
+        };
         if cs_raw.is_null() {
             anyhow::bail!("vkCreateSurfaceOHOS symbol missing");
         }
@@ -644,7 +641,8 @@ impl VkRenderer {
             ))
         };
         let mut pcount: u32 = 0;
-        if unsafe { ephys(instance, &mut pcount, std::ptr::null_mut()) } != VK_SUCCESS || pcount == 0
+        if unsafe { ephys(instance, &mut pcount, std::ptr::null_mut()) } != VK_SUCCESS
+            || pcount == 0
         {
             anyhow::bail!("no physical device");
         }
@@ -655,7 +653,9 @@ impl VkRenderer {
         let qfp: PFN_vkGetPhysicalDeviceQueueFamilyProperties = unsafe {
             std::mem::transmute(gpa(
                 instance,
-                CString::new("vkGetPhysicalDeviceQueueFamilyProperties").unwrap().as_ptr(),
+                CString::new("vkGetPhysicalDeviceQueueFamilyProperties")
+                    .unwrap()
+                    .as_ptr(),
             ))
         };
         let mut qcount: u32 = 0;
@@ -673,7 +673,9 @@ impl VkRenderer {
         let ssup: PFN_vkGetPhysicalDeviceSurfaceSupportKHR = unsafe {
             std::mem::transmute(gpa(
                 instance,
-                CString::new("vkGetPhysicalDeviceSurfaceSupportKHR").unwrap().as_ptr(),
+                CString::new("vkGetPhysicalDeviceSurfaceSupportKHR")
+                    .unwrap()
+                    .as_ptr(),
             ))
         };
         let mut queue_family = u32::MAX;
@@ -713,7 +715,10 @@ impl VkRenderer {
             p_enabled_features: std::ptr::null(),
         };
         let create_device: PFN_vkCreateDevice = unsafe {
-            std::mem::transmute(gpa(instance, CString::new("vkCreateDevice").unwrap().as_ptr()))
+            std::mem::transmute(gpa(
+                instance,
+                CString::new("vkCreateDevice").unwrap().as_ptr(),
+            ))
         };
         let mut device: *mut c_void = std::ptr::null_mut();
         let dr = unsafe { create_device(physical_device, &dci, std::ptr::null(), &mut device) };
@@ -730,7 +735,12 @@ impl VkRenderer {
         let fns = DeviceFns {
             get_queue: load!(gpd, device, "vkGetDeviceQueue", PFN_vkGetDeviceQueue),
             wait_idle: load!(gpd, device, "vkDeviceWaitIdle", PFN_vkDeviceWaitIdle),
-            create_swapchain: load!(gpd, device, "vkCreateSwapchainKHR", PFN_vkCreateSwapchainKHR),
+            create_swapchain: load!(
+                gpd,
+                device,
+                "vkCreateSwapchainKHR",
+                PFN_vkCreateSwapchainKHR
+            ),
             destroy_swapchain: load!(
                 gpd,
                 device,
@@ -1025,9 +1035,18 @@ impl VkRenderer {
         let mut caps = VkSurfaceCapabilitiesKHR {
             min_image_count: 0,
             max_image_count: 0,
-            current_extent: VkExtent2D { width: 0, height: 0 },
-            min_image_extent: VkExtent2D { width: 0, height: 0 },
-            max_image_extent: VkExtent2D { width: 0, height: 0 },
+            current_extent: VkExtent2D {
+                width: 0,
+                height: 0,
+            },
+            min_image_extent: VkExtent2D {
+                width: 0,
+                height: 0,
+            },
+            max_image_extent: VkExtent2D {
+                width: 0,
+                height: 0,
+            },
             max_image_array_layers: 0,
             supported_transforms: 0,
             current_transform: 0,
@@ -1037,7 +1056,14 @@ impl VkRenderer {
         unsafe { caps_f(self.physical_device, self.surface, &mut caps) };
 
         let mut fcount: u32 = 0;
-        unsafe { fmt_f(self.physical_device, self.surface, &mut fcount, std::ptr::null_mut()) };
+        unsafe {
+            fmt_f(
+                self.physical_device,
+                self.surface,
+                &mut fcount,
+                std::ptr::null_mut(),
+            )
+        };
         let mut fmts = vec![
             VkSurfaceFormatKHR {
                 format: FMT_R8G8B8A8_UNORM,
@@ -1046,7 +1072,14 @@ impl VkRenderer {
             fcount.max(1) as usize
         ];
         if fcount > 0 {
-            unsafe { fmt_f(self.physical_device, self.surface, &mut fcount, fmts.as_mut_ptr()) };
+            unsafe {
+                fmt_f(
+                    self.physical_device,
+                    self.surface,
+                    &mut fcount,
+                    fmts.as_mut_ptr(),
+                )
+            };
         }
         let chosen = fmts
             .iter()
@@ -1057,10 +1090,24 @@ impl VkRenderer {
         self.format = chosen.format;
 
         let mut mcount: u32 = 0;
-        unsafe { mode_f(self.physical_device, self.surface, &mut mcount, std::ptr::null_mut()) };
+        unsafe {
+            mode_f(
+                self.physical_device,
+                self.surface,
+                &mut mcount,
+                std::ptr::null_mut(),
+            )
+        };
         let mut modes = vec![PRESENT_MODE_FIFO; mcount.max(1) as usize];
         if mcount > 0 {
-            unsafe { mode_f(self.physical_device, self.surface, &mut mcount, modes.as_mut_ptr()) };
+            unsafe {
+                mode_f(
+                    self.physical_device,
+                    self.surface,
+                    &mut mcount,
+                    modes.as_mut_ptr(),
+                )
+            };
         }
         let present_mode = if modes.contains(&PRESENT_MODE_MAILBOX) {
             PRESENT_MODE_MAILBOX
@@ -1179,8 +1226,9 @@ impl VkRenderer {
                 layers: 1,
             };
             let mut fb: u64 = 0;
-            let r =
-                unsafe { (self.fns.create_framebuffer)(self.device, &fbci, std::ptr::null(), &mut fb) };
+            let r = unsafe {
+                (self.fns.create_framebuffer)(self.device, &fbci, std::ptr::null(), &mut fb)
+            };
             if r != VK_SUCCESS {
                 anyhow::bail!("vkCreateFramebuffer failed: {r}");
             }
@@ -1219,12 +1267,14 @@ impl VkRenderer {
         self.create_swapchain()
     }
 
-    /// Clear the swapchain image to color and present it.
+    /// Clear the swapchain to color and present it.
+    #[allow(dead_code)] // the documented swapchain clear path; scenes use render_scene
     pub fn render_clear(&mut self, color: [f32; 4]) -> anyhow::Result<()> {
         self.render_frame(color, &[])
     }
 
     /// Clear the swapchain to color, then paint rects in order on top.
+    #[allow(dead_code)] // see render_clear
     pub fn render_frame(&mut self, color: [f32; 4], rects: &[ClearRect]) -> anyhow::Result<()> {
         unsafe {
             (self.fns.wait_for_fences)(self.device, 1, &self.in_flight, 1, u64::MAX);
@@ -1576,9 +1626,7 @@ impl VkRenderer {
         }
         anyhow::bail!("no suitable Vulkan memory type (required {required:#x})")
     }
-
 }
-
 
 // ===========================================================================
 // GPU glyph pipeline (textured quads from the monochrome atlas)
@@ -1610,8 +1658,6 @@ const SAMPLE_COUNT_1: u32 = 1;
 const SHADER_STAGE_VERTEX: u32 = 0x1;
 const SHADER_STAGE_FRAGMENT: u32 = 0x10;
 const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: u32 = 1;
-const DESCRIPTOR_TYPE_SAMPLER: u32 = 0;
-const FILTER_NEAREST: u32 = 0;
 const FILTER_LINEAR: u32 = 1;
 const SAMPLER_MIPMAP_MODE_NEAREST: u32 = 0;
 const SAMPLER_ADDRESS_CLAMP_TO_EDGE: u32 = 2;
@@ -1911,21 +1957,13 @@ struct VkGraphicsPipelineCreateInfo {
     base_pipeline_index: i32,
 }
 
-type PFN_vkCreateImage = unsafe extern "C" fn(
-    *mut c_void,
-    *const VkImageCreateInfo,
-    *const c_void,
-    *mut u64,
-) -> i32;
+type PFN_vkCreateImage =
+    unsafe extern "C" fn(*mut c_void, *const VkImageCreateInfo, *const c_void, *mut u64) -> i32;
 type PFN_vkGetImageMemoryRequirements =
     unsafe extern "C" fn(*mut c_void, u64, *mut VkMemoryRequirements);
 type PFN_vkBindImageMemory = unsafe extern "C" fn(*mut c_void, u64, u64, u64) -> i32;
-type PFN_vkCreateSampler = unsafe extern "C" fn(
-    *mut c_void,
-    *const VkSamplerCreateInfo,
-    *const c_void,
-    *mut u64,
-) -> i32;
+type PFN_vkCreateSampler =
+    unsafe extern "C" fn(*mut c_void, *const VkSamplerCreateInfo, *const c_void, *mut u64) -> i32;
 type PFN_vkCreateDescriptorSetLayout = unsafe extern "C" fn(
     *mut c_void,
     *const VkDescriptorSetLayoutCreateInfo,
@@ -1938,11 +1976,8 @@ type PFN_vkCreateDescriptorPool = unsafe extern "C" fn(
     *const c_void,
     *mut u64,
 ) -> i32;
-type PFN_vkAllocateDescriptorSets = unsafe extern "C" fn(
-    *mut c_void,
-    *const VkDescriptorSetAllocateInfo,
-    *mut u64,
-) -> i32;
+type PFN_vkAllocateDescriptorSets =
+    unsafe extern "C" fn(*mut c_void, *const VkDescriptorSetAllocateInfo, *mut u64) -> i32;
 type PFN_vkUpdateDescriptorSets =
     unsafe extern "C" fn(*mut c_void, u32, *const VkWriteDescriptorSet, u32, *const c_void);
 type PFN_vkCreatePipelineLayout = unsafe extern "C" fn(
@@ -1966,14 +2001,18 @@ type PFN_vkCreateGraphicsPipelines = unsafe extern "C" fn(
     *mut u64,
 ) -> i32;
 type PFN_vkCmdBindPipeline = unsafe extern "C" fn(*mut c_void, u32, u64);
-type PFN_vkCmdBindVertexBuffers = unsafe extern "C" fn(*mut c_void, u32, u32, *const u64, *const u64);
+type PFN_vkCmdBindVertexBuffers =
+    unsafe extern "C" fn(*mut c_void, u32, u32, *const u64, *const u64);
 type PFN_vkCmdBindDescriptorSets =
     unsafe extern "C" fn(*mut c_void, u32, u64, u32, u32, *const u64, u32, *const u32);
 type PFN_vkCmdDraw = unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32);
 type PFN_vkCmdSetViewport = unsafe extern "C" fn(*mut c_void, u32, u32, *const VkViewport);
 type PFN_vkCmdSetScissor = unsafe extern "C" fn(*mut c_void, u32, u32, *const VkRect2D);
 
+/// Vertex layout shared with the shader: the fields are written into the GPU
+/// buffer and never read back on the CPU.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub struct GlyphVertex {
     pub x: f32,
     pub y: f32,
@@ -1985,6 +2024,9 @@ pub struct GlyphVertex {
     pub a: f32,
 }
 
+/// Owns the descriptor set, image view and sampler: the handles are held to
+/// keep the Vulkan objects alive, not read back.
+#[allow(dead_code)]
 struct TextPipeline {
     descriptor_set_layout: u64,
     descriptor_pool: u64,
@@ -2011,20 +2053,22 @@ fn load_spirv() -> &'static [u32] {
     unsafe { std::slice::from_raw_parts(BYTES.as_ptr() as *const u32, BYTES.len() / 4) }
 }
 
-
 impl VkRenderer {
     fn create_text_pipeline(&mut self) -> anyhow::Result<()> {
-        let create_image: PFN_vkCreateImage =
-            dev_fn!(self, "vkCreateImage", PFN_vkCreateImage);
-        let image_reqs: PFN_vkGetImageMemoryRequirements =
-            dev_fn!(self, "vkGetImageMemoryRequirements", PFN_vkGetImageMemoryRequirements);
+        let create_image: PFN_vkCreateImage = dev_fn!(self, "vkCreateImage", PFN_vkCreateImage);
+        let image_reqs: PFN_vkGetImageMemoryRequirements = dev_fn!(
+            self,
+            "vkGetImageMemoryRequirements",
+            PFN_vkGetImageMemoryRequirements
+        );
         let bind_image: PFN_vkBindImageMemory =
             dev_fn!(self, "vkBindImageMemory", PFN_vkBindImageMemory);
         let create_view: PFN_vkCreateImageView =
             dev_fn!(self, "vkCreateImageView", PFN_vkCreateImageView);
         let create_sampler: PFN_vkCreateSampler =
             dev_fn!(self, "vkCreateSampler", PFN_vkCreateSampler);
-        let alloc_mem: PFN_vkAllocateMemory = inst_fn!(self, "vkAllocateMemory", PFN_vkAllocateMemory);
+        let alloc_mem: PFN_vkAllocateMemory =
+            inst_fn!(self, "vkAllocateMemory", PFN_vkAllocateMemory);
         let create_set_layout: PFN_vkCreateDescriptorSetLayout = dev_fn!(
             self,
             "vkCreateDescriptorSetLayout",
@@ -2032,8 +2076,11 @@ impl VkRenderer {
         );
         let create_pool: PFN_vkCreateDescriptorPool =
             dev_fn!(self, "vkCreateDescriptorPool", PFN_vkCreateDescriptorPool);
-        let alloc_sets: PFN_vkAllocateDescriptorSets =
-            dev_fn!(self, "vkAllocateDescriptorSets", PFN_vkAllocateDescriptorSets);
+        let alloc_sets: PFN_vkAllocateDescriptorSets = dev_fn!(
+            self,
+            "vkAllocateDescriptorSets",
+            PFN_vkAllocateDescriptorSets
+        );
         let update_sets: PFN_vkUpdateDescriptorSets =
             dev_fn!(self, "vkUpdateDescriptorSets", PFN_vkUpdateDescriptorSets);
         let create_layout: PFN_vkCreatePipelineLayout =
@@ -2053,7 +2100,11 @@ impl VkRenderer {
             flags: 0,
             image_type: IMAGE_TYPE_2D,
             format: FORMAT_R8_UNORM,
-            extent: VkExtent3D { width: ATLAS, height: ATLAS, depth: 1 },
+            extent: VkExtent3D {
+                width: ATLAS,
+                height: ATLAS,
+                depth: 1,
+            },
             mip_levels: 1,
             array_layers: 1,
             samples: SAMPLE_COUNT_1,
@@ -2068,7 +2119,11 @@ impl VkRenderer {
         if unsafe { create_image(self.device, &ici, std::ptr::null(), &mut image) } != VK_SUCCESS {
             anyhow::bail!("vkCreateImage failed");
         }
-        let mut reqs = VkMemoryRequirements { size: 0, alignment: 0, memory_type_bits: 0 };
+        let mut reqs = VkMemoryRequirements {
+            size: 0,
+            alignment: 0,
+            memory_type_bits: 0,
+        };
         unsafe { image_reqs(self.device, image, &mut reqs) };
         let memory_type = self.find_memory_type(reqs.memory_type_bits, 0)?;
         let ai = VkMemoryAllocateInfo {
@@ -2078,7 +2133,8 @@ impl VkRenderer {
             memory_type_index: memory_type,
         };
         let mut image_memory: u64 = 0;
-        if unsafe { alloc_mem(self.device, &ai, std::ptr::null(), &mut image_memory) } != VK_SUCCESS {
+        if unsafe { alloc_mem(self.device, &ai, std::ptr::null(), &mut image_memory) } != VK_SUCCESS
+        {
             anyhow::bail!("vkAllocateMemory (image) failed");
         }
         if unsafe { bind_image(self.device, image, image_memory, 0) } != VK_SUCCESS {
@@ -2091,7 +2147,12 @@ impl VkRenderer {
             image,
             view_type: IMAGE_VIEW_TYPE_2D,
             format: FORMAT_R8_UNORM,
-            components: VkComponentMapping { r: 0, g: 0, b: 0, a: 0 },
+            components: VkComponentMapping {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            },
             subresource_range: VkImageSubresourceRange {
                 aspect_mask: ASPECT_COLOR,
                 base_mip_level: 0,
@@ -2125,7 +2186,9 @@ impl VkRenderer {
             unnormalized_coordinates: 0,
         };
         let mut sampler: u64 = 0;
-        if unsafe { create_sampler(self.device, &sci, std::ptr::null(), &mut sampler) } != VK_SUCCESS {
+        if unsafe { create_sampler(self.device, &sci, std::ptr::null(), &mut sampler) }
+            != VK_SUCCESS
+        {
             anyhow::bail!("vkCreateSampler failed");
         }
 
@@ -2145,7 +2208,12 @@ impl VkRenderer {
         };
         let mut descriptor_set_layout: u64 = 0;
         if unsafe {
-            create_set_layout(self.device, &dslci, std::ptr::null(), &mut descriptor_set_layout)
+            create_set_layout(
+                self.device,
+                &dslci,
+                std::ptr::null(),
+                &mut descriptor_set_layout,
+            )
         } != VK_SUCCESS
         {
             anyhow::bail!("vkCreateDescriptorSetLayout failed");
@@ -2223,7 +2291,8 @@ impl VkRenderer {
             p_code: spirv.as_ptr(),
         };
         let mut shader: u64 = 0;
-        if unsafe { create_shader(self.device, &smci, std::ptr::null(), &mut shader) } != VK_SUCCESS {
+        if unsafe { create_shader(self.device, &smci, std::ptr::null(), &mut shader) } != VK_SUCCESS
+        {
             anyhow::bail!("vkCreateShaderModule failed");
         }
         let entry = CString::new("vs_main").unwrap();
@@ -2254,9 +2323,24 @@ impl VkRenderer {
             input_rate: VERTEX_INPUT_RATE_VERTEX,
         };
         let attributes = [
-            VkVertexInputAttributeDescription { location: 0, binding: 0, format: FORMAT_R32G32_SFLOAT, offset: 0 },
-            VkVertexInputAttributeDescription { location: 1, binding: 0, format: FORMAT_R32G32_SFLOAT, offset: 8 },
-            VkVertexInputAttributeDescription { location: 2, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 16 },
+            VkVertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: FORMAT_R32G32_SFLOAT,
+                offset: 0,
+            },
+            VkVertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: FORMAT_R32G32_SFLOAT,
+                offset: 8,
+            },
+            VkVertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: FORMAT_R32G32B32A32_SFLOAT,
+                offset: 16,
+            },
         ];
         let visci = VkPipelineVertexInputStateCreateInfo {
             s_type: ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -2284,7 +2368,10 @@ impl VkRenderer {
         };
         let scissor = VkRect2D {
             offset: [0, 0],
-            extent: VkExtent2D { width: self.width, height: self.height },
+            extent: VkExtent2D {
+                width: self.width,
+                height: self.height,
+            },
         };
         let vpsci = VkPipelineViewportStateCreateInfo {
             s_type: ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -2401,13 +2488,15 @@ impl VkRenderer {
     }
 
     fn create_host_buffer(&self, size: u64, usage: u32) -> anyhow::Result<(u64, u64, *mut u8)> {
-        let create_buffer: PFN_vkCreateBuffer = inst_fn!(self, "vkCreateBuffer", PFN_vkCreateBuffer);
+        let create_buffer: PFN_vkCreateBuffer =
+            inst_fn!(self, "vkCreateBuffer", PFN_vkCreateBuffer);
         let get_reqs: PFN_vkGetBufferMemoryRequirements = inst_fn!(
             self,
             "vkGetBufferMemoryRequirements",
             PFN_vkGetBufferMemoryRequirements
         );
-        let alloc_mem: PFN_vkAllocateMemory = inst_fn!(self, "vkAllocateMemory", PFN_vkAllocateMemory);
+        let alloc_mem: PFN_vkAllocateMemory =
+            inst_fn!(self, "vkAllocateMemory", PFN_vkAllocateMemory);
         let bind_mem: PFN_vkBindBufferMemory =
             inst_fn!(self, "vkBindBufferMemory", PFN_vkBindBufferMemory);
         let map_mem: PFN_vkMapMemory = inst_fn!(self, "vkMapMemory", PFN_vkMapMemory);
@@ -2422,10 +2511,15 @@ impl VkRenderer {
             p_queue_family_indices: std::ptr::null(),
         };
         let mut buffer: u64 = 0;
-        if unsafe { create_buffer(self.device, &bci, std::ptr::null(), &mut buffer) } != VK_SUCCESS {
+        if unsafe { create_buffer(self.device, &bci, std::ptr::null(), &mut buffer) } != VK_SUCCESS
+        {
             anyhow::bail!("vkCreateBuffer failed");
         }
-        let mut reqs = VkMemoryRequirements { size: 0, alignment: 0, memory_type_bits: 0 };
+        let mut reqs = VkMemoryRequirements {
+            size: 0,
+            alignment: 0,
+            memory_type_bits: 0,
+        };
         unsafe { get_reqs(self.device, buffer, &mut reqs) };
         let memory_type = self.find_memory_type(
             reqs.memory_type_bits,
@@ -2472,7 +2566,12 @@ impl VkRenderer {
         let mut image_index: u32 = 0;
         let ar = unsafe {
             (self.fns.acquire_next_image)(
-                self.device, self.swapchain, u64::MAX, self.image_available, 0, &mut image_index,
+                self.device,
+                self.swapchain,
+                u64::MAX,
+                self.image_available,
+                0,
+                &mut image_index,
             )
         };
         if ar == VK_ERROR_OUT_OF_DATE_KHR {
@@ -2533,8 +2632,16 @@ impl VkRenderer {
                         base_array_layer: 0,
                         layer_count: 1,
                     },
-                    image_offset: VkOffset3D { x: upload.x as i32, y: upload.y as i32, z: 0 },
-                    image_extent: VkExtent3D { width: upload.width, height: upload.height, depth: 1 },
+                    image_offset: VkOffset3D {
+                        x: upload.x as i32,
+                        y: upload.y as i32,
+                        z: 0,
+                    },
+                    image_extent: VkExtent3D {
+                        width: upload.width,
+                        height: upload.height,
+                        depth: 1,
+                    },
                 });
                 offset += upload.data.len() as u64;
             }
@@ -2575,7 +2682,13 @@ impl VkRenderer {
                     self.command_buffer,
                     PIPELINE_STAGE_FRAGMENT_SHADER,
                     PIPELINE_STAGE_TRANSFER,
-                    0, 0, std::ptr::null(), 0, std::ptr::null(), 1, &to_dst,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    1,
+                    &to_dst,
                 );
                 copy_image(
                     self.command_buffer,
@@ -2589,13 +2702,27 @@ impl VkRenderer {
                     self.command_buffer,
                     PIPELINE_STAGE_TRANSFER,
                     PIPELINE_STAGE_FRAGMENT_SHADER,
-                    0, 0, std::ptr::null(), 0, std::ptr::null(), 1, &to_read,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    1,
+                    &to_read,
                 );
             }
             let _ = (staging_memory, staging_buffer);
         }
-        let clear = VkClearValue { clear_color: VkClearColorValue { f: color } };
-        let area = VkRect2D { offset: [0, 0], extent: VkExtent2D { width: self.width, height: self.height } };
+        let clear = VkClearValue {
+            clear_color: VkClearColorValue { f: color },
+        };
+        let area = VkRect2D {
+            offset: [0, 0],
+            extent: VkExtent2D {
+                width: self.width,
+                height: self.height,
+            },
+        };
         let rpbi = VkRenderPassBeginInfo {
             s_type: ST_RENDER_PASS_BEGIN_INFO,
             p_next: std::ptr::null(),
@@ -2605,34 +2732,54 @@ impl VkRenderer {
             clear_value_count: 1,
             p_clear_values: &clear,
         };
-        unsafe { (self.fns.begin_render_pass)(self.command_buffer, &rpbi, SUBPASS_CONTENTS_INLINE) };
+        unsafe {
+            (self.fns.begin_render_pass)(self.command_buffer, &rpbi, SUBPASS_CONTENTS_INLINE)
+        };
         for rect in rects {
             self.cmd_clear_rect(*rect);
         }
         if !vertices.is_empty() {
-            let bind_pipeline: PFN_vkCmdBindPipeline = dev_fn!(self, "vkCmdBindPipeline", PFN_vkCmdBindPipeline);
+            let bind_pipeline: PFN_vkCmdBindPipeline =
+                dev_fn!(self, "vkCmdBindPipeline", PFN_vkCmdBindPipeline);
             let bind_vertex: PFN_vkCmdBindVertexBuffers =
                 dev_fn!(self, "vkCmdBindVertexBuffers", PFN_vkCmdBindVertexBuffers);
             let bind_sets: PFN_vkCmdBindDescriptorSets =
                 dev_fn!(self, "vkCmdBindDescriptorSets", PFN_vkCmdBindDescriptorSets);
             let draw: PFN_vkCmdDraw = dev_fn!(self, "vkCmdDraw", PFN_vkCmdDraw);
-            let set_viewport: PFN_vkCmdSetViewport = dev_fn!(self, "vkCmdSetViewport", PFN_vkCmdSetViewport);
-            let set_scissor: PFN_vkCmdSetScissor = dev_fn!(self, "vkCmdSetScissor", PFN_vkCmdSetScissor);
+            let set_viewport: PFN_vkCmdSetViewport =
+                dev_fn!(self, "vkCmdSetViewport", PFN_vkCmdSetViewport);
+            let set_scissor: PFN_vkCmdSetScissor =
+                dev_fn!(self, "vkCmdSetScissor", PFN_vkCmdSetScissor);
             let text = self.text.as_ref().expect("text pipeline");
             let viewport = VkViewport {
-                x: 0.0, y: 0.0,
-                width: self.width as f32, height: self.height as f32,
-                min_depth: 0.0, max_depth: 1.0,
+                x: 0.0,
+                y: 0.0,
+                width: self.width as f32,
+                height: self.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
             };
-            let scissor = VkRect2D { offset: [0, 0], extent: VkExtent2D { width: self.width, height: self.height } };
+            let scissor = VkRect2D {
+                offset: [0, 0],
+                extent: VkExtent2D {
+                    width: self.width,
+                    height: self.height,
+                },
+            };
             unsafe {
                 set_viewport(self.command_buffer, 0, 1, &viewport);
                 set_scissor(self.command_buffer, 0, 1, &scissor);
                 bind_pipeline(self.command_buffer, BIND_POINT_GRAPHICS, text.pipeline);
                 bind_vertex(self.command_buffer, 0, 1, &text.vertex_buffer, &0u64);
                 bind_sets(
-                    self.command_buffer, BIND_POINT_GRAPHICS, text.pipeline_layout, 0, 1,
-                    &text.descriptor_set, 0, std::ptr::null(),
+                    self.command_buffer,
+                    BIND_POINT_GRAPHICS,
+                    text.pipeline_layout,
+                    0,
+                    1,
+                    &text.descriptor_set,
+                    0,
+                    std::ptr::null(),
                 );
                 draw(self.command_buffer, vertices.len() as u32, 1, 0, 0);
             }

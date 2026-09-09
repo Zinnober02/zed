@@ -1,0 +1,29 @@
+#!/bin/sh
+# Format staged Rust files before committing.
+#
+# The full workspace clippy (./script/clippy) cannot run here: it resolves
+# every workspace crate and needs git dependencies too large to fetch. gpui_ohos
+# is checked by building the app crate, whose dependency graph covers it.
+set -e
+
+files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)
+if [ -z "$files" ]; then
+    exit 0
+fi
+
+formatter=$(command -v rustfmt || true)
+if [ -z "$formatter" ]; then
+    echo "pre-commit: rustfmt not found, skipping formatting" >&2
+    exit 0
+fi
+
+for file in $files; do
+    [ -f "$file" ] || continue
+    before=$(git hash-object "$file")
+    "$formatter" --edition 2021 "$file" >/dev/null 2>&1 || true
+    after=$(git hash-object "$file")
+    if [ "$before" != "$after" ]; then
+        git add "$file"
+        echo "pre-commit: formatted $file"
+    fi
+done
