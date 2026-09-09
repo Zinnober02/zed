@@ -987,6 +987,8 @@ nix = { path = "patches/nix" }
 # OHOS: ALSA's ioctl request code is c_int there, like musl; ALSA itself does
 # not exist on OHOS, this only keeps the Rust side compiling.
 alsa = { path = "patches/alsa" }
+# OHOS: like musl, its cmsg length fields are socklen_t, not size_t.
+uds = { path = "patches/uds" }
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "0890bbb8ca40a4b5d1f67031698dd7918b37d991" }
 webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "0a1c519cfce9b365229026b55de9b9dbdb6fed3c" }
 
