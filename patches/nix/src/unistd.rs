@@ -2,14 +2,14 @@
 
 use crate::errno::Errno;
 
+#[cfg(not(target_os = "redox"))]
+#[cfg(feature = "fs")]
+use crate::fcntl::AtFlags;
 #[cfg(any(
     all(feature = "fs", not(target_os = "redox")),
     all(feature = "process", linux_android)
 ))]
 use crate::fcntl::at_rawfd;
-#[cfg(not(target_os = "redox"))]
-#[cfg(feature = "fs")]
-use crate::fcntl::AtFlags;
 
 #[cfg(feature = "fs")]
 #[cfg(any(
@@ -30,9 +30,7 @@ use crate::sys::stat::Mode;
 use crate::{Error, NixPath, Result};
 #[cfg(not(target_os = "redox"))]
 use cfg_if::cfg_if;
-use libc::{
-    c_char, c_int, c_long, c_uint, gid_t, mode_t, off_t, pid_t, size_t, uid_t,
-};
+use libc::{c_char, c_int, c_long, c_uint, gid_t, mode_t, off_t, pid_t, size_t, uid_t};
 use std::convert::Infallible;
 #[cfg(not(target_os = "redox"))]
 use std::ffi::CString;
@@ -1093,8 +1091,7 @@ pub fn close(fd: RawFd) -> Result<()> {
 ///
 /// See also [read(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/read.html)
 pub fn read(fd: RawFd, buf: &mut [u8]) -> Result<usize> {
-    let res =
-        unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len() as size_t) };
+    let res = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len() as size_t) };
 
     Errno::result(res).map(|r| r as usize)
 }
@@ -2888,11 +2885,7 @@ mod pivot_root {
     ) -> Result<()> {
         let res = new_root.with_nix_path(|new_root| {
             put_old.with_nix_path(|put_old| unsafe {
-                libc::syscall(
-                    libc::SYS_pivot_root,
-                    new_root.as_ptr(),
-                    put_old.as_ptr(),
-                )
+                libc::syscall(libc::SYS_pivot_root, new_root.as_ptr(), put_old.as_ptr())
             })
         })??;
 

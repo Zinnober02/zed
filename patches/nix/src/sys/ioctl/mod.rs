@@ -245,9 +245,7 @@ pub use self::bsd::*;
 #[macro_export]
 #[doc(hidden)]
 macro_rules! convert_ioctl_res {
-    ($w:expr) => {{
-        $crate::errno::Errno::result($w)
-    }};
+    ($w:expr) => {{ $crate::errno::Errno::result($w) }};
 }
 
 /// Generates a wrapper function for an ioctl that passes no data to the kernel.

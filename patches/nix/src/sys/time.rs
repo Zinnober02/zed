@@ -26,7 +26,7 @@ const fn zero_init_timespec() -> timespec {
     )
 ))]
 pub(crate) mod timer {
-    use crate::sys::time::{zero_init_timespec, TimeSpec};
+    use crate::sys::time::{TimeSpec, zero_init_timespec};
     use bitflags::bitflags;
 
     #[derive(Debug, Clone, Copy)]
@@ -60,12 +60,10 @@ pub(crate) mod timer {
                     it_interval: zero_init_timespec(),
                     it_value: *t.as_ref(),
                 }),
-                Expiration::IntervalDelayed(start, interval) => {
-                    TimerSpec(libc::itimerspec {
-                        it_interval: *interval.as_ref(),
-                        it_value: *start.as_ref(),
-                    })
-                }
+                Expiration::IntervalDelayed(start, interval) => TimerSpec(libc::itimerspec {
+                    it_interval: *interval.as_ref(),
+                    it_value: *start.as_ref(),
+                }),
                 Expiration::Interval(t) => TimerSpec(libc::itimerspec {
                     it_interval: *t.as_ref(),
                     it_value: *t.as_ref(),
@@ -121,15 +119,10 @@ pub(crate) mod timer {
                     it_interval: int_ts,
                     it_value: val_ts,
                 }) => {
-                    if (int_ts.tv_sec == val_ts.tv_sec)
-                        && (int_ts.tv_nsec == val_ts.tv_nsec)
-                    {
+                    if (int_ts.tv_sec == val_ts.tv_sec) && (int_ts.tv_nsec == val_ts.tv_nsec) {
                         Expiration::Interval(int_ts.into())
                     } else {
-                        Expiration::IntervalDelayed(
-                            val_ts.into(),
-                            int_ts.into(),
-                        )
+                        Expiration::IntervalDelayed(val_ts.into(), int_ts.into())
                     }
                 }
             }
@@ -331,13 +324,11 @@ impl TimeSpec {
     /// Leave the timestamp unchanged.
     #[cfg(not(target_os = "redox"))]
     // At the time of writing this PR, redox does not support this feature
-    pub const UTIME_OMIT: TimeSpec =
-        TimeSpec::new(0, libc::UTIME_OMIT as timespec_tv_nsec_t);
+    pub const UTIME_OMIT: TimeSpec = TimeSpec::new(0, libc::UTIME_OMIT as timespec_tv_nsec_t);
     /// Update the timestamp to `Now`
     // At the time of writing this PR, redox does not support this feature
     #[cfg(not(target_os = "redox"))]
-    pub const UTIME_NOW: TimeSpec =
-        TimeSpec::new(0, libc::UTIME_NOW as timespec_tv_nsec_t);
+    pub const UTIME_NOW: TimeSpec = TimeSpec::new(0, libc::UTIME_NOW as timespec_tv_nsec_t);
 
     /// Construct a new `TimeSpec` from its components
     #[cfg_attr(target_env = "musl", allow(deprecated))] // https://github.com/rust-lang/libc/issues/1848

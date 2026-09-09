@@ -1,8 +1,8 @@
 //! Socket options as used by `setsockopt` and `getsockopt`.
 use super::{GetSockOpt, SetSockOpt};
+use crate::Result;
 use crate::errno::Errno;
 use crate::sys::time::TimeVal;
-use crate::Result;
 use cfg_if::cfg_if;
 use libc::{self, c_int, c_void, socklen_t};
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -578,11 +578,7 @@ cfg_if! {
             TcpMaxSeg, GetOnly, libc::IPPROTO_TCP, libc::TCP_MAXSEG, u32);
     }
 }
-#[cfg(not(any(
-    target_os = "openbsd",
-    target_os = "haiku",
-    target_os = "redox"
-)))]
+#[cfg(not(any(target_os = "openbsd", target_os = "haiku", target_os = "redox")))]
 #[cfg(feature = "net")]
 sockopt_impl!(
     #[cfg_attr(docsrs, doc(cfg(feature = "net")))]
@@ -604,11 +600,7 @@ sockopt_impl!(
     libc::TCP_REPAIR,
     u32
 );
-#[cfg(not(any(
-    target_os = "openbsd",
-    target_os = "haiku",
-    target_os = "redox"
-)))]
+#[cfg(not(any(target_os = "openbsd", target_os = "haiku", target_os = "redox")))]
 #[cfg(feature = "net")]
 sockopt_impl!(
     #[cfg_attr(docsrs, doc(cfg(feature = "net")))]
@@ -749,7 +741,12 @@ sockopt_impl!(
     libc::SO_TIMESTAMPING,
     super::TimestampingFlag
 );
-#[cfg(not(any(target_os = "aix", target_os = "haiku", target_os = "hurd", target_os = "redox")))]
+#[cfg(not(any(
+    target_os = "aix",
+    target_os = "haiku",
+    target_os = "hurd",
+    target_os = "redox"
+)))]
 sockopt_impl!(
     /// Enable or disable the receiving of the `SO_TIMESTAMP` control message.
     ReceiveTimestamp,
@@ -1299,7 +1296,6 @@ impl SetSockOpt for TcpTlsRx {
         }
     }
 }
-
 
 /*
  *

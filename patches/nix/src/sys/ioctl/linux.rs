@@ -80,17 +80,13 @@ pub const DIRMASK: ioctl_num_type = (1 << DIRBITS) - 1;
 #[doc(hidden)]
 macro_rules! ioc {
     ($dir:expr, $ty:expr, $nr:expr, $sz:expr) => {
-        (($dir as $crate::sys::ioctl::ioctl_num_type
-            & $crate::sys::ioctl::DIRMASK)
+        (($dir as $crate::sys::ioctl::ioctl_num_type & $crate::sys::ioctl::DIRMASK)
             << $crate::sys::ioctl::DIRSHIFT)
-            | (($ty as $crate::sys::ioctl::ioctl_num_type
-                & $crate::sys::ioctl::TYPEMASK)
+            | (($ty as $crate::sys::ioctl::ioctl_num_type & $crate::sys::ioctl::TYPEMASK)
                 << $crate::sys::ioctl::TYPESHIFT)
-            | (($nr as $crate::sys::ioctl::ioctl_num_type
-                & $crate::sys::ioctl::NRMASK)
+            | (($nr as $crate::sys::ioctl::ioctl_num_type & $crate::sys::ioctl::NRMASK)
                 << $crate::sys::ioctl::NRSHIFT)
-            | (($sz as $crate::sys::ioctl::ioctl_num_type
-                & $crate::sys::ioctl::SIZEMASK)
+            | (($sz as $crate::sys::ioctl::ioctl_num_type & $crate::sys::ioctl::SIZEMASK)
                 << $crate::sys::ioctl::SIZESHIFT)
     };
 }

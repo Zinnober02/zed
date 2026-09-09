@@ -142,11 +142,7 @@ impl FromStr for Signal {
             "SIGALRM" => Signal::SIGALRM,
             "SIGTERM" => Signal::SIGTERM,
             #[cfg(all(
-                any(
-                    linux_android,
-                    target_os = "emscripten",
-                    target_os = "fuchsia",
-                ),
+                any(linux_android, target_os = "emscripten", target_os = "fuchsia",),
                 not(any(
                     target_arch = "mips",
                     target_arch = "mips32r6",
@@ -170,11 +166,7 @@ impl FromStr for Signal {
             "SIGWINCH" => Signal::SIGWINCH,
             #[cfg(not(target_os = "haiku"))]
             "SIGIO" => Signal::SIGIO,
-            #[cfg(any(
-                linux_android,
-                target_os = "emscripten",
-                target_os = "fuchsia",
-            ))]
+            #[cfg(any(linux_android, target_os = "emscripten", target_os = "fuchsia",))]
             "SIGPWR" => Signal::SIGPWR,
             "SIGSYS" => Signal::SIGSYS,
             #[cfg(not(any(
@@ -224,11 +216,7 @@ impl Signal {
             Signal::SIGALRM => "SIGALRM",
             Signal::SIGTERM => "SIGTERM",
             #[cfg(all(
-                any(
-                    linux_android,
-                    target_os = "emscripten",
-                    target_os = "fuchsia",
-                ),
+                any(linux_android, target_os = "emscripten", target_os = "fuchsia",),
                 not(any(
                     target_arch = "mips",
                     target_arch = "mips32r6",
@@ -301,18 +289,16 @@ pub use self::Signal::*;
 #[cfg(target_os = "redox")]
 #[cfg(feature = "signal")]
 const SIGNALS: [Signal; 29] = [
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL,
-    SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT,
-    SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM,
-    SIGPROF, SIGWINCH, SIGIO, SIGSYS,
+    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1, SIGSEGV,
+    SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU,
+    SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO, SIGSYS,
 ];
 #[cfg(target_os = "haiku")]
 #[cfg(feature = "signal")]
 const SIGNALS: [Signal; 28] = [
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL,
-    SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT,
-    SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM,
-    SIGPROF, SIGWINCH, SIGSYS,
+    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1, SIGSEGV,
+    SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU,
+    SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGSYS,
 ];
 #[cfg(all(
     any(linux_android, target_os = "emscripten", target_os = "fuchsia"),
@@ -326,10 +312,9 @@ const SIGNALS: [Signal; 28] = [
 ))]
 #[cfg(feature = "signal")]
 const SIGNALS: [Signal; 31] = [
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL,
-    SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGSTKFLT, SIGCHLD,
-    SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ,
-    SIGVTALRM, SIGPROF, SIGWINCH, SIGIO, SIGPWR, SIGSYS,
+    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1, SIGSEGV,
+    SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGSTKFLT, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN,
+    SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO, SIGPWR, SIGSYS,
 ];
 #[cfg(all(
     any(linux_android, target_os = "emscripten", target_os = "fuchsia"),
@@ -343,18 +328,16 @@ const SIGNALS: [Signal; 31] = [
 ))]
 #[cfg(feature = "signal")]
 const SIGNALS: [Signal; 30] = [
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL,
-    SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT,
-    SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM,
-    SIGPROF, SIGWINCH, SIGIO, SIGPWR, SIGSYS,
+    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1, SIGSEGV,
+    SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU,
+    SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO, SIGPWR, SIGSYS,
 ];
 #[cfg(target_os = "aix")]
 #[cfg(feature = "signal")]
 const SIGNALS: [Signal; 30] = [
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGABRT, SIGEMT, SIGFPE, SIGKILL, SIGSEGV,
-    SIGSYS, SIGPIPE, SIGALRM, SIGTERM, SIGUSR1, SIGUSR2, SIGPWR, SIGWINCH,
-    SIGURG, SIGPOLL, SIGIO, SIGSTOP, SIGTSTP, SIGCONT, SIGTTIN, SIGTTOU,
-    SIGVTALRM, SIGPROF, SIGXCPU, SIGXFSZ, SIGTRAP,
+    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGABRT, SIGEMT, SIGFPE, SIGKILL, SIGSEGV, SIGSYS, SIGPIPE,
+    SIGALRM, SIGTERM, SIGUSR1, SIGUSR2, SIGPWR, SIGWINCH, SIGURG, SIGPOLL, SIGIO, SIGSTOP, SIGTSTP,
+    SIGCONT, SIGTTIN, SIGTTOU, SIGVTALRM, SIGPROF, SIGXCPU, SIGXFSZ, SIGTRAP,
 ];
 #[cfg(not(any(
     linux_android,
@@ -366,10 +349,9 @@ const SIGNALS: [Signal; 30] = [
 )))]
 #[cfg(feature = "signal")]
 const SIGNALS: [Signal; 31] = [
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL,
-    SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT,
-    SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM,
-    SIGPROF, SIGWINCH, SIGIO, SIGSYS, SIGEMT, SIGINFO,
+    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1, SIGSEGV,
+    SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU,
+    SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO, SIGSYS, SIGEMT, SIGINFO,
 ];
 
 feature! {
