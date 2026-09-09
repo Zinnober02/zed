@@ -23281,6 +23281,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zed_ohos"
+version = "0.1.0"
+dependencies = [
+ "gpui_ohos",
+ "zed",
+]
+
+[[package]]
 name = "zed_proto"
 version = "0.3.3"
 dependencies = [

@@ -1,0 +1,20 @@
+[package]
+name = "zed_ohos"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+# OHOS entry point: the HAP host loads this cdylib and calls
+# ohos_gpui_app_main once the XComponent surface exists.
+[lib]
+name = "zed_ohos"
+path = "src/zed_ohos.rs"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+gpui_ohos.workspace = true
+zed = { path = "../zed" }

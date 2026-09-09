@@ -67,8 +67,44 @@ fn new_platform() -> Rc<OhosPlatform> {
 }
 
 /// Entry point used by gpui_platform and gpui_ohos_demo.
+///
+/// Reuses the platform the host already attached a surface to, so an
+/// application that builds its own `Application` (Zed) ends up on the same
+/// platform as the entry point that received the surface.
 pub fn current_platform(_headless: bool) -> Rc<dyn Platform> {
-    new_platform()
+    with_current(|platform| platform.clone() as Rc<dyn Platform>)
+        .unwrap_or_else(|| new_platform() as Rc<dyn Platform>)
+}
+
+/// Attach a surface, let `run_app` build and register the application on the
+/// shared platform, then launch it and start the frame loop.
+pub fn run_app_on_surface<F>(
+    id: &str,
+    window: *mut c_void,
+    width: u32,
+    height: u32,
+    log: LogFn,
+    run_app: F,
+) -> i32
+where
+    F: FnOnce(),
+{
+    vk::set_logger(log);
+    vk::log(&format!(
+        "[gpui_ohos] run_app_on_surface id={id} window={:p} {}x{}",
+        window, width, height
+    ));
+    let platform = new_platform();
+    platform.set_surface(id, window, width, height);
+    run_app();
+    platform.launch();
+    inputmethod::attach();
+    platform.request_frames();
+    vk::log(&format!(
+        "[gpui_ohos] launched, windows={}",
+        platform.window_count()
+    ));
+    0
 }
 
 /// Start a GPUI application on an XComponent surface and render the first frame.
