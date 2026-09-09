@@ -560,6 +560,7 @@ pub struct VkRenderer {
     gpd: PFN_vkGetDeviceProcAddr,
     text: Option<TextPipeline>,
     quads: Option<QuadPipeline>,
+    paths: Option<PathPipeline>,
 }
 
 impl VkRenderer {
@@ -835,6 +836,7 @@ impl VkRenderer {
             gpd,
             text: None,
             quads: None,
+            paths: None,
         };
 
         renderer.create_render_pass()?;
@@ -2053,6 +2055,39 @@ pub struct QuadVertex {
     pub border_a: f32,
 }
 
+/// Path triangle vertex: NDC position, GPUI's curve-encoding st coordinate
+/// and the path colour.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct PathVertex {
+    pub x: f32,
+    pub y: f32,
+    pub st_x: f32,
+    pub st_y: f32,
+    /// Screen-space gradient of st, constant per triangle.
+    pub st_dx_x: f32,
+    pub st_dx_y: f32,
+    pub st_dy_x: f32,
+    pub st_dy_y: f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+/// Path pipeline: like QuadPipeline, no descriptors.
+struct PathPipeline {
+    /// Held so the pipeline's layout outlives it.
+    #[allow(dead_code)]
+    pipeline_layout: u64,
+    pipeline: u64,
+    vertex_buffer: u64,
+    #[allow(dead_code)]
+    vertex_memory: u64,
+    vertex_mapped: *mut u8,
+    vertex_size: u64,
+}
+
 /// Rounded-rectangle pipeline: no descriptors, only a vertex buffer.
 struct QuadPipeline {
     /// Held so the pipeline's layout outlives it.
@@ -2097,6 +2132,11 @@ fn load_spirv() -> &'static [u32] {
 
 fn load_quad_spirv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.spv"));
+    unsafe { std::slice::from_raw_parts(BYTES.as_ptr() as *const u32, BYTES.len() / 4) }
+}
+
+fn load_path_spirv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/path.spv"));
     unsafe { std::slice::from_raw_parts(BYTES.as_ptr() as *const u32, BYTES.len() / 4) }
 }
 
@@ -2534,9 +2574,16 @@ impl VkRenderer {
         Ok(())
     }
 
-    /// Create the rounded-rectangle pipeline: no descriptors, only a
-    /// host-visible vertex buffer, with alpha blending enabled.
-    fn create_quad_pipeline(&mut self) -> anyhow::Result<()> {
+    /// Shared fixed-function state for pipelines that only need a vertex
+    /// buffer: shader stages, vertex input, alpha blending and a dynamic
+    /// viewport.
+    fn create_vertex_pipeline(
+        &self,
+        name: &str,
+        spirv: &[u32],
+        stride: u32,
+        attributes: &[VkVertexInputAttributeDescription],
+    ) -> anyhow::Result<(u64, u64)> {
         let create_layout: PFN_vkCreatePipelineLayout =
             dev_fn!(self, "vkCreatePipelineLayout", PFN_vkCreatePipelineLayout);
         let create_shader: PFN_vkCreateShaderModule =
@@ -2560,10 +2607,9 @@ impl VkRenderer {
         if unsafe { create_layout(self.device, &plci, std::ptr::null(), &mut pipeline_layout) }
             != VK_SUCCESS
         {
-            anyhow::bail!("vkCreatePipelineLayout (quad) failed");
+            anyhow::bail!("vkCreatePipelineLayout ({name}) failed");
         }
 
-        let spirv = load_quad_spirv();
         let smci = VkShaderModuleCreateInfo {
             s_type: ST_SHADER_MODULE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -2574,7 +2620,7 @@ impl VkRenderer {
         let mut shader: u64 = 0;
         if unsafe { create_shader(self.device, &smci, std::ptr::null(), &mut shader) } != VK_SUCCESS
         {
-            anyhow::bail!("vkCreateShaderModule (quad) failed");
+            anyhow::bail!("vkCreateShaderModule ({name}) failed");
         }
         let entry = CString::new("vs_main").unwrap();
         let frag_entry = CString::new("fs_main").unwrap();
@@ -2600,26 +2646,9 @@ impl VkRenderer {
         ];
         let vertex_binding = VkVertexInputBindingDescription {
             binding: 0,
-            stride: std::mem::size_of::<QuadVertex>() as u32,
+            stride,
             input_rate: VERTEX_INPUT_RATE_VERTEX,
         };
-        let attributes = [
-            (0u32, FORMAT_R32G32_SFLOAT, 0u32),
-            (1, FORMAT_R32G32_SFLOAT, 8),
-            (2, FORMAT_R32G32_SFLOAT, 16),
-            (3, FORMAT_R32G32B32A32_SFLOAT, 24),
-            (4, FORMAT_R32G32_SFLOAT, 40),
-            (5, FORMAT_R32G32B32A32_SFLOAT, 48),
-            (6, FORMAT_R32G32B32A32_SFLOAT, 64),
-        ]
-        .map(
-            |(location, format, offset)| VkVertexInputAttributeDescription {
-                location,
-                binding: 0,
-                format,
-                offset,
-            },
-        );
         let visci = VkPipelineVertexInputStateCreateInfo {
             s_type: ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -2736,16 +2765,81 @@ impl VkRenderer {
             base_pipeline_index: -1,
         };
         let mut pipeline: u64 = 0;
-        if unsafe { create_pipelines(self.device, 0, 1, &gpci, std::ptr::null(), &mut pipeline) }
-            != VK_SUCCESS
-        {
-            anyhow::bail!("vkCreateGraphicsPipelines (quad) failed");
+        let result =
+            unsafe { create_pipelines(self.device, 0, 1, &gpci, std::ptr::null(), &mut pipeline) };
+        if result != VK_SUCCESS {
+            anyhow::bail!("vkCreateGraphicsPipelines ({name}) failed: {result}");
         }
 
+        Ok((pipeline_layout, pipeline))
+    }
+
+    /// Rounded-rectangle pipeline for scene quads.
+    fn create_quad_pipeline(&mut self) -> anyhow::Result<()> {
+        let attributes = [
+            (0u32, FORMAT_R32G32_SFLOAT, 0u32),
+            (1, FORMAT_R32G32_SFLOAT, 8),
+            (2, FORMAT_R32G32_SFLOAT, 16),
+            (3, FORMAT_R32G32B32A32_SFLOAT, 24),
+            (4, FORMAT_R32G32_SFLOAT, 40),
+            (5, FORMAT_R32G32B32A32_SFLOAT, 48),
+            (6, FORMAT_R32G32B32A32_SFLOAT, 64),
+        ]
+        .map(
+            |(location, format, offset)| VkVertexInputAttributeDescription {
+                location,
+                binding: 0,
+                format,
+                offset,
+            },
+        );
+        let (pipeline_layout, pipeline) = self.create_vertex_pipeline(
+            "quad",
+            load_quad_spirv(),
+            std::mem::size_of::<QuadVertex>() as u32,
+            &attributes,
+        )?;
         let vertex_size: u64 = 4 * 1024 * 1024;
         let (vertex_buffer, vertex_memory, vertex_mapped) =
             self.create_host_buffer(vertex_size, BUFFER_USAGE_VERTEX_BUFFER)?;
         self.quads = Some(QuadPipeline {
+            pipeline_layout,
+            pipeline,
+            vertex_buffer,
+            vertex_memory,
+            vertex_mapped,
+            vertex_size,
+        });
+        Ok(())
+    }
+
+    /// Path pipeline: GPUI's curve-encoded triangle list.
+    fn create_path_pipeline(&mut self) -> anyhow::Result<()> {
+        let attributes = [
+            (0u32, FORMAT_R32G32_SFLOAT, 0u32),
+            (1, FORMAT_R32G32_SFLOAT, 8),
+            (2, FORMAT_R32G32_SFLOAT, 16),
+            (3, FORMAT_R32G32_SFLOAT, 24),
+            (4, FORMAT_R32G32B32A32_SFLOAT, 32),
+        ]
+        .map(
+            |(location, format, offset)| VkVertexInputAttributeDescription {
+                location,
+                binding: 0,
+                format,
+                offset,
+            },
+        );
+        let (pipeline_layout, pipeline) = self.create_vertex_pipeline(
+            "path",
+            load_path_spirv(),
+            std::mem::size_of::<PathVertex>() as u32,
+            &attributes,
+        )?;
+        let vertex_size: u64 = 4 * 1024 * 1024;
+        let (vertex_buffer, vertex_memory, vertex_mapped) =
+            self.create_host_buffer(vertex_size, BUFFER_USAGE_VERTEX_BUFFER)?;
+        self.paths = Some(PathPipeline {
             pipeline_layout,
             pipeline,
             vertex_buffer,
@@ -2818,6 +2912,7 @@ impl VkRenderer {
         &mut self,
         color: [f32; 4],
         quads: &[QuadVertex],
+        paths: &[PathVertex],
         vertices: &[GlyphVertex],
         uploads: &[super::atlas::AtlasUpload],
     ) -> anyhow::Result<()> {
@@ -2826,6 +2921,9 @@ impl VkRenderer {
         }
         if self.quads.is_none() {
             self.create_quad_pipeline()?;
+        }
+        if self.paths.is_none() {
+            self.create_path_pipeline()?;
         }
         let copy_image: PFN_vkCmdCopyBufferToImage =
             dev_fn!(self, "vkCmdCopyBufferToImage", PFN_vkCmdCopyBufferToImage);
@@ -2866,6 +2964,22 @@ impl VkRenderer {
                         quads.as_ptr() as *const u8,
                         quad_pipeline.vertex_mapped,
                         quad_bytes,
+                    );
+                }
+            }
+        }
+        {
+            let path_pipeline = self.paths.as_ref().expect("path pipeline");
+            let path_bytes = std::mem::size_of_val(paths);
+            if path_bytes as u64 > path_pipeline.vertex_size {
+                anyhow::bail!("path vertex buffer too small");
+            }
+            if !paths.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        paths.as_ptr() as *const u8,
+                        path_pipeline.vertex_mapped,
+                        path_bytes,
                     );
                 }
             }
@@ -3065,6 +3179,29 @@ impl VkRenderer {
                     &0u64,
                 );
                 draw(self.command_buffer, quads.len() as u32, 1, 0, 0);
+            }
+        }
+        if !paths.is_empty() {
+            let bind_pipeline: PFN_vkCmdBindPipeline =
+                dev_fn!(self, "vkCmdBindPipeline", PFN_vkCmdBindPipeline);
+            let bind_vertex: PFN_vkCmdBindVertexBuffers =
+                dev_fn!(self, "vkCmdBindVertexBuffers", PFN_vkCmdBindVertexBuffers);
+            let draw: PFN_vkCmdDraw = dev_fn!(self, "vkCmdDraw", PFN_vkCmdDraw);
+            let path_pipeline = self.paths.as_ref().expect("path pipeline");
+            unsafe {
+                bind_pipeline(
+                    self.command_buffer,
+                    BIND_POINT_GRAPHICS,
+                    path_pipeline.pipeline,
+                );
+                bind_vertex(
+                    self.command_buffer,
+                    0,
+                    1,
+                    &path_pipeline.vertex_buffer,
+                    &0u64,
+                );
+                draw(self.command_buffer, paths.len() as u32, 1, 0, 0);
             }
         }
         if !vertices.is_empty() {

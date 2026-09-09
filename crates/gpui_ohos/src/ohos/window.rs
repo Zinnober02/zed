@@ -368,8 +368,11 @@ impl WindowShared {
         if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
             let (width, height) = renderer.size();
             let quads = build_quad_vertices(scene, width, height);
+            let paths = build_path_vertices(scene, width, height);
             let vertices = build_glyph_vertices(scene, width, height, atlas_w, atlas_h);
-            if let Err(error) = renderer.render_scene(CLEAR_COLOR, &quads, &vertices, &uploads) {
+            if let Err(error) =
+                renderer.render_scene(CLEAR_COLOR, &quads, &paths, &vertices, &uploads)
+            {
                 super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
             }
         }
@@ -736,6 +739,71 @@ fn build_quad_vertices(scene: &Scene, width: u32, height: u32) -> Vec<super::vk:
                 border_b: border_color.b,
                 border_a: border_color.a,
             });
+        }
+    }
+    vertices
+}
+
+/// GPUI paths are already triangle lists; each vertex carries the colour and
+/// the curve-encoding st coordinate the fragment shader decodes.
+fn build_path_vertices(scene: &Scene, width: u32, height: u32) -> Vec<super::vk::PathVertex> {
+    let screen_width = width as f32;
+    let screen_height = height as f32;
+    let mut vertices = Vec::new();
+    for path in &scene.paths {
+        let Some(fill) = path.color.as_solid() else {
+            // Gradient fills are not rendered yet.
+            continue;
+        };
+        let fill = fill.to_rgb();
+        for triangle in path.vertices.chunks_exact(3) {
+            let points: [(f32, f32); 3] = std::array::from_fn(|index| {
+                (
+                    triangle[index].xy_position.x.as_f32(),
+                    triangle[index].xy_position.y.as_f32(),
+                )
+            });
+            let st: [(f32, f32); 3] = std::array::from_fn(|index| {
+                (triangle[index].st_position.x, triangle[index].st_position.y)
+            });
+            // st is affine across a triangle, so its screen-space gradient is
+            // constant: solve for the barycentric derivatives once.
+            let dp1 = (points[1].0 - points[0].0, points[1].1 - points[0].1);
+            let dp2 = (points[2].0 - points[0].0, points[2].1 - points[0].1);
+            let ds1 = (st[1].0 - st[0].0, st[1].1 - st[0].1);
+            let ds2 = (st[2].0 - st[0].0, st[2].1 - st[0].1);
+            let determinant = dp1.0 * dp2.1 - dp2.0 * dp1.1;
+            let (st_dx, st_dy) = if determinant.abs() < 1.0e-6 {
+                ((0.0, 0.0), (0.0, 0.0))
+            } else {
+                let inverse = 1.0 / determinant;
+                (
+                    (
+                        (ds1.0 * dp2.1 - ds2.0 * dp1.1) * inverse,
+                        (ds1.1 * dp2.1 - ds2.1 * dp1.1) * inverse,
+                    ),
+                    (
+                        (ds2.0 * dp1.0 - ds1.0 * dp2.0) * inverse,
+                        (ds2.1 * dp1.0 - ds1.1 * dp2.0) * inverse,
+                    ),
+                )
+            };
+            for index in 0..3 {
+                vertices.push(super::vk::PathVertex {
+                    x: points[index].0 / screen_width * 2.0 - 1.0,
+                    y: 1.0 - points[index].1 / screen_height * 2.0,
+                    st_x: st[index].0,
+                    st_y: st[index].1,
+                    st_dx_x: st_dx.0,
+                    st_dx_y: st_dx.1,
+                    st_dy_x: st_dy.0,
+                    st_dy_y: st_dy.1,
+                    r: fill.r,
+                    g: fill.g,
+                    b: fill.b,
+                    a: fill.a,
+                });
+            }
         }
     }
     vertices
