@@ -51,7 +51,11 @@ pub(crate) struct OhosPlatform {
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
-    surface: Rc<RefCell<SurfaceState>>,
+    /// Every XComponent surface, keyed by its XComponent id; index 0 is the
+    /// primary surface that launched the application.
+    surfaces: Rc<RefCell<Vec<(String, Rc<RefCell<SurfaceState>>)>>>,
+    /// How many GPUI windows have been bound to a surface.
+    windows_opened: Cell<usize>,
     pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
     windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
     /// GPUI window handles paired with their platform window, in open order.
@@ -93,7 +97,8 @@ impl OhosPlatform {
             foreground_executor,
             text_system: Arc::new(OhosTextSystem::new()),
             main_receiver,
-            surface: Rc::new(RefCell::new(SurfaceState::default())),
+            surfaces: Rc::new(RefCell::new(Vec::new())),
+            windows_opened: Cell::new(0),
             pending_launch: RefCell::new(None),
             windows: Rc::new(RefCell::new(Vec::new())),
             handles: RefCell::new(Vec::new()),
@@ -225,31 +230,125 @@ impl OhosPlatform {
         receiver
     }
 
-    pub(crate) fn set_surface(&self, window: *mut c_void, width: u32, height: u32) {
-        let mut surface = self.surface.borrow_mut();
-        surface.window = window;
-        surface.width = width;
-        surface.height = height;
-        surface.valid = true;
+    /// Register the primary surface (the one that launched the application).
+    pub(crate) fn set_surface(&self, id: &str, window: *mut c_void, width: u32, height: u32) {
+        let mut surfaces = self.surfaces.borrow_mut();
+        // Reuse the existing entry so any window already holding this Rc sees
+        // the update; otherwise insert the primary at the front.
+        if let Some((_, surface)) = surfaces.iter().find(|(existing, _)| existing == id) {
+            let mut state = surface.borrow_mut();
+            state.window = window;
+            state.width = width;
+            state.height = height;
+            state.valid = true;
+            return;
+        }
+        surfaces.insert(
+            0,
+            (
+                id.to_string(),
+                Rc::new(RefCell::new(SurfaceState {
+                    window,
+                    width,
+                    height,
+                    valid: true,
+                })),
+            ),
+        );
     }
 
-    pub(crate) fn surface_resized(&self, width: u32, height: u32) {
+    /// Register an additional XComponent surface created for another window.
+    ///
+    /// The window was opened with a placeholder for this id, so update that
+    /// entry in place rather than replacing it.
+    pub(crate) fn add_surface(&self, id: &str, window: *mut c_void, width: u32, height: u32) {
+        let surface = {
+            let mut surfaces = self.surfaces.borrow_mut();
+            if let Some((_, surface)) = surfaces.iter().find(|(existing, _)| existing == id) {
+                surface.clone()
+            } else {
+                let surface = Rc::new(RefCell::new(SurfaceState::default()));
+                surfaces.push((id.to_string(), surface.clone()));
+                surface
+            }
+        };
         {
-            let mut surface = self.surface.borrow_mut();
-            surface.width = width;
-            surface.height = height;
-            surface.valid = true;
+            let mut state = surface.borrow_mut();
+            state.window = window;
+            state.width = width;
+            state.height = height;
+            state.valid = true;
         }
         for window in self.windows.borrow().iter() {
-            window.on_surface_resized(width, height);
+            if window.shares_surface(&surface) {
+                window.on_surface_resized(width, height);
+            }
+        }
+    }
+
+    /// The surface a new window should use: an existing one, or a fresh
+    /// placeholder plus a host request to create the XComponent.
+    fn surface_for_window(&self) -> Rc<RefCell<SurfaceState>> {
+        let index = self.windows_opened.get();
+        self.windows_opened.set(index + 1);
+        let mut surfaces = self.surfaces.borrow_mut();
+        let (width, height) = surfaces
+            .first()
+            .map(|(_, surface)| {
+                let state = surface.borrow();
+                (state.width, state.height)
+            })
+            .unwrap_or((2200, 1430));
+        while surfaces.len() <= index {
+            let id = format!("gpui_surface_{}", surfaces.len());
+            surfaces.push((
+                id.clone(),
+                Rc::new(RefCell::new(SurfaceState {
+                    window: std::ptr::null_mut(),
+                    width,
+                    height,
+                    valid: false,
+                })),
+            ));
+            drop(surfaces);
+            host::window_op(host::op::CREATE_WINDOW, &id);
+            surfaces = self.surfaces.borrow_mut();
+        }
+        surfaces[index].1.clone()
+    }
+
+    pub(crate) fn surface_resized(&self, id: &str, width: u32, height: u32) {
+        let surface = {
+            let surfaces = self.surfaces.borrow();
+            surfaces
+                .iter()
+                .find(|(existing, _)| existing == id)
+                .map(|(_, surface)| surface.clone())
+        };
+        let Some(surface) = surface else {
+            return;
+        };
+        {
+            let mut state = surface.borrow_mut();
+            state.width = width;
+            state.height = height;
+            state.valid = true;
+        }
+        for window in self.windows.borrow().iter() {
+            if window.shares_surface(&surface) {
+                window.on_surface_resized(width, height);
+            }
         }
         self.request_frames();
     }
 
-    pub(crate) fn surface_destroyed(&self) {
-        let mut surface = self.surface.borrow_mut();
-        surface.valid = false;
-        surface.window = std::ptr::null_mut();
+    pub(crate) fn surface_destroyed(&self, id: &str) {
+        let surfaces = self.surfaces.borrow();
+        if let Some((_, surface)) = surfaces.iter().find(|(existing, _)| existing == id) {
+            let mut state = surface.borrow_mut();
+            state.valid = false;
+            state.window = std::ptr::null_mut();
+        }
     }
 
     /// Invoke the GPUI launch callback recorded by Platform::run.
@@ -429,8 +528,14 @@ impl Platform for OhosPlatform {
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         let (w, h) = {
-            let surface = self.surface.borrow();
-            (surface.width, surface.height)
+            let surfaces = self.surfaces.borrow();
+            surfaces
+                .first()
+                .map(|(_, surface)| {
+                    let state = surface.borrow();
+                    (state.width, state.height)
+                })
+                .unwrap_or((3120, 2080))
         };
         vec![Rc::new(OhosDisplay::new(w, h, super::window::SCALE)) as Rc<dyn PlatformDisplay>]
     }
@@ -483,9 +588,10 @@ impl Platform for OhosPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
-        if !self.surface.borrow().valid {
-            anyhow::bail!("OHOS surface is not available yet");
-        }
+        // The first window uses the primary surface; later windows get a fresh
+        // XComponent, created by the host on demand. Its surface may still be
+        // invalid here and is filled in when the host reports it.
+        let surface = self.surface_for_window();
         if let Some(title) = options
             .titlebar
             .as_ref()
@@ -493,11 +599,7 @@ impl Platform for OhosPlatform {
         {
             host::window_op(host::op::SET_TITLE, title);
         }
-        let shared = WindowShared::new(
-            self.surface.clone(),
-            options,
-            self.foreground_executor.clone(),
-        );
+        let shared = WindowShared::new(surface, options, self.foreground_executor.clone());
         self.windows.borrow_mut().push(shared.clone());
         self.handles
             .borrow_mut()

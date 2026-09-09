@@ -164,6 +164,10 @@ impl WindowShared {
         Some((text, selection.range.end, cursor))
     }
 
+    pub(crate) fn shares_surface(&self, other: &Rc<RefCell<SurfaceState>>) -> bool {
+        Rc::ptr_eq(&self.surface, other)
+    }
+
     pub(crate) fn is_active(&self) -> bool {
         self.active.get()
     }

@@ -77,6 +77,7 @@ pub fn current_platform(_headless: bool) -> Rc<dyn Platform> {
 /// records the launch callback, so we invoke it here once the surface exists;
 /// the ArkTS frame loop then drives subsequent frames through tick().
 pub fn run_with_surface<F>(
+    id: &str,
     window: *mut c_void,
     width: u32,
     height: u32,
@@ -88,11 +89,11 @@ where
 {
     vk::set_logger(log);
     vk::log(&format!(
-        "[gpui_ohos] run_with_surface window={:p} {}x{}",
+        "[gpui_ohos] run_with_surface id={id} window={:p} {}x{}",
         window, width, height
     ));
     let platform = new_platform();
-    platform.set_surface(window, width, height);
+    platform.set_surface(id, window, width, height);
     {
         let text_system = platform.text_system();
         let names = text_system.all_font_names();
@@ -181,16 +182,31 @@ pub fn host_event(kind: i32, arg: &str) {
     with_current(|platform| platform.handle_host_event(kind, arg));
 }
 
+/// An additional XComponent surface was created for another window.
+pub fn surface_created(id: &str, window: *mut c_void, width: u32, height: u32) {
+    vk::log(&format!(
+        "[gpui_ohos] surface_created id={id} window={:p} {}x{}",
+        window, width, height
+    ));
+    with_current(|platform| {
+        platform.add_surface(id, window, width, height);
+        platform.request_frames();
+    });
+}
+
 /// XComponent surface changed size (rotation / resize).
-pub fn surface_resized(width: u32, height: u32) {
-    vk::log(&format!("[gpui_ohos] surface_resized {}x{}", width, height));
-    with_current(|platform| platform.surface_resized(width, height));
+pub fn surface_resized(id: &str, width: u32, height: u32) {
+    vk::log(&format!(
+        "[gpui_ohos] surface_resized id={id} {}x{}",
+        width, height
+    ));
+    with_current(|platform| platform.surface_resized(id, width, height));
 }
 
 /// XComponent surface destroyed.
-pub fn surface_destroyed() {
-    vk::log("[gpui_ohos] surface_destroyed");
-    with_current(|platform| platform.surface_destroyed());
+pub fn surface_destroyed(id: &str) {
+    vk::log(&format!("[gpui_ohos] surface_destroyed id={id}"));
+    with_current(|platform| platform.surface_destroyed(id));
 }
 
 /// One frame tick, driven by the ArkTS host (DisplaySync or setInterval).
