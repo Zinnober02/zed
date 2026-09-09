@@ -25,6 +25,7 @@ pub(crate) mod op {
     pub const PICK_PATHS: i32 = 12;
     pub const PICK_NEW_PATH: i32 = 13;
     pub const SET_MENUS: i32 = 14;
+    pub const REQUEST_FOCUS: i32 = 15;
 }
 
 /// Synchronous queries. The host writes a UTF-8 answer into the buffer.

@@ -172,6 +172,9 @@ fn logical(value: f32) -> crate::Pixels {
 }
 
 pub fn pointer_down(x: f32, y: f32, button: u32) {
+    // Clicking the surface must give the XComponent ArkUI focus, otherwise its
+    // onKeyEvent never fires and non-text keys (arrows) are dropped.
+    host::window_op(host::op::REQUEST_FOCUS, "");
     with_current(|platform| {
         for window in platform.windows() {
             window.pointer_down(map_button(button), crate::point(logical(x), logical(y)));
