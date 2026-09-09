@@ -230,8 +230,8 @@ fn map_button(button: u32) -> MouseButton {
     }
 }
 
-// The ArkUI NDK reports pointer coordinates in logical pixels, which is what
-// GPUI works in.
+// The host converts ArkUI's vp coordinates into GPUI logical pixels before
+// calling in, so this is a pass-through.
 fn logical(value: f32) -> crate::Pixels {
     crate::px(value)
 }
