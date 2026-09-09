@@ -363,13 +363,13 @@ impl WindowShared {
                 scene.monochrome_sprites.len()
             ));
         }
-        let rects = collect_clear_rects(scene);
         let uploads = self.atlas.take_uploads();
         let (atlas_w, atlas_h) = self.atlas.texture_size(AtlasTextureKind::Monochrome);
         if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
             let (width, height) = renderer.size();
+            let quads = build_quad_vertices(scene, width, height);
             let vertices = build_glyph_vertices(scene, width, height, atlas_w, atlas_h);
-            if let Err(error) = renderer.render_scene(CLEAR_COLOR, &rects, &vertices, &uploads) {
+            if let Err(error) = renderer.render_scene(CLEAR_COLOR, &quads, &vertices, &uploads) {
                 super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
             }
         }
@@ -668,33 +668,77 @@ impl PlatformWindow for OhosWindow {
     }
 }
 
-/// Solid quads become clear rectangles; glyph sprites become textured quads.
-fn collect_clear_rects(scene: &Scene) -> Vec<super::vk::ClearRect> {
-    let mut rects = Vec::with_capacity(scene.quads.len());
+/// Every solid quad becomes a rounded-rectangle vertex pair, translucent or
+/// not; the fragment shader does the corners, border and antialiasing.
+fn build_quad_vertices(scene: &Scene, width: u32, height: u32) -> Vec<super::vk::QuadVertex> {
+    let screen_width = width as f32;
+    let screen_height = height as f32;
+    let mut vertices = Vec::with_capacity(scene.quads.len() * 6);
     for quad in &scene.quads {
-        let Some(color) = quad.background.as_solid() else {
+        let Some(fill) = quad.background.as_solid() else {
+            // Gradients are not rendered yet.
             continue;
         };
-        let rgba = color.to_rgb();
-        if rgba.a < 0.996 {
-            continue;
-        }
         let x = quad.bounds.origin.x.as_f32();
         let y = quad.bounds.origin.y.as_f32();
-        let width = quad.bounds.size.width.as_f32();
-        let height = quad.bounds.size.height.as_f32();
-        if width <= 0.0 || height <= 0.0 {
+        let quad_width = quad.bounds.size.width.as_f32();
+        let quad_height = quad.bounds.size.height.as_f32();
+        if quad_width <= 0.0 || quad_height <= 0.0 {
             continue;
         }
-        rects.push(super::vk::ClearRect {
-            x: x as i32,
-            y: y as i32,
-            width: width as u32,
-            height: height as u32,
-            color: [rgba.r, rgba.g, rgba.b, 1.0],
-        });
+        let half_width = quad_width / 2.0;
+        let half_height = quad_height / 2.0;
+        let center_x = x + half_width;
+        let center_y = y + half_height;
+        let fill = fill.to_rgb();
+        let border_color = quad.border_color.to_rgb();
+        let border = quad
+            .border_widths
+            .top
+            .as_f32()
+            .max(quad.border_widths.right.as_f32())
+            .max(quad.border_widths.bottom.as_f32())
+            .max(quad.border_widths.left.as_f32())
+            .max(0.0);
+        let radii = [
+            quad.corner_radii.top_left.as_f32(),
+            quad.corner_radii.top_right.as_f32(),
+            quad.corner_radii.bottom_right.as_f32(),
+            quad.corner_radii.bottom_left.as_f32(),
+        ];
+        let corners = [
+            (x, y),
+            (x + quad_width, y),
+            (x + quad_width, y + quad_height),
+            (x, y + quad_height),
+        ];
+        for index in [0usize, 1, 2, 0, 2, 3] {
+            let (px, py) = corners[index];
+            vertices.push(super::vk::QuadVertex {
+                x: px / screen_width * 2.0 - 1.0,
+                y: 1.0 - py / screen_height * 2.0,
+                local_x: px - center_x,
+                local_y: py - center_y,
+                half_width,
+                half_height,
+                radius_tl: radii[0],
+                radius_tr: radii[1],
+                radius_br: radii[2],
+                radius_bl: radii[3],
+                border,
+                pad: 0.0,
+                r: fill.r,
+                g: fill.g,
+                b: fill.b,
+                a: fill.a,
+                border_r: border_color.r,
+                border_g: border_color.g,
+                border_b: border_color.b,
+                border_a: border_color.a,
+            });
+        }
     }
-    rects
+    vertices
 }
 
 fn build_glyph_vertices(

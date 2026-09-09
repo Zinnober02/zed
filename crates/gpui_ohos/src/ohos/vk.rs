@@ -559,6 +559,7 @@ pub struct VkRenderer {
     gpa: PFN_vkGetInstanceProcAddr,
     gpd: PFN_vkGetDeviceProcAddr,
     text: Option<TextPipeline>,
+    quads: Option<QuadPipeline>,
 }
 
 impl VkRenderer {
@@ -833,6 +834,7 @@ impl VkRenderer {
             gpa,
             gpd,
             text: None,
+            quads: None,
         };
 
         renderer.create_render_pass()?;
@@ -2024,6 +2026,46 @@ pub struct GlyphVertex {
     pub a: f32,
 }
 
+/// Rounded-rectangle vertex: NDC position, local offset and half extents in
+/// device pixels, per-corner radii, border width and both colours.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct QuadVertex {
+    pub x: f32,
+    pub y: f32,
+    pub local_x: f32,
+    pub local_y: f32,
+    pub half_width: f32,
+    pub half_height: f32,
+    pub radius_tl: f32,
+    pub radius_tr: f32,
+    pub radius_br: f32,
+    pub radius_bl: f32,
+    pub border: f32,
+    pub pad: f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+    pub border_r: f32,
+    pub border_g: f32,
+    pub border_b: f32,
+    pub border_a: f32,
+}
+
+/// Rounded-rectangle pipeline: no descriptors, only a vertex buffer.
+struct QuadPipeline {
+    /// Held so the pipeline's layout outlives it.
+    #[allow(dead_code)]
+    pipeline_layout: u64,
+    pipeline: u64,
+    vertex_buffer: u64,
+    #[allow(dead_code)]
+    vertex_memory: u64,
+    vertex_mapped: *mut u8,
+    vertex_size: u64,
+}
+
 /// Owns the descriptor set, image view and sampler: the handles are held to
 /// keep the Vulkan objects alive, not read back.
 #[allow(dead_code)]
@@ -2050,6 +2092,11 @@ fn load_spirv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glyph.spv"));
     // The array is 4-byte aligned because it is a static byte slice of a
     // multiple-of-4 length; reinterpret as u32 words.
+    unsafe { std::slice::from_raw_parts(BYTES.as_ptr() as *const u32, BYTES.len() / 4) }
+}
+
+fn load_quad_spirv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.spv"));
     unsafe { std::slice::from_raw_parts(BYTES.as_ptr() as *const u32, BYTES.len() / 4) }
 }
 
@@ -2487,6 +2534,228 @@ impl VkRenderer {
         Ok(())
     }
 
+    /// Create the rounded-rectangle pipeline: no descriptors, only a
+    /// host-visible vertex buffer, with alpha blending enabled.
+    fn create_quad_pipeline(&mut self) -> anyhow::Result<()> {
+        let create_layout: PFN_vkCreatePipelineLayout =
+            dev_fn!(self, "vkCreatePipelineLayout", PFN_vkCreatePipelineLayout);
+        let create_shader: PFN_vkCreateShaderModule =
+            dev_fn!(self, "vkCreateShaderModule", PFN_vkCreateShaderModule);
+        let create_pipelines: PFN_vkCreateGraphicsPipelines = dev_fn!(
+            self,
+            "vkCreateGraphicsPipelines",
+            PFN_vkCreateGraphicsPipelines
+        );
+
+        let plci = VkPipelineLayoutCreateInfo {
+            s_type: ST_PIPELINE_LAYOUT_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            set_layout_count: 0,
+            p_set_layouts: std::ptr::null(),
+            push_constant_range_count: 0,
+            p_push_constant_ranges: std::ptr::null(),
+        };
+        let mut pipeline_layout: u64 = 0;
+        if unsafe { create_layout(self.device, &plci, std::ptr::null(), &mut pipeline_layout) }
+            != VK_SUCCESS
+        {
+            anyhow::bail!("vkCreatePipelineLayout (quad) failed");
+        }
+
+        let spirv = load_quad_spirv();
+        let smci = VkShaderModuleCreateInfo {
+            s_type: ST_SHADER_MODULE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            code_size: spirv.len() * 4,
+            p_code: spirv.as_ptr(),
+        };
+        let mut shader: u64 = 0;
+        if unsafe { create_shader(self.device, &smci, std::ptr::null(), &mut shader) } != VK_SUCCESS
+        {
+            anyhow::bail!("vkCreateShaderModule (quad) failed");
+        }
+        let entry = CString::new("vs_main").unwrap();
+        let frag_entry = CString::new("fs_main").unwrap();
+        let stages = [
+            VkPipelineShaderStageCreateInfo {
+                s_type: ST_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: SHADER_STAGE_VERTEX,
+                module: shader,
+                p_name: entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+            VkPipelineShaderStageCreateInfo {
+                s_type: ST_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: SHADER_STAGE_FRAGMENT,
+                module: shader,
+                p_name: frag_entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+        ];
+        let vertex_binding = VkVertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<QuadVertex>() as u32,
+            input_rate: VERTEX_INPUT_RATE_VERTEX,
+        };
+        let attributes = [
+            (0u32, FORMAT_R32G32_SFLOAT, 0u32),
+            (1, FORMAT_R32G32_SFLOAT, 8),
+            (2, FORMAT_R32G32_SFLOAT, 16),
+            (3, FORMAT_R32G32B32A32_SFLOAT, 24),
+            (4, FORMAT_R32G32_SFLOAT, 40),
+            (5, FORMAT_R32G32B32A32_SFLOAT, 48),
+            (6, FORMAT_R32G32B32A32_SFLOAT, 64),
+        ]
+        .map(
+            |(location, format, offset)| VkVertexInputAttributeDescription {
+                location,
+                binding: 0,
+                format,
+                offset,
+            },
+        );
+        let visci = VkPipelineVertexInputStateCreateInfo {
+            s_type: ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            vertex_binding_description_count: 1,
+            p_vertex_binding_descriptions: &vertex_binding,
+            vertex_attribute_description_count: attributes.len() as u32,
+            p_vertex_attribute_descriptions: attributes.as_ptr(),
+        };
+        let iasci = VkPipelineInputAssemblyStateCreateInfo {
+            s_type: ST_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            topology: TOPOLOGY_TRIANGLE_LIST,
+            primitive_restart_enable: 0,
+        };
+        let viewport = VkViewport {
+            x: 0.0,
+            y: 0.0,
+            width: self.width as f32,
+            height: self.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = VkRect2D {
+            offset: [0, 0],
+            extent: VkExtent2D {
+                width: self.width,
+                height: self.height,
+            },
+        };
+        let vpsci = VkPipelineViewportStateCreateInfo {
+            s_type: ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            viewport_count: 1,
+            p_viewports: &viewport,
+            scissor_count: 1,
+            p_scissors: &scissor,
+        };
+        let rsci = VkPipelineRasterizationStateCreateInfo {
+            s_type: ST_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            depth_clamp_enable: 0,
+            rasterizer_discard_enable: 0,
+            polygon_mode: POLYGON_MODE_FILL,
+            cull_mode: CULL_MODE_NONE,
+            front_face: FRONT_FACE_COUNTER_CLOCKWISE,
+            depth_bias_enable: 0,
+            depth_bias_constant_factor: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_bias_slope_factor: 0.0,
+            line_width: 1.0,
+        };
+        let msci = VkPipelineMultisampleStateCreateInfo {
+            s_type: ST_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            rasterization_samples: SAMPLE_COUNT_1,
+            sample_shading_enable: 0,
+            min_sample_shading: 1.0,
+            p_sample_mask: std::ptr::null(),
+            alpha_to_coverage_enable: 0,
+            alpha_to_one_enable: 0,
+        };
+        let blend_attachment = VkPipelineColorBlendAttachmentState {
+            blend_enable: 1,
+            src_color_blend_factor: BLEND_FACTOR_SRC_ALPHA,
+            dst_color_blend_factor: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            color_blend_op: BLEND_OP_ADD,
+            src_alpha_blend_factor: BLEND_FACTOR_SRC_ALPHA,
+            dst_alpha_blend_factor: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            alpha_blend_op: BLEND_OP_ADD,
+            color_write_mask: COLOR_COMPONENT_RGBA,
+        };
+        let cbsci = VkPipelineColorBlendStateCreateInfo {
+            s_type: ST_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            logic_op_enable: 0,
+            logic_op: 0,
+            attachment_count: 1,
+            p_attachments: &blend_attachment,
+            blend_constants: [0.0; 4],
+        };
+        let dynamic_states = [DYNAMIC_STATE_VIEWPORT, DYNAMIC_STATE_SCISSOR];
+        let dsci = VkPipelineDynamicStateCreateInfo {
+            s_type: ST_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            dynamic_state_count: 2,
+            p_dynamic_states: dynamic_states.as_ptr(),
+        };
+        let gpci = VkGraphicsPipelineCreateInfo {
+            s_type: ST_GRAPHICS_PIPELINE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage_count: 2,
+            p_stages: stages.as_ptr(),
+            p_vertex_input_state: &visci,
+            p_input_assembly_state: &iasci,
+            p_tessellation_state: std::ptr::null(),
+            p_viewport_state: &vpsci,
+            p_rasterization_state: &rsci,
+            p_multisample_state: &msci,
+            p_depth_stencil_state: std::ptr::null(),
+            p_color_blend_state: &cbsci,
+            p_dynamic_state: &dsci,
+            layout: pipeline_layout,
+            render_pass: self.render_pass,
+            subpass: 0,
+            base_pipeline_handle: 0,
+            base_pipeline_index: -1,
+        };
+        let mut pipeline: u64 = 0;
+        if unsafe { create_pipelines(self.device, 0, 1, &gpci, std::ptr::null(), &mut pipeline) }
+            != VK_SUCCESS
+        {
+            anyhow::bail!("vkCreateGraphicsPipelines (quad) failed");
+        }
+
+        let vertex_size: u64 = 4 * 1024 * 1024;
+        let (vertex_buffer, vertex_memory, vertex_mapped) =
+            self.create_host_buffer(vertex_size, BUFFER_USAGE_VERTEX_BUFFER)?;
+        self.quads = Some(QuadPipeline {
+            pipeline_layout,
+            pipeline,
+            vertex_buffer,
+            vertex_memory,
+            vertex_mapped,
+            vertex_size,
+        });
+        Ok(())
+    }
+
     fn create_host_buffer(&self, size: u64, usage: u32) -> anyhow::Result<(u64, u64, *mut u8)> {
         let create_buffer: PFN_vkCreateBuffer =
             inst_fn!(self, "vkCreateBuffer", PFN_vkCreateBuffer);
@@ -2548,12 +2817,15 @@ impl VkRenderer {
     pub fn render_scene(
         &mut self,
         color: [f32; 4],
-        rects: &[ClearRect],
+        quads: &[QuadVertex],
         vertices: &[GlyphVertex],
         uploads: &[super::atlas::AtlasUpload],
     ) -> anyhow::Result<()> {
         if self.text.is_none() {
             self.create_text_pipeline()?;
+        }
+        if self.quads.is_none() {
+            self.create_quad_pipeline()?;
         }
         let copy_image: PFN_vkCmdCopyBufferToImage =
             dev_fn!(self, "vkCmdCopyBufferToImage", PFN_vkCmdCopyBufferToImage);
@@ -2581,6 +2853,22 @@ impl VkRenderer {
         }
         if ar != VK_SUCCESS {
             anyhow::bail!("vkAcquireNextImageKHR failed: {ar}");
+        }
+        {
+            let quad_pipeline = self.quads.as_ref().expect("quad pipeline");
+            let quad_bytes = std::mem::size_of_val(quads);
+            if quad_bytes as u64 > quad_pipeline.vertex_size {
+                anyhow::bail!("quad vertex buffer too small");
+            }
+            if !quads.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        quads.as_ptr() as *const u8,
+                        quad_pipeline.vertex_mapped,
+                        quad_bytes,
+                    );
+                }
+            }
         }
         let vertex_bytes = std::mem::size_of_val(vertices);
         {
@@ -2735,8 +3023,49 @@ impl VkRenderer {
         unsafe {
             (self.fns.begin_render_pass)(self.command_buffer, &rpbi, SUBPASS_CONTENTS_INLINE)
         };
-        for rect in rects {
-            self.cmd_clear_rect(*rect);
+        if !quads.is_empty() {
+            let bind_pipeline: PFN_vkCmdBindPipeline =
+                dev_fn!(self, "vkCmdBindPipeline", PFN_vkCmdBindPipeline);
+            let bind_vertex: PFN_vkCmdBindVertexBuffers =
+                dev_fn!(self, "vkCmdBindVertexBuffers", PFN_vkCmdBindVertexBuffers);
+            let draw: PFN_vkCmdDraw = dev_fn!(self, "vkCmdDraw", PFN_vkCmdDraw);
+            let set_viewport: PFN_vkCmdSetViewport =
+                dev_fn!(self, "vkCmdSetViewport", PFN_vkCmdSetViewport);
+            let set_scissor: PFN_vkCmdSetScissor =
+                dev_fn!(self, "vkCmdSetScissor", PFN_vkCmdSetScissor);
+            let quad_pipeline = self.quads.as_ref().expect("quad pipeline");
+            let viewport = VkViewport {
+                x: 0.0,
+                y: 0.0,
+                width: self.width as f32,
+                height: self.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            let scissor = VkRect2D {
+                offset: [0, 0],
+                extent: VkExtent2D {
+                    width: self.width,
+                    height: self.height,
+                },
+            };
+            unsafe {
+                set_viewport(self.command_buffer, 0, 1, &viewport);
+                set_scissor(self.command_buffer, 0, 1, &scissor);
+                bind_pipeline(
+                    self.command_buffer,
+                    BIND_POINT_GRAPHICS,
+                    quad_pipeline.pipeline,
+                );
+                bind_vertex(
+                    self.command_buffer,
+                    0,
+                    1,
+                    &quad_pipeline.vertex_buffer,
+                    &0u64,
+                );
+                draw(self.command_buffer, quads.len() as u32, 1, 0, 0);
+            }
         }
         if !vertices.is_empty() {
             let bind_pipeline: PFN_vkCmdBindPipeline =
