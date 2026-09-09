@@ -142,6 +142,11 @@ pub fn list_picked_dir(uri: &str) -> Vec<(String, bool, String)> {
     host::list_dir(uri)
 }
 
+/// Read the system clipboard. Needs ohos.permission.READ_PASTEBOARD.
+pub fn read_clipboard() -> Option<String> {
+    clipboard::read_text()
+}
+
 /// Take the folder URI the host restored from persisted authorization.
 pub fn take_restore_folder() -> Option<String> {
     with_current(|platform| platform.take_restore_folder()).flatten()
