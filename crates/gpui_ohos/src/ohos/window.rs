@@ -671,12 +671,64 @@ impl PlatformWindow for OhosWindow {
     }
 }
 
-/// Every solid quad becomes a rounded-rectangle vertex pair, translucent or
-/// not; the fragment shader does the corners, border and antialiasing.
+/// Push one rectangle as two triangles.
+#[allow(clippy::too_many_arguments)]
+fn push_quad(
+    vertices: &mut Vec<super::vk::QuadVertex>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    screen_width: f32,
+    screen_height: f32,
+    fill: [f32; 4],
+    radii: [f32; 4],
+    border: f32,
+    border_color: [f32; 4],
+) {
+    let half_width = width / 2.0;
+    let half_height = height / 2.0;
+    let center_x = x + half_width;
+    let center_y = y + half_height;
+    let corners = [
+        (x, y),
+        (x + width, y),
+        (x + width, y + height),
+        (x, y + height),
+    ];
+    for index in [0usize, 1, 2, 0, 2, 3] {
+        let (px, py) = corners[index];
+        vertices.push(super::vk::QuadVertex {
+            x: px / screen_width * 2.0 - 1.0,
+            y: 1.0 - py / screen_height * 2.0,
+            local_x: px - center_x,
+            local_y: py - center_y,
+            half_width,
+            half_height,
+            radius_tl: radii[0],
+            radius_tr: radii[1],
+            radius_br: radii[2],
+            radius_bl: radii[3],
+            border,
+            pad: 0.0,
+            r: fill[0],
+            g: fill[1],
+            b: fill[2],
+            a: fill[3],
+            border_r: border_color[0],
+            border_g: border_color[1],
+            border_b: border_color[2],
+            border_a: border_color[3],
+        });
+    }
+}
+
+/// Solid quads and underlines become rounded-rectangle vertices, translucent
+/// or not; the fragment shader does the corners, border and antialiasing.
 fn build_quad_vertices(scene: &Scene, width: u32, height: u32) -> Vec<super::vk::QuadVertex> {
     let screen_width = width as f32;
     let screen_height = height as f32;
-    let mut vertices = Vec::with_capacity(scene.quads.len() * 6);
+    let mut vertices = Vec::with_capacity((scene.quads.len() + scene.underlines.len()) * 6);
     for quad in &scene.quads {
         let Some(fill) = quad.background.as_solid() else {
             // Gradients are not rendered yet.
@@ -689,10 +741,6 @@ fn build_quad_vertices(scene: &Scene, width: u32, height: u32) -> Vec<super::vk:
         if quad_width <= 0.0 || quad_height <= 0.0 {
             continue;
         }
-        let half_width = quad_width / 2.0;
-        let half_height = quad_height / 2.0;
-        let center_x = x + half_width;
-        let center_y = y + half_height;
         let fill = fill.to_rgb();
         let border_color = quad.border_color.to_rgb();
         let border = quad
@@ -709,37 +757,48 @@ fn build_quad_vertices(scene: &Scene, width: u32, height: u32) -> Vec<super::vk:
             quad.corner_radii.bottom_right.as_f32(),
             quad.corner_radii.bottom_left.as_f32(),
         ];
-        let corners = [
-            (x, y),
-            (x + quad_width, y),
-            (x + quad_width, y + quad_height),
-            (x, y + quad_height),
-        ];
-        for index in [0usize, 1, 2, 0, 2, 3] {
-            let (px, py) = corners[index];
-            vertices.push(super::vk::QuadVertex {
-                x: px / screen_width * 2.0 - 1.0,
-                y: 1.0 - py / screen_height * 2.0,
-                local_x: px - center_x,
-                local_y: py - center_y,
-                half_width,
-                half_height,
-                radius_tl: radii[0],
-                radius_tr: radii[1],
-                radius_br: radii[2],
-                radius_bl: radii[3],
-                border,
-                pad: 0.0,
-                r: fill.r,
-                g: fill.g,
-                b: fill.b,
-                a: fill.a,
-                border_r: border_color.r,
-                border_g: border_color.g,
-                border_b: border_color.b,
-                border_a: border_color.a,
-            });
+        push_quad(
+            &mut vertices,
+            x,
+            y,
+            quad_width,
+            quad_height,
+            screen_width,
+            screen_height,
+            [fill.r, fill.g, fill.b, fill.a],
+            radii,
+            border,
+            [
+                border_color.r,
+                border_color.g,
+                border_color.b,
+                border_color.a,
+            ],
+        );
+    }
+    for underline in &scene.underlines {
+        let bounds = underline.bounds;
+        let x = bounds.origin.x.as_f32();
+        let y = bounds.origin.y.as_f32();
+        let underline_width = bounds.size.width.as_f32();
+        let underline_height = bounds.size.height.as_f32();
+        if underline_width <= 0.0 || underline_height <= 0.0 {
+            continue;
         }
+        let color = underline.color.to_rgb();
+        push_quad(
+            &mut vertices,
+            x,
+            y,
+            underline_width,
+            underline_height,
+            screen_width,
+            screen_height,
+            [color.r, color.g, color.b, color.a],
+            [0.0; 4],
+            0.0,
+            [0.0; 4],
+        );
     }
     vertices
 }
