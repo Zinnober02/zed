@@ -87,6 +87,9 @@ pub(crate) struct WindowShared {
     ime_cursor: Cell<Bounds<Pixels>>,
     render_failure_logged: Cell<bool>,
     frame_count: Cell<u64>,
+    /// Set when the host destroyed this window's surface; the platform then
+    /// stops ticking it and drops its reference.
+    closed: Cell<bool>,
     atlas: Arc<OhosAtlas>,
     last_scene_hash: Cell<Option<u64>>,
     #[allow(dead_code)]
@@ -135,10 +138,19 @@ impl WindowShared {
             )),
             render_failure_logged: Cell::new(false),
             frame_count: Cell::new(0),
+            closed: Cell::new(false),
             atlas: Arc::new(OhosAtlas::new()),
             last_scene_hash: Cell::new(None),
             foreground_executor,
         })
+    }
+
+    pub(crate) fn mark_closed(&self) {
+        self.closed.set(true);
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.get()
     }
 
     pub(crate) fn request_frame(&self) {
@@ -335,7 +347,7 @@ impl WindowShared {
     }
 
     pub(crate) fn render(&self, scene: &Scene) {
-        if !self.ensure_renderer() {
+        if self.closed.get() || !self.ensure_renderer() {
             return;
         }
         let hash = scene_hash(scene);

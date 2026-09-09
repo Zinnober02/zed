@@ -236,42 +236,42 @@ fn logical(value: f32) -> crate::Pixels {
     crate::px(value / window::SCALE)
 }
 
-pub fn pointer_down(x: f32, y: f32, button: u32) {
+pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
     // Clicking the surface must give the XComponent ArkUI focus, otherwise its
     // onKeyEvent never fires and non-text keys (arrows) are dropped.
     host::window_op(host::op::REQUEST_FOCUS, "");
     with_current(|platform| {
-        for window in platform.windows() {
+        for window in platform.route_targets(id) {
             window.pointer_down(map_button(button), crate::point(logical(x), logical(y)));
         }
     });
 }
 
-pub fn pointer_up(x: f32, y: f32, button: u32) {
+pub fn pointer_up(id: &str, x: f32, y: f32, button: u32) {
     with_current(|platform| {
-        for window in platform.windows() {
+        for window in platform.route_targets(id) {
             window.pointer_up(map_button(button), crate::point(logical(x), logical(y)));
         }
     });
 }
 
-pub fn pointer_move(x: f32, y: f32) {
+pub fn pointer_move(id: &str, x: f32, y: f32) {
     with_current(|platform| {
-        for window in platform.windows() {
+        for window in platform.route_targets(id) {
             window.pointer_move(crate::point(logical(x), logical(y)));
         }
     });
 }
 
 /// ArkUI axis events (mouse wheel / touchpad) are already in logical pixels.
-pub fn scroll(x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) {
+pub fn scroll(id: &str, x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) {
     let phase = match phase {
         0 => crate::TouchPhase::Started,
         2 => crate::TouchPhase::Ended,
         _ => crate::TouchPhase::Moved,
     };
     with_current(|platform| {
-        for window in platform.windows() {
+        for window in platform.route_targets(id) {
             window.scroll(
                 crate::point(crate::px(x), crate::px(y)),
                 crate::point(crate::px(delta_x), crate::px(delta_y)),
@@ -288,7 +288,7 @@ thread_local! {
 }
 
 /// XComponent key event (action: 0 = down, 1 = up).
-pub fn key_event(action: i32, code: i32) {
+pub fn key_event(id: &str, action: i32, code: i32) {
     let down = action == 0;
     MODIFIERS.with(|cell| {
         let mut modifiers = cell.get();
@@ -304,7 +304,7 @@ pub fn key_event(action: i32, code: i32) {
     let modifiers = MODIFIERS.with(|cell| cell.get());
 
     if matches!(code, 2072 | 2073 | 2047 | 2048 | 2045 | 2046 | 2076 | 2077) {
-        with_current(|platform| platform.dispatch_modifiers(modifiers));
+        with_current(|platform| platform.dispatch_modifiers(id, modifiers));
         return;
     }
 
@@ -333,7 +333,7 @@ pub fn key_event(action: i32, code: i32) {
         if down { "down" } else { "up" },
         keystroke
     ));
-    with_current(|platform| platform.dispatch_key(down, keystroke));
+    with_current(|platform| platform.dispatch_key(id, down, keystroke));
 }
 
 /// Map an OHOS key code to a GPUI key name and the character it types.

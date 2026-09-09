@@ -343,12 +343,30 @@ impl OhosPlatform {
     }
 
     pub(crate) fn surface_destroyed(&self, id: &str) {
-        let surfaces = self.surfaces.borrow();
-        if let Some((_, surface)) = surfaces.iter().find(|(existing, _)| existing == id) {
+        let surface = {
+            let surfaces = self.surfaces.borrow();
+            surfaces
+                .iter()
+                .find(|(existing, _)| existing == id)
+                .map(|(_, surface)| surface.clone())
+        };
+        let Some(surface) = surface else {
+            return;
+        };
+        {
             let mut state = surface.borrow_mut();
             state.valid = false;
             state.window = std::ptr::null_mut();
         }
+        // The host closed that window: stop ticking it and drop the platform's
+        // reference so it is recycled.
+        let mut windows = self.windows.borrow_mut();
+        for window in windows.iter() {
+            if window.shares_surface(&surface) {
+                window.mark_closed();
+            }
+        }
+        windows.retain(|window| !window.is_closed());
     }
 
     /// Invoke the GPUI launch callback recorded by Platform::run.
@@ -371,17 +389,52 @@ impl OhosPlatform {
 
     pub(crate) fn request_frames(&self) {
         for window in self.windows.borrow().iter() {
-            window.request_frame();
+            if !window.is_closed() {
+                window.request_frame();
+            }
         }
     }
 
     pub(crate) fn window_count(&self) -> usize {
-        self.windows.borrow().len()
+        self.windows
+            .borrow()
+            .iter()
+            .filter(|window| !window.is_closed())
+            .count()
+    }
+
+    /// Windows an input event from a surface should reach. An empty id keeps
+    /// the legacy broadcast to every window.
+    pub(crate) fn route_targets(&self, id: &str) -> Vec<Rc<WindowShared>> {
+        if id.is_empty() {
+            return self.windows();
+        }
+        let surface = {
+            let surfaces = self.surfaces.borrow();
+            surfaces
+                .iter()
+                .find(|(existing, _)| existing == id)
+                .map(|(_, surface)| surface.clone())
+        };
+        let Some(surface) = surface else {
+            return Vec::new();
+        };
+        self.windows
+            .borrow()
+            .iter()
+            .filter(|window| !window.is_closed() && window.shares_surface(&surface))
+            .cloned()
+            .collect()
     }
 
     /// Snapshot of live window state, for input routing and frame ticks.
     pub(crate) fn windows(&self) -> Vec<Rc<WindowShared>> {
-        self.windows.borrow().clone()
+        self.windows
+            .borrow()
+            .iter()
+            .filter(|window| !window.is_closed())
+            .cloned()
+            .collect()
     }
 
     /// Text, caret and absolute caret rect (physical pixels) of the focused
@@ -408,9 +461,9 @@ impl OhosPlatform {
         }
     }
 
-    /// Forward a modifier-state change to every window.
-    pub(crate) fn dispatch_modifiers(&self, modifiers: Modifiers) {
-        for window in self.windows() {
+    /// Forward a modifier-state change to the surface's window.
+    pub(crate) fn dispatch_modifiers(&self, id: &str, modifiers: Modifiers) {
+        for window in self.route_targets(id) {
             window.dispatch_input(PlatformInput::ModifiersChanged(
                 crate::ModifiersChangedEvent {
                     modifiers,
@@ -420,9 +473,9 @@ impl OhosPlatform {
         }
     }
 
-    /// Forward a key press or release to every window.
-    pub(crate) fn dispatch_key(&self, down: bool, keystroke: crate::Keystroke) {
-        for window in self.windows() {
+    /// Forward a key press or release to the surface's window.
+    pub(crate) fn dispatch_key(&self, id: &str, down: bool, keystroke: crate::Keystroke) {
+        for window in self.route_targets(id) {
             if down {
                 window.dispatch_input(PlatformInput::KeyDown(crate::KeyDownEvent {
                     keystroke: keystroke.clone(),
