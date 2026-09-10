@@ -71,6 +71,12 @@ pub(crate) fn set_ops(ops: HostOps) {
     super::vk::log("[gpui_ohos] host ops installed");
 }
 
+/// Send a command that names the window it targets. The host strips the id
+/// prefix before handling the payload, so ids must not contain a tab.
+pub(crate) fn window_op_for(id: &str, op: i32, arg: &str) {
+    window_op(op, &format!("{id}\t{arg}"));
+}
+
 /// Send a command to the host. Silently no-ops when the host is absent.
 pub(crate) fn window_op(op: i32, arg: &str) {
     let Some(ops) = OPS.get() else {

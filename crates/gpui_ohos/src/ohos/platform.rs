@@ -137,8 +137,9 @@ impl OhosPlatform {
                 }
             }
             host::event::FOCUS => {
-                let active = arg != "0";
-                for window in self.windows() {
+                let (id, value) = split_window_event(arg);
+                let active = value != "0";
+                for window in self.route_targets(id) {
                     window.set_active(active);
                 }
             }
@@ -146,13 +147,15 @@ impl OhosPlatform {
                 // 1 full screen, 2 maximize, 3 minimize, 4 floating, 5 split.
                 // On 2in1 the system reports MAXIMIZE for a screen-filling
                 // window, which is what GPUI's titlebar treats as fullscreen.
-                let fullscreen = arg == "1" || arg == "2";
-                for window in self.windows() {
+                let (id, value) = split_window_event(arg);
+                let fullscreen = value == "1" || value == "2";
+                for window in self.route_targets(id) {
                     window.set_fullscreen(fullscreen);
                 }
             }
             host::event::WINDOW_RECT => {
-                if let Some(rect) = parse_rect(arg) {
+                let (_, value) = split_window_event(arg);
+                if let Some(rect) = parse_rect(value) {
                     self.window_rect.set(rect);
                 }
             }
@@ -293,7 +296,7 @@ impl OhosPlatform {
 
     /// The surface a new window should use: an existing one, or a fresh
     /// placeholder plus a host request to create the XComponent.
-    fn surface_for_window(&self) -> Rc<RefCell<SurfaceState>> {
+    fn surface_for_window(&self, params: &WindowParams) -> (String, Rc<RefCell<SurfaceState>>) {
         let index = self.windows_opened.get();
         self.windows_opened.set(index + 1);
         let mut surfaces = self.surfaces.borrow_mut();
@@ -316,10 +319,12 @@ impl OhosPlatform {
                 })),
             ));
             drop(surfaces);
-            host::window_op(host::op::CREATE_WINDOW, &id);
+            let payload = create_window_payload(&id, params, width, height);
+            host::window_op(host::op::CREATE_WINDOW, &payload);
             surfaces = self.surfaces.borrow_mut();
         }
-        surfaces[index].1.clone()
+        let id = surfaces[index].0.clone();
+        (id, surfaces[index].1.clone())
     }
 
     pub(crate) fn surface_resized(&self, id: &str, width: u32, height: u32) {
@@ -496,6 +501,42 @@ impl OhosPlatform {
     }
 }
 
+/// Split a per-window host event into its surface id and payload.
+fn split_window_event(arg: &str) -> (&str, &str) {
+    match arg.split_once('\t') {
+        Some((id, value)) => (id, value),
+        None => ("", arg),
+    }
+}
+
+/// Payload for CREATE_WINDOW: "<id>\t<left>,<top>,<width>,<height>\t<title>\t<resizable>".
+fn create_window_payload(
+    id: &str,
+    params: &WindowParams,
+    fallback_width: u32,
+    fallback_height: u32,
+) -> String {
+    let scale = super::window::SCALE;
+    let bounds = params.bounds;
+    let left = (bounds.origin.x.as_f32() * scale).round() as i32;
+    let top = (bounds.origin.y.as_f32() * scale).round() as i32;
+    let width = (bounds.size.width.as_f32() * scale).round().max(0.0) as u32;
+    let height = (bounds.size.height.as_f32() * scale).round().max(0.0) as u32;
+    let (width, height) = if width == 0 || height == 0 {
+        (fallback_width, fallback_height)
+    } else {
+        (width, height)
+    };
+    let title = params
+        .titlebar
+        .as_ref()
+        .and_then(|titlebar| titlebar.title.as_ref())
+        .map(|title| title.to_string())
+        .unwrap_or_default();
+    let resizable = if params.is_resizable { "1" } else { "0" };
+    format!("{id}\t{left},{top},{width},{height}\t{title}\t{resizable}")
+}
+
 /// Map a GPUI cursor style to the OHOS PointerStyle enum member name.
 fn cursor_style_name(style: CursorStyle) -> &'static str {
     match style {
@@ -649,15 +690,8 @@ impl Platform for OhosPlatform {
         // The first window uses the primary surface; later windows get a fresh
         // XComponent, created by the host on demand. Its surface may still be
         // invalid here and is filled in when the host reports it.
-        let surface = self.surface_for_window();
-        if let Some(title) = options
-            .titlebar
-            .as_ref()
-            .and_then(|titlebar| titlebar.title.as_ref())
-        {
-            host::window_op(host::op::SET_TITLE, title);
-        }
-        let shared = WindowShared::new(surface, options, self.foreground_executor.clone());
+        let (id, surface) = self.surface_for_window(&options);
+        let shared = WindowShared::new(id, surface, options, self.foreground_executor.clone());
         self.windows.borrow_mut().push(shared.clone());
         self.handles
             .borrow_mut()

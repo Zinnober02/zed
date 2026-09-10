@@ -110,6 +110,16 @@ where
         previous_hook(info);
     }));
 
+    // The first surface starts the application. Later surfaces are the
+    // XComponents the host created for windows the application asked for;
+    // running the application again for one of those would open yet another
+    // window, so only attach the surface and keep ticking.
+    if let Some(platform) = with_current(|platform| platform.clone()) {
+        platform.add_surface(id, window, width, height);
+        platform.request_frames();
+        return 0;
+    }
+
     let platform = new_platform();
     platform.set_surface(id, window, width, height);
     run_app();

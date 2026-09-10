@@ -96,6 +96,8 @@ impl Default for WindowCallbacks {
 /// State shared between the boxed PlatformWindow owned by GPUI and the
 /// OhosPlatform, which needs to drive frames and surface changes.
 pub(crate) struct WindowShared {
+    /// Host-side window id ("gpui_surface" or "gpui_surface_N").
+    id: String,
     surface: Rc<RefCell<SurfaceState>>,
     bounds: RefCell<Bounds<Pixels>>,
     scale: Cell<f32>,
@@ -127,6 +129,7 @@ pub(crate) struct WindowShared {
 
 impl WindowShared {
     pub(crate) fn new(
+        id: String,
         surface: Rc<RefCell<SurfaceState>>,
         _params: WindowParams,
         foreground_executor: ForegroundExecutor,
@@ -144,6 +147,7 @@ impl WindowShared {
             },
         );
         Rc::new(Self {
+            id,
             surface,
             bounds: RefCell::new(bounds),
             scale: Cell::new(scale),
@@ -173,6 +177,11 @@ impl WindowShared {
             last_scene_hash: Cell::new(None),
             foreground_executor,
         })
+    }
+
+    /// The host-side id, used to route commands to this window.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
     }
 
     pub(crate) fn mark_closed(&self) {
@@ -569,17 +578,17 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn set_title(&mut self, title: &str) {
-        host::window_op(host::op::SET_TITLE, title);
+        host::window_op_for(self.shared.id(), host::op::SET_TITLE, title);
     }
 
     fn set_background_appearance(&self, _appearance: WindowBackgroundAppearance) {}
 
     fn minimize(&self) {
-        host::window_op(host::op::MINIMIZE, "");
+        host::window_op_for(self.shared.id(), host::op::MINIMIZE, "");
     }
 
     fn zoom(&self) {
-        host::window_op(host::op::MAXIMIZE, "");
+        host::window_op_for(self.shared.id(), host::op::MAXIMIZE, "");
     }
 
     fn toggle_fullscreen(&self) {
@@ -588,7 +597,7 @@ impl PlatformWindow for OhosWindow {
         } else {
             "1"
         };
-        host::window_op(host::op::SET_FULLSCREEN, target);
+        host::window_op_for(self.shared.id(), host::op::SET_FULLSCREEN, target);
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -696,20 +705,20 @@ impl PlatformWindow for OhosWindow {
             ResizeEdge::Left => "left",
             ResizeEdge::TopLeft => "top-left",
         };
-        host::window_op(host::op::START_RESIZE, value);
+        host::window_op_for(self.shared.id(), host::op::START_RESIZE, value);
     }
 
     fn request_decorations(&self, _decorations: crate::WindowDecorations) {
         // The client titlebar we could draw has no close or resize controls, so
         // hiding the system title bar would strand the window. Keep the server
         // decorations; the system then insets the surface below them for us.
-        host::window_op(host::op::SET_DECOR, "server");
+        host::window_op_for(self.shared.id(), host::op::SET_DECOR, "server");
     }
 
     fn show_window_menu(&self, _position: Point<Pixels>) {}
 
     fn start_window_move(&self) {
-        host::window_op(host::op::START_MOVE, "");
+        host::window_op_for(self.shared.id(), host::op::START_MOVE, "");
     }
 }
 
