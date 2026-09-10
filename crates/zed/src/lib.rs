@@ -442,7 +442,10 @@ pub fn run() {
     if !stdout_is_a_pty() {
         app.background_executor()
             .spawn(async {
-                #[cfg(unix)]
+                // OHOS has no login shell to capture: the capture runs the
+                // Zed binary through an interactive shell, neither of which
+                // exists in the sandbox, so it only fails and logs noise.
+                #[cfg(all(unix, not(target_env = "ohos")))]
                 util::load_login_shell_environment().await.log_err();
                 shell_env_loaded_tx.send(()).ok();
             })
