@@ -27,5 +27,13 @@ pub extern "C" fn ohos_gpui_app_main(
         // SAFETY: the host passes a valid, NUL-terminated identifier.
         unsafe { CStr::from_ptr(id) }.to_string_lossy().into_owned()
     };
+    // Zed resolves its data, config and log directories from HOME, which the
+    // sandbox does not define; without this every directory creation is
+    // denied and the app stops at its launch-failure dialog.
+    // SAFETY: called before any other thread exists.
+    unsafe {
+        std::env::set_var("HOME", "/data/storage/el2/base/haps/entry/files");
+    }
+
     gpui_ohos::run_app_on_surface(&id, window, width, height, log, zed_app::run)
 }

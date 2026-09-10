@@ -158,10 +158,13 @@ impl OhosPlatform {
             }
             host::event::LIFECYCLE => match arg {
                 "background" | "destroy" => {
-                    if let Some(mut callback) = self.on_quit.borrow_mut().take() {
+                    // Take the callback out first: holding the RefMut across
+                    // the call would panic when it is stored back.
+                    let mut callback = self.on_quit.borrow_mut().take();
+                    if let Some(callback) = callback.as_mut() {
                         let _ = callback();
-                        *self.on_quit.borrow_mut() = Some(callback);
                     }
+                    *self.on_quit.borrow_mut() = callback;
                 }
                 "newwant" => {
                     if let Some(mut callback) = self.on_reopen.borrow_mut().take() {
