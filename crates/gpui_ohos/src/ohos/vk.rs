@@ -3044,7 +3044,9 @@ impl VkRenderer {
             anyhow::bail!("vkBeginCommandBuffer failed");
         }
         if !uploads.is_empty() {
-            let total: u64 = uploads.iter().map(|u| (u.width * u.height) as u64).sum();
+            // Size the staging buffer by the bytes actually copied; a
+            // polychrome tile is four bytes per pixel, not one.
+            let total: u64 = uploads.iter().map(|u| u.data.len() as u64).sum();
             let (staging_buffer, staging_memory, staging_mapped) =
                 self.create_host_buffer(total.max(4), BUFFER_USAGE_TRANSFER_SRC)?;
             let mut offset: u64 = 0;
