@@ -3,7 +3,7 @@
 //! Writing needs no permission; reading requires ohos.permission.READ_PASTEBOARD
 //! (an ACL permission), so read_text returns None when it is not granted.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 unsafe extern "C" {

@@ -10,7 +10,11 @@ mod text_system;
 mod vk;
 mod window;
 
-use std::{cell::RefCell, ffi::c_void, rc::{Rc, Weak}};
+use std::{
+    cell::RefCell,
+    ffi::c_void,
+    rc::{Rc, Weak},
+};
 
 pub use vk::LogFn;
 
@@ -18,8 +22,8 @@ pub use host::HostOps;
 
 pub use inputmethod::{
     commit_text as ime_commit_text, delete_backward as ime_delete_backward,
-    delete_forward as ime_delete_forward, finish_preview as ime_finish_preview,
-    hide as ime_hide, preview_text as ime_preview_text, show as ime_show,
+    delete_forward as ime_delete_forward, finish_preview as ime_finish_preview, hide as ime_hide,
+    preview_text as ime_preview_text, show as ime_show,
 };
 
 /// Log a line through the host-provided hilog sink.
@@ -412,16 +416,13 @@ fn dispatch_key(
     let key_char = if modifiers.control || modifiers.platform {
         None
     } else {
-        unicode
-            .and_then(char::from_u32)
-            .or(character)
-            .map(|ch| {
-                if modifiers.shift {
-                    ch.to_uppercase().to_string()
-                } else {
-                    ch.to_string()
-                }
-            })
+        unicode.and_then(char::from_u32).or(character).map(|ch| {
+            if modifiers.shift {
+                ch.to_uppercase().to_string()
+            } else {
+                ch.to_string()
+            }
+        })
     };
     let keystroke = crate::Keystroke {
         modifiers,
