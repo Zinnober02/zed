@@ -117,6 +117,8 @@ pub(crate) struct WindowShared {
     /// Set when the host destroyed this window's surface; the platform then
     /// stops ticking it and drops its reference.
     closed: Cell<bool>,
+    /// The last visibility GPUI asked for, so repeated requests are a no-op.
+    virtual_keyboard_visible: Cell<bool>,
     atlas: Arc<OhosAtlas>,
     last_scene_hash: Cell<Option<u64>>,
     #[allow(dead_code)]
@@ -166,6 +168,7 @@ impl WindowShared {
             render_failure_logged: Cell::new(false),
             frame_count: Cell::new(0),
             closed: Cell::new(false),
+            virtual_keyboard_visible: Cell::new(false),
             atlas: Arc::new(OhosAtlas::new()),
             last_scene_hash: Cell::new(None),
             foreground_executor,
@@ -654,6 +657,19 @@ impl PlatformWindow for OhosWindow {
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         self.shared.ime_cursor.set(bounds);
+    }
+
+    fn set_virtual_keyboard_visible(&self, visible: bool) {
+        // GPUI reports this on every focus change, and showing an already
+        // visible input method resets a composing (Chinese) pre-edit.
+        if self.shared.virtual_keyboard_visible.replace(visible) == visible {
+            return;
+        }
+        if visible {
+            super::inputmethod::show();
+        } else {
+            super::inputmethod::hide();
+        }
     }
 
     fn window_decorations(&self) -> Decorations {
