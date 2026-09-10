@@ -432,6 +432,11 @@ pub fn run() {
     }
 
     let fs = Arc::new(RealFs::new(git_binary_path, app.background_executor()));
+    // Documents the picker returns are tagged `dir:`/`file:` paths the sandbox
+    // cannot open; route those through the host and the rest to the real
+    // filesystem.
+    #[cfg(target_env = "ohos")]
+    let fs = Arc::new(fs::OhosFs::new(fs));
     let (user_keymap_file_rx, user_keymap_watcher) = watch_config_file(
         &app.background_executor(),
         fs.clone(),

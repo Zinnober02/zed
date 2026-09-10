@@ -35,5 +35,27 @@ pub extern "C" fn ohos_gpui_app_main(
         std::env::set_var("HOME", "/data/storage/el2/base/haps/entry/files");
     }
 
+    install_filesystem_bridge();
+
     gpui_ohos::run_app_on_surface(&id, window, width, height, log, zed_app::run)
+}
+
+/// Let the filesystem wrapper reach picked documents through the host.
+///
+/// The picker hands back `file://docs` URIs and descriptors instead of paths the
+/// sandbox can open, so `fs::OhosFs` forwards tagged paths to these entry
+/// points and leaves every other path to the real filesystem.
+fn install_filesystem_bridge() {
+    fs::set_ohos_fs_bridge(fs::OhosFsBridge {
+        list_dir: gpui_ohos::list_picked_dir,
+        open_file: gpui_ohos::open_picked_file,
+        read_fd: |fd| {
+            gpui_ohos::read_picked_file_bytes(fd)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
+        },
+        write_fd: |fd, data| {
+            gpui_ohos::write_picked_file_bytes(fd, data)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
+        },
+    });
 }

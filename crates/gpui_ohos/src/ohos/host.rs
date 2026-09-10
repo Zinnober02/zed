@@ -126,7 +126,7 @@ unsafe extern "C" {
 }
 
 /// Read a picked public file through the descriptor the host opened for it.
-pub(crate) fn read_fd(fd: i32) -> std::io::Result<String> {
+pub(crate) fn read_fd_bytes(fd: i32) -> std::io::Result<Vec<u8>> {
     unsafe { lseek(fd, 0, SEEK_SET) };
     let mut out = Vec::new();
     let mut buffer = [0u8; 8192];
@@ -140,17 +140,22 @@ pub(crate) fn read_fd(fd: i32) -> std::io::Result<String> {
         }
         out.extend_from_slice(&buffer[..count as usize]);
     }
-    String::from_utf8(out)
+    Ok(out)
+}
+
+/// Read a picked public file as UTF-8 text.
+pub(crate) fn read_fd(fd: i32) -> std::io::Result<String> {
+    let bytes = read_fd_bytes(fd)?;
+    String::from_utf8(bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// Replace a picked public file's contents through its descriptor.
-pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
+pub(crate) fn write_fd_bytes(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
     unsafe {
         ftruncate(fd, 0);
         lseek(fd, 0, SEEK_SET);
     }
-    let bytes = data.as_bytes();
     let mut written = 0usize;
     while written < bytes.len() {
         let count = unsafe {
@@ -166,6 +171,11 @@ pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
         written += count as usize;
     }
     Ok(())
+}
+
+/// Replace a picked public file's contents with UTF-8 text.
+pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
+    write_fd_bytes(fd, data.as_bytes())
 }
 
 /// Ask the host to open a picked file read/write, returning its descriptor.

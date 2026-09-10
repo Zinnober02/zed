@@ -16,6 +16,7 @@ path = "src/zed_ohos.rs"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
+fs.workspace = true
 gpui_ohos.workspace = true
 zed = { path = "../zed" }
 

@@ -23285,6 +23285,7 @@ name = "zed_ohos"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "fs",
  "gpui_ohos",
  "zed",
 ]

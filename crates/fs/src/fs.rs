@@ -1,5 +1,11 @@
 pub mod fs_watcher;
 
+#[cfg(target_env = "ohos")]
+mod ohos;
+
+#[cfg(target_env = "ohos")]
+pub use ohos::{OhosFs, OhosFsBridge, set_ohos_fs_bridge};
+
 pub use fs_watcher::requires_poll_watcher;
 
 use parking_lot::Mutex;

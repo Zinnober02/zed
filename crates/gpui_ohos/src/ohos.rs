@@ -190,9 +190,19 @@ pub fn read_picked_file(fd: i32) -> Result<String, String> {
     host::read_fd(fd).map_err(|error| error.to_string())
 }
 
+/// Read a picked file's raw bytes.
+pub fn read_picked_file_bytes(fd: i32) -> Result<Vec<u8>, String> {
+    host::read_fd_bytes(fd).map_err(|error| error.to_string())
+}
+
 /// Overwrite a file the user picked, through its descriptor.
 pub fn write_picked_file(fd: i32, data: &str) -> Result<(), String> {
     host::write_fd(fd, data).map_err(|error| error.to_string())
+}
+
+/// Overwrite a picked file with raw bytes.
+pub fn write_picked_file_bytes(fd: i32, data: &[u8]) -> Result<(), String> {
+    host::write_fd_bytes(fd, data).map_err(|error| error.to_string())
 }
 
 /// Open a picked file read/write and return its descriptor.
