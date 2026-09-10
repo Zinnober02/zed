@@ -2055,8 +2055,33 @@ pub struct QuadVertex {
     pub border_a: f32,
 }
 
-/// Path triangle vertex: NDC position, GPUI's curve-encoding st coordinate
+/// Which pipeline a DrawBatch issues its draw with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DrawPipeline {
+    Quads,
+    Paths,
+    Glyphs,
+}
+
+/// One contiguous run of primitives sharing a pipeline and a clip rect.
+///
+/// GPUI hands the scene over sorted by draw order, and Scene::batches() merges
+/// the per-kind lists back into that order, so a run like this is a single
+/// vkCmdDraw(first_vertex, vertex_count, 1, 0) in that pipeline vertex buffer.
+/// Keeping the order matters: a popup background is a quad while the page text
+/// behind it is glyphs, so drawing all quads first used to put the page text on
+/// top of the popup.
+pub struct DrawBatch {
+    pub pipeline: DrawPipeline,
+    pub first_vertex: u32,
+    pub vertex_count: u32,
+    /// Device-pixel scissor rect, already clamped to the surface.
+    pub scissor: (i32, i32, u32, u32),
+}
+
+/// Path triangle vertex: NDC position, GPUI curve-encoding st coordinate
 /// and the path colour.
+
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub struct PathVertex {
@@ -2921,6 +2946,7 @@ impl VkRenderer {
         quads: &[QuadVertex],
         paths: &[PathVertex],
         vertices: &[GlyphVertex],
+        batches: &[DrawBatch],
         uploads: &[super::atlas::AtlasUpload],
     ) -> anyhow::Result<()> {
         if self.text.is_none() {
@@ -3144,118 +3170,92 @@ impl VkRenderer {
         unsafe {
             (self.fns.begin_render_pass)(self.command_buffer, &rpbi, SUBPASS_CONTENTS_INLINE)
         };
-        if !quads.is_empty() {
-            let bind_pipeline: PFN_vkCmdBindPipeline =
-                dev_fn!(self, "vkCmdBindPipeline", PFN_vkCmdBindPipeline);
-            let bind_vertex: PFN_vkCmdBindVertexBuffers =
-                dev_fn!(self, "vkCmdBindVertexBuffers", PFN_vkCmdBindVertexBuffers);
-            let draw: PFN_vkCmdDraw = dev_fn!(self, "vkCmdDraw", PFN_vkCmdDraw);
-            let set_viewport: PFN_vkCmdSetViewport =
-                dev_fn!(self, "vkCmdSetViewport", PFN_vkCmdSetViewport);
-            let set_scissor: PFN_vkCmdSetScissor =
-                dev_fn!(self, "vkCmdSetScissor", PFN_vkCmdSetScissor);
-            let quad_pipeline = self.quads.as_ref().expect("quad pipeline");
-            let viewport = VkViewport {
-                x: 0.0,
-                y: 0.0,
-                width: self.width as f32,
-                height: self.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
+        let set_viewport: PFN_vkCmdSetViewport =
+            dev_fn!(self, "vkCmdSetViewport", PFN_vkCmdSetViewport);
+        let set_scissor: PFN_vkCmdSetScissor =
+            dev_fn!(self, "vkCmdSetScissor", PFN_vkCmdSetScissor);
+        let bind_pipeline: PFN_vkCmdBindPipeline =
+            dev_fn!(self, "vkCmdBindPipeline", PFN_vkCmdBindPipeline);
+        let bind_vertex: PFN_vkCmdBindVertexBuffers =
+            dev_fn!(self, "vkCmdBindVertexBuffers", PFN_vkCmdBindVertexBuffers);
+        let bind_sets: PFN_vkCmdBindDescriptorSets =
+            dev_fn!(self, "vkCmdBindDescriptorSets", PFN_vkCmdBindDescriptorSets);
+        let draw: PFN_vkCmdDraw = dev_fn!(self, "vkCmdDraw", PFN_vkCmdDraw);
+        let viewport = VkViewport {
+            x: 0.0,
+            y: 0.0,
+            width: self.width as f32,
+            height: self.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        unsafe { set_viewport(self.command_buffer, 0, 1, &viewport) };
+        // Batches arrive in painter order and each carries its clip rect, so
+        // the pipeline is only rebound when the kind actually changes.
+        let mut bound: Option<DrawPipeline> = None;
+        for batch in batches {
+            let (scissor_x, scissor_y, scissor_width, scissor_height) = batch.scissor;
             let scissor = VkRect2D {
-                offset: [0, 0],
+                offset: [scissor_x, scissor_y],
                 extent: VkExtent2D {
-                    width: self.width,
-                    height: self.height,
+                    width: scissor_width,
+                    height: scissor_height,
                 },
             };
-            unsafe {
-                set_viewport(self.command_buffer, 0, 1, &viewport);
-                set_scissor(self.command_buffer, 0, 1, &scissor);
-                bind_pipeline(
-                    self.command_buffer,
-                    BIND_POINT_GRAPHICS,
-                    quad_pipeline.pipeline,
-                );
-                bind_vertex(
-                    self.command_buffer,
-                    0,
-                    1,
-                    &quad_pipeline.vertex_buffer,
-                    &0u64,
-                );
-                draw(self.command_buffer, quads.len() as u32, 1, 0, 0);
+            unsafe { set_scissor(self.command_buffer, 0, 1, &scissor) };
+            if bound != Some(batch.pipeline) {
+                unsafe {
+                    match batch.pipeline {
+                        DrawPipeline::Quads => {
+                            let pipeline = self.quads.as_ref().expect("quad pipeline");
+                            bind_pipeline(
+                                self.command_buffer,
+                                BIND_POINT_GRAPHICS,
+                                pipeline.pipeline,
+                            );
+                            bind_vertex(self.command_buffer, 0, 1, &pipeline.vertex_buffer, &0u64);
+                        }
+                        DrawPipeline::Paths => {
+                            let pipeline = self.paths.as_ref().expect("path pipeline");
+                            bind_pipeline(
+                                self.command_buffer,
+                                BIND_POINT_GRAPHICS,
+                                pipeline.pipeline,
+                            );
+                            bind_vertex(self.command_buffer, 0, 1, &pipeline.vertex_buffer, &0u64);
+                        }
+                        DrawPipeline::Glyphs => {
+                            let pipeline = self.text.as_ref().expect("text pipeline");
+                            bind_pipeline(
+                                self.command_buffer,
+                                BIND_POINT_GRAPHICS,
+                                pipeline.pipeline,
+                            );
+                            bind_vertex(self.command_buffer, 0, 1, &pipeline.vertex_buffer, &0u64);
+                            bind_sets(
+                                self.command_buffer,
+                                BIND_POINT_GRAPHICS,
+                                pipeline.pipeline_layout,
+                                0,
+                                1,
+                                &pipeline.descriptor_set,
+                                0,
+                                std::ptr::null(),
+                            );
+                        }
+                    }
+                }
+                bound = Some(batch.pipeline);
             }
-        }
-        if !paths.is_empty() {
-            let bind_pipeline: PFN_vkCmdBindPipeline =
-                dev_fn!(self, "vkCmdBindPipeline", PFN_vkCmdBindPipeline);
-            let bind_vertex: PFN_vkCmdBindVertexBuffers =
-                dev_fn!(self, "vkCmdBindVertexBuffers", PFN_vkCmdBindVertexBuffers);
-            let draw: PFN_vkCmdDraw = dev_fn!(self, "vkCmdDraw", PFN_vkCmdDraw);
-            let path_pipeline = self.paths.as_ref().expect("path pipeline");
             unsafe {
-                bind_pipeline(
+                draw(
                     self.command_buffer,
-                    BIND_POINT_GRAPHICS,
-                    path_pipeline.pipeline,
-                );
-                bind_vertex(
-                    self.command_buffer,
-                    0,
+                    batch.vertex_count,
                     1,
-                    &path_pipeline.vertex_buffer,
-                    &0u64,
-                );
-                draw(self.command_buffer, paths.len() as u32, 1, 0, 0);
-            }
-        }
-        if !vertices.is_empty() {
-            let bind_pipeline: PFN_vkCmdBindPipeline =
-                dev_fn!(self, "vkCmdBindPipeline", PFN_vkCmdBindPipeline);
-            let bind_vertex: PFN_vkCmdBindVertexBuffers =
-                dev_fn!(self, "vkCmdBindVertexBuffers", PFN_vkCmdBindVertexBuffers);
-            let bind_sets: PFN_vkCmdBindDescriptorSets =
-                dev_fn!(self, "vkCmdBindDescriptorSets", PFN_vkCmdBindDescriptorSets);
-            let draw: PFN_vkCmdDraw = dev_fn!(self, "vkCmdDraw", PFN_vkCmdDraw);
-            let set_viewport: PFN_vkCmdSetViewport =
-                dev_fn!(self, "vkCmdSetViewport", PFN_vkCmdSetViewport);
-            let set_scissor: PFN_vkCmdSetScissor =
-                dev_fn!(self, "vkCmdSetScissor", PFN_vkCmdSetScissor);
-            let text = self.text.as_ref().expect("text pipeline");
-            let viewport = VkViewport {
-                x: 0.0,
-                y: 0.0,
-                width: self.width as f32,
-                height: self.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
+                    batch.first_vertex,
+                    0,
+                )
             };
-            let scissor = VkRect2D {
-                offset: [0, 0],
-                extent: VkExtent2D {
-                    width: self.width,
-                    height: self.height,
-                },
-            };
-            unsafe {
-                set_viewport(self.command_buffer, 0, 1, &viewport);
-                set_scissor(self.command_buffer, 0, 1, &scissor);
-                bind_pipeline(self.command_buffer, BIND_POINT_GRAPHICS, text.pipeline);
-                bind_vertex(self.command_buffer, 0, 1, &text.vertex_buffer, &0u64);
-                bind_sets(
-                    self.command_buffer,
-                    BIND_POINT_GRAPHICS,
-                    text.pipeline_layout,
-                    0,
-                    1,
-                    &text.descriptor_set,
-                    0,
-                    std::ptr::null(),
-                );
-                draw(self.command_buffer, vertices.len() as u32, 1, 0, 0);
-            }
         }
         unsafe {
             (self.fns.cmd_end_render_pass)(self.command_buffer);

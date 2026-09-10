@@ -17,11 +17,12 @@ use raw_window_handle::{
 };
 
 use crate::{
-    AtlasTextureKind, Bounds, Capslock, Decorations, DispatchEventResult, ForegroundExecutor,
-    GpuSpecs, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, ScrollDelta,
-    ScrollWheelEvent, Size, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    AtlasTextureKind, Bounds, Capslock, ContentMask, Decorations, DispatchEventResult,
+    ForegroundExecutor, GpuSpecs, Modifiers, MonochromeSprite, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PrimitiveBatch, PromptButton, PromptLevel, Quad,
+    RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, ScrollDelta, ScrollWheelEvent, Size,
+    TouchPhase, Underline, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowControls, WindowParams, point, px,
 };
 
@@ -29,7 +30,7 @@ use super::atlas::OhosAtlas;
 use super::display::OhosDisplay;
 use super::host;
 use super::platform::SurfaceState;
-use super::vk::VkRenderer;
+use super::vk::{DrawBatch, DrawPipeline, VkRenderer};
 
 /// Clear color used until the GPUI scene renderer lands (M2+).
 /// Teal so it is unambiguous versus the old probe blue.
@@ -394,11 +395,10 @@ impl WindowShared {
         let (atlas_w, atlas_h) = self.atlas.texture_size(AtlasTextureKind::Monochrome);
         if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
             let (width, height) = renderer.size();
-            let quads = build_quad_vertices(scene, width, height);
-            let paths = build_path_vertices(scene, width, height);
-            let vertices = build_glyph_vertices(scene, width, height, atlas_w, atlas_h);
+            let (quads, paths, glyphs, batches) =
+                build_draw_list(scene, width, height, atlas_w, atlas_h);
             if let Err(error) =
-                renderer.render_scene(CLEAR_COLOR, &quads, &paths, &vertices, &uploads)
+                renderer.render_scene(CLEAR_COLOR, &quads, &paths, &glyphs, &batches, &uploads)
             {
                 super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
             }
@@ -750,199 +750,338 @@ fn push_quad(
     }
 }
 
-/// Solid quads and underlines become rounded-rectangle vertices, translucent
-/// or not; the fragment shader does the corners, border and antialiasing.
-fn build_quad_vertices(scene: &Scene, width: u32, height: u32) -> Vec<super::vk::QuadVertex> {
-    let screen_width = width as f32;
-    let screen_height = height as f32;
-    let mut vertices = Vec::with_capacity((scene.quads.len() + scene.underlines.len()) * 6);
-    for quad in &scene.quads {
-        let Some(fill) = quad.background.as_solid() else {
-            // Gradients are not rendered yet.
-            continue;
-        };
-        let x = quad.bounds.origin.x.as_f32();
-        let y = quad.bounds.origin.y.as_f32();
-        let quad_width = quad.bounds.size.width.as_f32();
-        let quad_height = quad.bounds.size.height.as_f32();
-        if quad_width <= 0.0 || quad_height <= 0.0 {
-            continue;
-        }
-        let fill = fill.to_rgb();
-        let border_color = quad.border_color.to_rgb();
-        let border = quad
-            .border_widths
-            .top
-            .as_f32()
-            .max(quad.border_widths.right.as_f32())
-            .max(quad.border_widths.bottom.as_f32())
-            .max(quad.border_widths.left.as_f32())
-            .max(0.0);
-        let radii = [
-            quad.corner_radii.top_left.as_f32(),
-            quad.corner_radii.top_right.as_f32(),
-            quad.corner_radii.bottom_right.as_f32(),
-            quad.corner_radii.bottom_left.as_f32(),
-        ];
-        push_quad(
-            &mut vertices,
-            x,
-            y,
-            quad_width,
-            quad_height,
-            screen_width,
-            screen_height,
-            [fill.r, fill.g, fill.b, fill.a],
-            radii,
-            border,
-            [
-                border_color.r,
-                border_color.g,
-                border_color.b,
-                border_color.a,
-            ],
-        );
+/// Clip rect for one primitive, in device pixels and clamped to the surface.
+///
+/// GPUI intersects nested content masks while building the scene and snaps the
+/// result to whole device pixels, so one rectangle per primitive is exact.
+/// Returns None when the primitive is clipped away entirely.
+fn scissor_for(
+    mask: &ContentMask<ScaledPixels>,
+    width: u32,
+    height: u32,
+) -> Option<(i32, i32, u32, u32)> {
+    let left = mask.bounds.origin.x.as_f32().floor().max(0.0);
+    let top = mask.bounds.origin.y.as_f32().floor().max(0.0);
+    let right = (mask.bounds.origin.x.as_f32() + mask.bounds.size.width.as_f32())
+        .ceil()
+        .min(width as f32);
+    let bottom = (mask.bounds.origin.y.as_f32() + mask.bounds.size.height.as_f32())
+        .ceil()
+        .min(height as f32);
+    let extent_x = (right - left).max(0.0) as u32;
+    let extent_y = (bottom - top).max(0.0) as u32;
+    if extent_x == 0 || extent_y == 0 {
+        // Fully clipped: the caller skips the draw instead of emitting an empty
+        // scissor, which Vulkan rejects.
+        None
+    } else {
+        Some((left as i32, top as i32, extent_x, extent_y))
     }
-    for underline in &scene.underlines {
-        let bounds = underline.bounds;
-        let x = bounds.origin.x.as_f32();
-        let y = bounds.origin.y.as_f32();
-        let underline_width = bounds.size.width.as_f32();
-        let underline_height = bounds.size.height.as_f32();
-        if underline_width <= 0.0 || underline_height <= 0.0 {
-            continue;
-        }
-        let color = underline.color.to_rgb();
-        push_quad(
-            &mut vertices,
-            x,
-            y,
-            underline_width,
-            underline_height,
-            screen_width,
-            screen_height,
-            [color.r, color.g, color.b, color.a],
-            [0.0; 4],
-            0.0,
-            [0.0; 4],
-        );
-    }
-    vertices
 }
 
-/// GPUI paths are already triangle lists; each vertex carries the colour and
-/// the curve-encoding st coordinate the fragment shader decodes.
-fn build_path_vertices(scene: &Scene, width: u32, height: u32) -> Vec<super::vk::PathVertex> {
-    let screen_width = width as f32;
-    let screen_height = height as f32;
-    let mut vertices = Vec::new();
-    for path in &scene.paths {
-        let Some(fill) = path.color.as_solid() else {
-            // Gradient fills are not rendered yet.
-            continue;
-        };
-        let fill = fill.to_rgb();
-        for triangle in path.vertices.chunks_exact(3) {
-            let points: [(f32, f32); 3] = std::array::from_fn(|index| {
-                (
-                    triangle[index].xy_position.x.as_f32(),
-                    triangle[index].xy_position.y.as_f32(),
-                )
-            });
-            let st: [(f32, f32); 3] = std::array::from_fn(|index| {
-                (triangle[index].st_position.x, triangle[index].st_position.y)
-            });
-            // st is affine across a triangle, so its screen-space gradient is
-            // constant: solve for the barycentric derivatives once.
-            let dp1 = (points[1].0 - points[0].0, points[1].1 - points[0].1);
-            let dp2 = (points[2].0 - points[0].0, points[2].1 - points[0].1);
-            let ds1 = (st[1].0 - st[0].0, st[1].1 - st[0].1);
-            let ds2 = (st[2].0 - st[0].0, st[2].1 - st[0].1);
-            let determinant = dp1.0 * dp2.1 - dp2.0 * dp1.1;
-            let (st_dx, st_dy) = if determinant.abs() < 1.0e-6 {
-                ((0.0, 0.0), (0.0, 0.0))
-            } else {
-                let inverse = 1.0 / determinant;
-                (
-                    (
-                        (ds1.0 * dp2.1 - ds2.0 * dp1.1) * inverse,
-                        (ds1.1 * dp2.1 - ds2.1 * dp1.1) * inverse,
-                    ),
-                    (
-                        (ds2.0 * dp1.0 - ds1.0 * dp2.0) * inverse,
-                        (ds2.1 * dp1.0 - ds1.1 * dp2.0) * inverse,
-                    ),
-                )
-            };
-            for index in 0..3 {
-                vertices.push(super::vk::PathVertex {
-                    x: points[index].0 / screen_width * 2.0 - 1.0,
-                    y: 1.0 - points[index].1 / screen_height * 2.0,
-                    st_x: st[index].0,
-                    st_y: st[index].1,
-                    st_dx_x: st_dx.0,
-                    st_dx_y: st_dx.1,
-                    st_dy_x: st_dy.0,
-                    st_dy_y: st_dy.1,
-                    r: fill.r,
-                    g: fill.g,
-                    b: fill.b,
-                    a: fill.a,
-                });
-            }
-        }
+/// Emits one quad, reporting whether anything was emitted.
+fn push_quad_primitive(
+    vertices: &mut Vec<super::vk::QuadVertex>,
+    quad: &Quad,
+    screen_width: f32,
+    screen_height: f32,
+) -> bool {
+    let Some(fill) = quad.background.as_solid() else {
+        // Gradients and patterns are not rendered yet.
+        return false;
+    };
+    let x = quad.bounds.origin.x.as_f32();
+    let y = quad.bounds.origin.y.as_f32();
+    let quad_width = quad.bounds.size.width.as_f32();
+    let quad_height = quad.bounds.size.height.as_f32();
+    if quad_width <= 0.0 || quad_height <= 0.0 {
+        return false;
     }
-    vertices
+    let fill = fill.to_rgb();
+    let border_color = quad.border_color.to_rgb();
+    let border = quad
+        .border_widths
+        .top
+        .as_f32()
+        .max(quad.border_widths.right.as_f32())
+        .max(quad.border_widths.bottom.as_f32())
+        .max(quad.border_widths.left.as_f32())
+        .max(0.0);
+    let radii = [
+        quad.corner_radii.top_left.as_f32(),
+        quad.corner_radii.top_right.as_f32(),
+        quad.corner_radii.bottom_right.as_f32(),
+        quad.corner_radii.bottom_left.as_f32(),
+    ];
+    push_quad(
+        vertices,
+        x,
+        y,
+        quad_width,
+        quad_height,
+        screen_width,
+        screen_height,
+        [fill.r, fill.g, fill.b, fill.a],
+        radii,
+        border,
+        [
+            border_color.r,
+            border_color.g,
+            border_color.b,
+            border_color.a,
+        ],
+    );
+    true
 }
 
-fn build_glyph_vertices(
+/// Emits one underline. Wavy underlines are still drawn straight.
+fn push_underline_primitive(
+    vertices: &mut Vec<super::vk::QuadVertex>,
+    underline: &Underline,
+    screen_width: f32,
+    screen_height: f32,
+) -> bool {
+    let bounds = underline.bounds;
+    let x = bounds.origin.x.as_f32();
+    let y = bounds.origin.y.as_f32();
+    let underline_width = bounds.size.width.as_f32();
+    let underline_height = bounds.size.height.as_f32();
+    if underline_width <= 0.0 || underline_height <= 0.0 {
+        return false;
+    }
+    let color = underline.color.to_rgb();
+    push_quad(
+        vertices,
+        x,
+        y,
+        underline_width,
+        underline_height,
+        screen_width,
+        screen_height,
+        [color.r, color.g, color.b, color.a],
+        [0.0; 4],
+        0.0,
+        [0.0; 4],
+    );
+    true
+}
+
+/// Emits one path. GPUI hands us a triangle list whose st coordinate encodes
+/// quadratic curves, so compute each triangle screen-space st gradient here.
+fn push_path_primitive(
+    vertices: &mut Vec<super::vk::PathVertex>,
+    path: &Path<ScaledPixels>,
+    screen_width: f32,
+    screen_height: f32,
+) -> bool {
+    let Some(fill) = path.color.as_solid() else {
+        return false;
+    };
+    let fill = fill.to_rgb();
+    let before = vertices.len();
+    for triangle in path.vertices.chunks_exact(3) {
+        let points: [(f32, f32); 3] = std::array::from_fn(|index| {
+            (
+                triangle[index].xy_position.x.as_f32(),
+                triangle[index].xy_position.y.as_f32(),
+            )
+        });
+        let st: [(f32, f32); 3] = std::array::from_fn(|index| {
+            (triangle[index].st_position.x, triangle[index].st_position.y)
+        });
+        let dp1 = (points[1].0 - points[0].0, points[1].1 - points[0].1);
+        let dp2 = (points[2].0 - points[0].0, points[2].1 - points[0].1);
+        let ds1 = (st[1].0 - st[0].0, st[1].1 - st[0].1);
+        let ds2 = (st[2].0 - st[0].0, st[2].1 - st[0].1);
+        let determinant = dp1.0 * dp2.1 - dp2.0 * dp1.1;
+        let (st_dx, st_dy) = if determinant.abs() < 1.0e-6 {
+            ((0.0, 0.0), (0.0, 0.0))
+        } else {
+            let inverse = 1.0 / determinant;
+            (
+                (
+                    (ds1.0 * dp2.1 - ds2.0 * dp1.1) * inverse,
+                    (ds1.1 * dp2.1 - ds2.1 * dp1.1) * inverse,
+                ),
+                (
+                    (ds2.0 * dp1.0 - ds1.0 * dp2.0) * inverse,
+                    (ds2.1 * dp1.0 - ds1.1 * dp2.0) * inverse,
+                ),
+            )
+        };
+        for index in 0..3 {
+            vertices.push(super::vk::PathVertex {
+                x: points[index].0 / screen_width * 2.0 - 1.0,
+                y: 1.0 - points[index].1 / screen_height * 2.0,
+                st_x: st[index].0,
+                st_y: st[index].1,
+                st_dx_x: st_dx.0,
+                st_dx_y: st_dx.1,
+                st_dy_x: st_dy.0,
+                st_dy_y: st_dy.1,
+                r: fill.r,
+                g: fill.g,
+                b: fill.b,
+                a: fill.a,
+            });
+        }
+    }
+    vertices.len() > before
+}
+
+/// Emits one monochrome sprite (a glyph).
+fn push_glyph_primitive(
+    vertices: &mut Vec<super::vk::GlyphVertex>,
+    sprite: &MonochromeSprite,
+    screen_width: f32,
+    screen_height: f32,
+    atlas_width: f32,
+    atlas_height: f32,
+) -> bool {
+    let x = sprite.bounds.origin.x.as_f32();
+    let y = sprite.bounds.origin.y.as_f32();
+    let sprite_width = sprite.bounds.size.width.as_f32();
+    let sprite_height = sprite.bounds.size.height.as_f32();
+    if sprite_width <= 0.0 || sprite_height <= 0.0 {
+        return false;
+    }
+    let tile = sprite.tile.bounds;
+    let u0 = tile.origin.x.0 as f32 / atlas_width;
+    let v0 = tile.origin.y.0 as f32 / atlas_height;
+    let u1 = (tile.origin.x.0 + tile.size.width.0) as f32 / atlas_width;
+    let v1 = (tile.origin.y.0 + tile.size.height.0) as f32 / atlas_height;
+    let color = sprite.color.to_rgb();
+    let x0 = x / screen_width * 2.0 - 1.0;
+    let y0 = 1.0 - y / screen_height * 2.0;
+    let x1 = (x + sprite_width) / screen_width * 2.0 - 1.0;
+    let y1 = 1.0 - (y + sprite_height) / screen_height * 2.0;
+    let vertex = |px: f32, py: f32, u: f32, v: f32| super::vk::GlyphVertex {
+        x: px,
+        y: py,
+        u,
+        v,
+        r: color.r,
+        g: color.g,
+        b: color.b,
+        a: color.a,
+    };
+    vertices.push(vertex(x0, y0, u0, v0));
+    vertices.push(vertex(x1, y0, u1, v0));
+    vertices.push(vertex(x1, y1, u1, v1));
+    vertices.push(vertex(x0, y0, u0, v0));
+    vertices.push(vertex(x1, y1, u1, v1));
+    vertices.push(vertex(x0, y1, u0, v1));
+    true
+}
+
+/// Builds the frame vertex arrays plus the ordered draw list.
+///
+/// Walking Scene::batches() instead of "all quads, then all paths, then all
+/// glyphs" is what keeps painter order: a popup background is a quad while the
+/// page text behind it is glyphs, so the old order drew the text on top of the
+/// popup. Each emitted primitive carries its clip rect so the renderer can set
+/// a scissor per run.
+pub(super) fn build_draw_list(
     scene: &Scene,
     width: u32,
     height: u32,
     atlas_width: u32,
     atlas_height: u32,
-) -> Vec<super::vk::GlyphVertex> {
-    let mut vertices = Vec::with_capacity(scene.monochrome_sprites.len() * 6);
+) -> (
+    Vec<super::vk::QuadVertex>,
+    Vec<super::vk::PathVertex>,
+    Vec<super::vk::GlyphVertex>,
+    Vec<DrawBatch>,
+) {
     let screen_width = width as f32;
     let screen_height = height as f32;
     let atlas_width = atlas_width as f32;
     let atlas_height = atlas_height as f32;
-    for sprite in &scene.monochrome_sprites {
-        let x = sprite.bounds.origin.x.as_f32();
-        let y = sprite.bounds.origin.y.as_f32();
-        let sprite_width = sprite.bounds.size.width.as_f32();
-        let sprite_height = sprite.bounds.size.height.as_f32();
-        if sprite_width <= 0.0 || sprite_height <= 0.0 {
-            continue;
-        }
-        let tile = sprite.tile.bounds;
-        let u0 = tile.origin.x.0 as f32 / atlas_width;
-        let v0 = tile.origin.y.0 as f32 / atlas_height;
-        let u1 = (tile.origin.x.0 + tile.size.width.0) as f32 / atlas_width;
-        let v1 = (tile.origin.y.0 + tile.size.height.0) as f32 / atlas_height;
-        let color = sprite.color.to_rgb();
-        let x0 = x / screen_width * 2.0 - 1.0;
-        let y0 = 1.0 - y / screen_height * 2.0;
-        let x1 = (x + sprite_width) / screen_width * 2.0 - 1.0;
-        let y1 = 1.0 - (y + sprite_height) / screen_height * 2.0;
-        let vertex = |px: f32, py: f32, u: f32, v: f32| super::vk::GlyphVertex {
-            x: px,
-            y: py,
-            u,
-            v,
-            r: color.r,
-            g: color.g,
-            b: color.b,
-            a: color.a,
-        };
-        vertices.push(vertex(x0, y0, u0, v0));
-        vertices.push(vertex(x1, y0, u1, v0));
-        vertices.push(vertex(x1, y1, u1, v1));
-        vertices.push(vertex(x0, y0, u0, v0));
-        vertices.push(vertex(x1, y1, u1, v1));
-        vertices.push(vertex(x0, y1, u0, v1));
+    let mut quads = Vec::new();
+    let mut paths = Vec::new();
+    let mut glyphs = Vec::new();
+    let mut batches = Vec::new();
+
+    macro_rules! emit {
+        ($list:expr, $pipeline:expr, $mask:expr, $body:expr) => {{
+            // A primitive clipped away entirely still appears in the scene, and
+            // emitting it with a whole-surface scissor would draw it unclipped.
+            if let Some(scissor) = scissor_for($mask, width, height) {
+                let first = $list.len();
+                if $body {
+                    batches.push(DrawBatch {
+                        pipeline: $pipeline,
+                        first_vertex: first as u32,
+                        vertex_count: ($list.len() - first) as u32,
+                        scissor,
+                    });
+                }
+            }
+        }};
     }
-    vertices
+
+    for batch in scene.batches() {
+        match batch {
+            PrimitiveBatch::Quads(range) => {
+                for quad in &scene.quads[range] {
+                    emit!(
+                        quads,
+                        DrawPipeline::Quads,
+                        &quad.content_mask,
+                        push_quad_primitive(&mut quads, quad, screen_width, screen_height)
+                    );
+                }
+            }
+            PrimitiveBatch::Underlines(range) => {
+                for underline in &scene.underlines[range] {
+                    emit!(
+                        quads,
+                        DrawPipeline::Quads,
+                        &underline.content_mask,
+                        push_underline_primitive(
+                            &mut quads,
+                            underline,
+                            screen_width,
+                            screen_height
+                        )
+                    );
+                }
+            }
+            PrimitiveBatch::Paths(range) => {
+                for path in &scene.paths[range] {
+                    emit!(
+                        paths,
+                        DrawPipeline::Paths,
+                        &path.content_mask,
+                        push_path_primitive(&mut paths, path, screen_width, screen_height)
+                    );
+                }
+            }
+            PrimitiveBatch::MonochromeSprites { range, .. } => {
+                for sprite in &scene.monochrome_sprites[range] {
+                    emit!(
+                        glyphs,
+                        DrawPipeline::Glyphs,
+                        &sprite.content_mask,
+                        push_glyph_primitive(
+                            &mut glyphs,
+                            sprite,
+                            screen_width,
+                            screen_height,
+                            atlas_width,
+                            atlas_height
+                        )
+                    );
+                }
+            }
+            // Not rendered yet; skipping them must not disturb painter order.
+            PrimitiveBatch::Shadows(_)
+            | PrimitiveBatch::SubpixelSprites { .. }
+            | PrimitiveBatch::PolychromeSprites { .. }
+            | PrimitiveBatch::Surfaces(_) => {}
+        }
+    }
+    (quads, paths, glyphs, batches)
 }
 
 /// Cheap identity of the rendered scene, used to skip unchanged frames.
@@ -962,6 +1101,46 @@ fn scene_hash(scene: &Scene) -> u64 {
             rgba.b.to_bits().hash(&mut hasher);
             rgba.a.to_bits().hash(&mut hasher);
         }
+    }
+    scene.paths.len().hash(&mut hasher);
+    for path in &scene.paths {
+        path.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
+        path.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
+        path.bounds.size.width.as_f32().to_bits().hash(&mut hasher);
+        path.bounds.size.height.as_f32().to_bits().hash(&mut hasher);
+        path.vertices.len().hash(&mut hasher);
+    }
+    scene.underlines.len().hash(&mut hasher);
+    for underline in &scene.underlines {
+        underline
+            .bounds
+            .origin
+            .x
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        underline
+            .bounds
+            .origin
+            .y
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        underline
+            .bounds
+            .size
+            .width
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        underline
+            .bounds
+            .size
+            .height
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        underline.color.to_rgb().r.to_bits().hash(&mut hasher);
     }
     scene.monochrome_sprites.len().hash(&mut hasher);
     for sprite in &scene.monochrome_sprites {
