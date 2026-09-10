@@ -196,6 +196,7 @@ impl OhosPlatform {
             host::event::RESTORE_FOLDER => {
                 if !arg.is_empty() {
                     *self.restore_folder.borrow_mut() = Some(arg.to_string());
+                    self.deliver_restore_folder();
                 }
             }
             host::event::PICK_RESULT => {
@@ -216,6 +217,22 @@ impl OhosPlatform {
 
     pub(crate) fn take_restore_folder(&self) -> Option<String> {
         self.restore_folder.borrow_mut().take()
+    }
+
+    /// Hand the previous session's folder to the open listener once it exists.
+    ///
+    /// `OpenRequest::parse` strips the `file://` scheme and then treats the rest
+    /// as a path, so writing the tagged handle after that scheme delivers a
+    /// `dir:` path the filesystem wrapper understands.
+    fn deliver_restore_folder(&self) {
+        let Some(uri) = self.take_restore_folder() else {
+            return;
+        };
+        let mut callback = self.open_urls.borrow_mut();
+        match callback.as_mut() {
+            Some(callback) => callback(vec![format!("file://dir:{uri}")]),
+            None => *self.restore_folder.borrow_mut() = Some(uri),
+        }
     }
 
     /// Pick files/folders, returning the host's raw answer lines
@@ -709,6 +726,7 @@ impl Platform for OhosPlatform {
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
         *self.open_urls.borrow_mut() = Some(callback);
+        self.deliver_restore_folder();
     }
 
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
