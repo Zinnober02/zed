@@ -699,12 +699,11 @@ impl PlatformWindow for OhosWindow {
         host::window_op(host::op::START_RESIZE, value);
     }
 
-    fn request_decorations(&self, decorations: crate::WindowDecorations) {
-        let value = match decorations {
-            crate::WindowDecorations::Client => "client",
-            crate::WindowDecorations::Server => "server",
-        };
-        host::window_op(host::op::SET_DECOR, value);
+    fn request_decorations(&self, _decorations: crate::WindowDecorations) {
+        // The client titlebar we could draw has no close or resize controls, so
+        // hiding the system title bar would strand the window. Keep the server
+        // decorations; the system then insets the surface below them for us.
+        host::window_op(host::op::SET_DECOR, "server");
     }
 
     fn show_window_menu(&self, _position: Point<Pixels>) {}
