@@ -101,9 +101,6 @@ fn new_platform() -> Rc<OhosPlatform> {
         OhosPlatform::new()
             .unwrap_or_else(|error| panic!("Failed to initialize OHOS platform: {error}")),
     );
-    if let Some(density) = host::density() {
-        set_density(density);
-    }
     set_current(&platform);
     platform
 }
@@ -368,33 +365,21 @@ fn map_button(button: u32) -> MouseButton {
     }
 }
 
-/// Device pixels per ArkUI vp, in thousandths, from the host. Pointer events
-/// carry vp coordinates while GPUI works in logical pixels (device pixels
-/// divided by SCALE), so without this every hit test is off by
-/// density / SCALE.
-static DENSITY_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Remember the display density once the host has reported it.
-pub(crate) fn set_density(density: f32) {
-    DENSITY_MILLI.store(
-        (density * 1000.0) as u32,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
-
+// The host converts ArkUI's pointer vp coordinates into GPUI logical pixels
+// (it knows the display density and the node offset), so this is a pass-through.
 fn logical(value: f32) -> crate::Pixels {
-    let milli = DENSITY_MILLI.load(std::sync::atomic::Ordering::Relaxed);
-    if milli == 0 {
-        return crate::px(value);
-    }
-    let factor = (milli as f32 / 1000.0) / window::SCALE;
-    crate::px(value * factor)
+    crate::px(value)
 }
 
 pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
     // Clicking the surface must give the XComponent ArkUI focus, otherwise its
     // onKeyEvent never fires and non-text keys (arrows) are dropped.
     host::window_op(host::op::REQUEST_FOCUS, "");
+    vk::log(&format!(
+        "[gpui_ohos] pointer down vp=({x:.1},{y:.1}) logical=({:.1},{:.1})",
+        logical(x).as_f32(),
+        logical(y).as_f32()
+    ));
     with_current(|platform| {
         for window in platform.route_targets(id) {
             window.pointer_down(map_button(button), crate::point(logical(x), logical(y)));

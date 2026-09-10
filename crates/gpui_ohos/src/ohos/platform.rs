@@ -77,6 +77,8 @@ pub(crate) struct OhosPlatform {
     /// Whether the folder was already pulled from the host, so the restore only
     /// happens once even though the delivery path runs repeatedly.
     restore_pulled: Cell<bool>,
+    /// Whether the folder has been handed to the open listener yet.
+    restore_delivered: Cell<bool>,
     /// Window rect in physical pixels: (x, y, width, height).
     window_rect: Cell<(f32, f32, f32, f32)>,
 }
@@ -118,6 +120,7 @@ impl OhosPlatform {
             next_pick_id: Cell::new(1),
             restore_folder: RefCell::new(None),
             restore_pulled: Cell::new(false),
+            restore_delivered: Cell::new(false),
             window_rect: Cell::new(window_rect),
         })
     }
@@ -232,8 +235,7 @@ impl OhosPlatform {
         let uri = match self.take_restore_folder() {
             Some(uri) => {
                 // A pushed folder is the one delivery; without this the later
-                // pull would hand the same folder over twice and the host would
-                // open the workspace in a second window.
+                // pull would hand the same folder over twice.
                 self.restore_pulled.set(true);
                 uri
             }
@@ -429,6 +431,19 @@ impl OhosPlatform {
         // Filesystem work hops here to reach the host bridge, which may only be
         // called from this thread.
         super::drain_ui_tasks();
+        // Asking for the previous folder while the app is still creating its
+        // startup window opens the workspace in a second window and leaves an
+        // empty one on top, so wait until a window has actually drawn.
+        if !self.restore_delivered.get()
+            && self
+                .windows
+                .borrow()
+                .iter()
+                .any(|window| window.has_rendered())
+        {
+            self.restore_delivered.set(true);
+            self.deliver_restore_folder();
+        }
         let mut receiver = self.main_receiver.clone();
         while let Ok(Some(runnable)) = receiver.try_pop() {
             runnable.run();
@@ -748,8 +763,9 @@ impl Platform for OhosPlatform {
     }
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
+        // Only remember the listener; the folder is delivered from tick once a
+        // window has drawn, so the startup window is not left behind.
         *self.open_urls.borrow_mut() = Some(callback);
-        self.deliver_restore_folder();
     }
 
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {

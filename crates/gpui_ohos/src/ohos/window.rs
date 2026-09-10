@@ -223,6 +223,11 @@ impl WindowShared {
         self.active.get()
     }
 
+    /// Whether this window has drawn at least one frame.
+    pub(crate) fn has_rendered(&self) -> bool {
+        self.frame_count.get() > 0
+    }
+
     pub(crate) fn set_active(&self, active: bool) {
         if self.active.get() == active {
             return;

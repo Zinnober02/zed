@@ -40,8 +40,6 @@ pub(crate) mod query {
     /// The folder to restore, if the host has one. Pulled instead of pushed so
     /// the backend cannot miss it by starting a moment late.
     pub const RESTORE_FOLDER: i32 = 107;
-    /// Device pixels per ArkUI vp, used to convert pointer coordinates.
-    pub const DENSITY: i32 = 108;
 }
 
 /// Events the host pushes into the backend.
@@ -195,11 +193,6 @@ pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
 /// Ask the host to open a picked file read/write, returning its descriptor.
 pub(crate) fn open_file(uri: &str) -> Option<i32> {
     query(query::OPEN_FILE, uri)?.trim().parse().ok()
-}
-
-/// Device pixels per ArkUI vp, as reported by the host.
-pub(crate) fn density() -> Option<f32> {
-    query(query::DENSITY, "")?.trim().parse().ok()
 }
 
 /// The folder the host wants restored, if any.
