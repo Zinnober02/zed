@@ -686,6 +686,11 @@ impl LocalBufferStore {
             let path = path.clone();
             let buffer = match load_file.await {
                 Ok(loaded) => {
+                    log::info!(
+                        "ohos debug: loaded {path:?} as {} bytes (has_bom {})",
+                        loaded.text.len(),
+                        loaded.has_bom
+                    );
                     let is_writable = loaded.is_writable;
                     let capability = if is_writable {
                         Capability::ReadWrite
@@ -711,7 +716,9 @@ impl LocalBufferStore {
                         buffer
                     })
                 }
-                Err(error) if is_not_found_error(&error) => cx.new(|cx| {
+                Err(error) if is_not_found_error(&error) => {
+                    log::error!("ohos debug: {path:?} reported not found: {error:#}");
+                    cx.new(|cx| {
                     let buffer_id = BufferId::from(cx.entity_id().as_non_zero_u64());
                     let text_buffer = text::Buffer::new(ReplicaId::LOCAL, buffer_id, "");
                     let mut buffer = Buffer::build(
@@ -726,10 +733,14 @@ impl LocalBufferStore {
                         })),
                         Capability::ReadWrite,
                     );
-                    apply_initial_line_ending(&mut buffer, cx);
-                    buffer
-                }),
-                Err(e) => return Err(e),
+                        apply_initial_line_ending(&mut buffer, cx);
+                        buffer
+                    })
+                }
+                Err(e) => {
+                    log::error!("ohos debug: loading {path:?} failed: {e:#}");
+                    return Err(e);
+                }
             };
             this.update(cx, |this, cx| {
                 this.add_buffer(buffer.clone(), cx)?;

@@ -12,12 +12,19 @@
 //! filesystem. The host entry points are injected at startup so this crate does
 //! not depend on the platform backend. They are asynchronous because the host
 //! bridge enters the ArkUI JavaScript VM, which only the UI thread may do.
+//!
+//! Zed's worktree keeps relative paths and rebuilds absolute ones with
+//! `root.join(relative)`, so a file under a picked directory arrives as
+//! `dir:<root uri>/<name>` rather than the tagged path `read_dir` produced.
+//! The listing therefore records what it learned in `picked`, keyed by the same
+//! joined path, and later lookups resolve through that map.
 
 use std::{
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Result, anyhow};
@@ -43,12 +50,21 @@ pub struct OhosFsBridge {
     pub open_file: fn(String) -> BoxFuture<'static, Option<i32>>,
     pub read_fd: fn(i32) -> BoxFuture<'static, io::Result<Vec<u8>>>,
     pub write_fd: fn(i32, Vec<u8>) -> BoxFuture<'static, io::Result<()>>,
+    /// Diagnostic sink; the app log lives in a sandbox hdc cannot read.
+    pub log: fn(&str),
 }
 
 static BRIDGE: OnceLock<OhosFsBridge> = OnceLock::new();
 
 pub fn set_ohos_fs_bridge(bridge: OhosFsBridge) {
     let _ = BRIDGE.set(bridge);
+}
+
+/// Report one line of what the wrapper decided, when the host is installed.
+fn debug(message: String) {
+    if let Some(bridge) = BRIDGE.get() {
+        (bridge.log)(&message);
+    }
 }
 
 fn bridge() -> Result<&'static OhosFsBridge> {
@@ -73,7 +89,7 @@ fn descriptor(path: &Path) -> Option<i32> {
     tagged(path, FD_PREFIX)?.parse().ok()
 }
 
-fn is_picked_file(path: &Path) -> bool {
+fn is_tagged_file(path: &Path) -> bool {
     file_uri(path).is_some() || descriptor(path).is_some()
 }
 
@@ -90,30 +106,11 @@ fn picked_metadata(is_dir: bool) -> Metadata {
     }
 }
 
-async fn read_picked(path: &Path) -> Result<Vec<u8>> {
-    if let Some(uri) = file_uri(path) {
-        let fd = (bridge()?.open_file)(uri.to_string())
-            .await
-            .ok_or_else(|| anyhow!("could not open {uri}"))?;
-        return Ok((bridge()?.read_fd)(fd).await?);
-    }
-    if let Some(fd) = descriptor(path) {
-        return Ok((bridge()?.read_fd)(fd).await?);
-    }
-    Err(anyhow!("{} is not a picked file", path.display()))
-}
-
-async fn write_picked(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(uri) = file_uri(path) {
-        let fd = (bridge()?.open_file)(uri.to_string())
-            .await
-            .ok_or_else(|| anyhow!("could not open {uri}"))?;
-        return Ok((bridge()?.write_fd)(fd, bytes.to_vec()).await?);
-    }
-    if let Some(fd) = descriptor(path) {
-        return Ok((bridge()?.write_fd)(fd, bytes.to_vec()).await?);
-    }
-    Err(anyhow!("{} is not a picked file", path.display()))
+/// What a directory listing learned about one entry.
+#[derive(Clone)]
+struct PickedEntry {
+    is_dir: bool,
+    uri: String,
 }
 
 #[derive(Debug)]
@@ -143,11 +140,61 @@ impl Watcher for NullWatcher {
 /// real filesystem.
 pub struct OhosFs {
     inner: Arc<dyn Fs>,
+    picked: Mutex<HashMap<PathBuf, PickedEntry>>,
 }
 
 impl OhosFs {
     pub fn new(inner: Arc<dyn Fs>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            picked: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether the path names something behind the picker.
+    fn is_picked(&self, path: &Path) -> bool {
+        directory_uri(path).is_some()
+            || is_tagged_file(path)
+            || self.picked.lock().unwrap().contains_key(path)
+    }
+
+    fn picked_entry(&self, path: &Path) -> Option<PickedEntry> {
+        self.picked.lock().unwrap().get(path).cloned()
+    }
+
+    /// The URI to hand the host for a picked path. A listed entry knows its own
+    /// URI; a `dir:` root is its own URI.
+    fn picked_uri(&self, path: &Path) -> Option<String> {
+        if let Some(entry) = self.picked_entry(path) {
+            return Some(entry.uri);
+        }
+        directory_uri(path).map(str::to_string)
+    }
+
+    async fn read_picked(&self, path: &Path) -> Result<Vec<u8>> {
+        if let Some(fd) = descriptor(path) {
+            return Ok((bridge()?.read_fd)(fd).await?);
+        }
+        let uri = self
+            .picked_uri(path)
+            .ok_or_else(|| anyhow!("{} is not a picked file", path.display()))?;
+        let fd = (bridge()?.open_file)(uri.clone())
+            .await
+            .ok_or_else(|| anyhow!("could not open {uri}"))?;
+        Ok((bridge()?.read_fd)(fd).await?)
+    }
+
+    async fn write_picked(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        if let Some(fd) = descriptor(path) {
+            return Ok((bridge()?.write_fd)(fd, bytes.to_vec()).await?);
+        }
+        let uri = self
+            .picked_uri(path)
+            .ok_or_else(|| anyhow!("{} is not a picked file", path.display()))?;
+        let fd = (bridge()?.open_file)(uri.clone())
+            .await
+            .ok_or_else(|| anyhow!("could not open {uri}"))?;
+        Ok((bridge()?.write_fd)(fd, bytes.to_vec()).await?)
     }
 }
 
@@ -162,8 +209,8 @@ impl Fs for OhosFs {
     }
 
     async fn create_file(&self, path: &Path, options: CreateOptions) -> Result<()> {
-        if is_picked_file(path) {
-            write_picked(path, &[]).await
+        if self.is_picked(path) {
+            self.write_picked(path, &[]).await
         } else {
             self.inner.create_file(path, options).await
         }
@@ -206,7 +253,7 @@ impl Fs for OhosFs {
     }
 
     async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>> {
-        if is_picked_file(path) {
+        if self.is_picked(path) {
             Ok(Arc::new(PickedFileHandle {
                 path: path.to_path_buf(),
             }))
@@ -216,8 +263,14 @@ impl Fs for OhosFs {
     }
 
     async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>> {
-        if is_picked_file(path) {
-            let bytes = read_picked(path).await?;
+        debug(format!(
+            "ohosfs open_sync {} picked={} uri={:?}",
+            path.display(),
+            self.is_picked(path),
+            self.picked_uri(path)
+        ));
+        if self.is_picked(path) {
+            let bytes = self.read_picked(path).await?;
             Ok(Box::new(io::Cursor::new(bytes)))
         } else {
             self.inner.open_sync(path).await
@@ -225,73 +278,94 @@ impl Fs for OhosFs {
     }
 
     async fn load_bytes(&self, path: &Path) -> Result<Vec<u8>> {
-        if is_picked_file(path) {
-            read_picked(path).await
+        debug(format!(
+            "ohosfs load_bytes {} picked={} uri={:?}",
+            path.display(),
+            self.is_picked(path),
+            self.picked_uri(path)
+        ));
+        if self.is_picked(path) {
+            self.read_picked(path).await
         } else {
             self.inner.load_bytes(path).await
         }
     }
 
     async fn atomic_write(&self, path: PathBuf, text: String) -> Result<()> {
-        if is_picked_file(&path) {
-            write_picked(&path, text.as_bytes()).await
+        if self.is_picked(&path) {
+            self.write_picked(&path, text.as_bytes()).await
         } else {
             self.inner.atomic_write(path, text).await
         }
     }
 
     async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
-        if is_picked_file(path) {
+        if self.is_picked(path) {
             let mut bytes = Vec::new();
             for chunk in text::chunks_with_line_ending(text, line_ending) {
                 bytes.extend_from_slice(chunk.as_bytes());
             }
-            write_picked(path, &bytes).await
+            self.write_picked(path, &bytes).await
         } else {
             self.inner.save(path, text, line_ending).await
         }
     }
 
     async fn write(&self, path: &Path, content: &[u8]) -> Result<()> {
-        if is_picked_file(path) {
-            write_picked(path, content).await
+        if self.is_picked(path) {
+            self.write_picked(path, content).await
         } else {
             self.inner.write(path, content).await
         }
     }
 
     async fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
-        if directory_uri(path).is_some() || is_picked_file(path) {
+        if self.is_picked(path) {
             return Ok(path.to_path_buf());
         }
         self.inner.canonicalize(path).await
     }
 
     async fn is_file(&self, path: &Path) -> bool {
+        if let Some(entry) = self.picked_entry(path) {
+            return !entry.is_dir;
+        }
+        if is_tagged_file(path) {
+            return true;
+        }
         if directory_uri(path).is_some() {
             return false;
-        }
-        if is_picked_file(path) {
-            return true;
         }
         self.inner.is_file(path).await
     }
 
     async fn is_dir(&self, path: &Path) -> bool {
+        if let Some(entry) = self.picked_entry(path) {
+            return entry.is_dir;
+        }
         if directory_uri(path).is_some() {
             return true;
         }
-        if is_picked_file(path) {
+        if is_tagged_file(path) {
             return false;
         }
         self.inner.is_dir(path).await
     }
 
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>> {
+        debug(format!(
+            "ohosfs metadata {} picked={} cached={}",
+            path.display(),
+            self.is_picked(path),
+            self.picked_entry(path).is_some()
+        ));
+        if let Some(entry) = self.picked_entry(path) {
+            return Ok(Some(picked_metadata(entry.is_dir)));
+        }
         if directory_uri(path).is_some() {
             return Ok(Some(picked_metadata(true)));
         }
-        if is_picked_file(path) {
+        if is_tagged_file(path) {
             return Ok(Some(picked_metadata(false)));
         }
         self.inner.metadata(path).await
@@ -305,14 +379,32 @@ impl Fs for OhosFs {
         &self,
         path: &Path,
     ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<PathBuf>>>>> {
-        let Some(uri) = directory_uri(path) else {
+        let Some(uri) = self.picked_uri(path) else {
             return self.inner.read_dir(path).await;
         };
-        let entries = (bridge()?.list_dir)(uri.to_string()).await;
-        let children = entries.into_iter().map(|(_, is_dir, child_uri)| {
-            let prefix = if is_dir { DIR_PREFIX } else { FILE_PREFIX };
-            Ok(PathBuf::from(format!("{prefix}{child_uri}")))
-        });
+        let entries = (bridge()?.list_dir)(uri.clone()).await;
+        debug(format!(
+            "ohosfs read_dir {} uri={} entries={}",
+            path.display(),
+            uri,
+            entries.len()
+        ));
+        let base = path.to_path_buf();
+        {
+            let mut picked = self.picked.lock().unwrap();
+            for (name, is_dir, child_uri) in &entries {
+                picked.insert(
+                    base.join(name),
+                    PickedEntry {
+                        is_dir: *is_dir,
+                        uri: child_uri.clone(),
+                    },
+                );
+            }
+        }
+        let children = entries
+            .into_iter()
+            .map(move |(name, _, _)| Ok(base.join(name)));
         Ok(Box::pin(stream::iter(children)))
     }
 
@@ -324,7 +416,7 @@ impl Fs for OhosFs {
         Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
         Arc<dyn Watcher>,
     ) {
-        if directory_uri(path).is_some() || is_picked_file(path) {
+        if self.is_picked(path) {
             return (Box::pin(stream::empty()), Arc::new(NullWatcher));
         }
         self.inner.watch(path, latency).await

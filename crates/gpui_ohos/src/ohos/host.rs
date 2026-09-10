@@ -127,19 +127,28 @@ unsafe extern "C" {
 
 /// Read a picked public file through the descriptor the host opened for it.
 pub(crate) fn read_fd_bytes(fd: i32) -> std::io::Result<Vec<u8>> {
-    unsafe { lseek(fd, 0, SEEK_SET) };
+    let position = unsafe { lseek(fd, 0, SEEK_SET) };
     let mut out = Vec::new();
     let mut buffer = [0u8; 8192];
     loop {
         let count = unsafe { read(fd, buffer.as_mut_ptr() as *mut c_void, buffer.len()) };
         if count < 0 {
-            return Err(std::io::Error::last_os_error());
+            let error = std::io::Error::last_os_error();
+            crate::log_line(&format!(
+                "read_fd {fd} failed after {} bytes (position {position}): {error}",
+                out.len()
+            ));
+            return Err(error);
         }
         if count == 0 {
             break;
         }
         out.extend_from_slice(&buffer[..count as usize]);
     }
+    crate::log_line(&format!(
+        "read_fd {fd} read {} bytes (position {position})",
+        out.len()
+    ));
     Ok(out)
 }
 
