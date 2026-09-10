@@ -404,8 +404,12 @@ impl OhosPlatform {
         }
     }
 
-    /// One host frame: drain foreground tasks, fire due timers, then draw.
+    /// One host frame: drain host tasks and foreground tasks, fire due timers,
+    /// then draw.
     pub(crate) fn tick(&self) {
+        // Filesystem work hops here to reach the host bridge, which may only be
+        // called from this thread.
+        super::drain_ui_tasks();
         let mut receiver = self.main_receiver.clone();
         while let Ok(Some(runnable)) = receiver.try_pop() {
             runnable.run();

@@ -46,16 +46,12 @@ pub extern "C" fn ohos_gpui_app_main(
 /// sandbox can open, so `fs::OhosFs` forwards tagged paths to these entry
 /// points and leaves every other path to the real filesystem.
 fn install_filesystem_bridge() {
+    // These hop to the UI thread internally, because the host bridge enters the
+    // ArkUI JavaScript VM.
     fs::set_ohos_fs_bridge(fs::OhosFsBridge {
-        list_dir: gpui_ohos::list_picked_dir,
-        open_file: gpui_ohos::open_picked_file,
-        read_fd: |fd| {
-            gpui_ohos::read_picked_file_bytes(fd)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
-        },
-        write_fd: |fd, data| {
-            gpui_ohos::write_picked_file_bytes(fd, data)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
-        },
+        list_dir: gpui_ohos::list_picked_dir_async,
+        open_file: gpui_ohos::open_picked_file_async,
+        read_fd: gpui_ohos::read_picked_file_bytes_async,
+        write_fd: gpui_ohos::write_picked_file_bytes_async,
     });
 }

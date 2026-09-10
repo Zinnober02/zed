@@ -13,8 +13,12 @@ mod window;
 use std::{
     cell::RefCell,
     ffi::c_void,
+    future::Future,
     rc::{Rc, Weak},
+    sync::Mutex,
 };
+
+use futures::{FutureExt as _, channel::oneshot, future::BoxFuture};
 
 pub use vk::LogFn;
 
@@ -51,6 +55,37 @@ pub fn set_root_dir(path: &str) {
 /// The directory set by set_root_dir, if any.
 pub fn root_dir() -> Option<String> {
     ROOT_DIR.with(|root| root.borrow().clone())
+}
+
+/// Closures waiting for the ArkUI UI thread, drained from platform::tick.
+///
+/// The host bridge ends up in the JavaScript VM, which may only be entered from
+/// the thread it was created on, so filesystem work running on a background
+/// executor has to be marshalled back here.
+static UI_TASKS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
+
+/// Run every closure queued by run_on_ui. Called from the UI thread.
+pub(crate) fn drain_ui_tasks() {
+    let tasks = {
+        let mut tasks = UI_TASKS.lock().unwrap();
+        std::mem::take(&mut *tasks)
+    };
+    for task in tasks {
+        task();
+    }
+}
+
+/// Run a closure on the ArkUI UI thread and await its result.
+pub fn run_on_ui<T, F>(f: F) -> impl Future<Output = T> + Send
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = oneshot::channel();
+    UI_TASKS.lock().unwrap().push(Box::new(move || {
+        let _ = sender.send(f());
+    }));
+    receiver.map(|result| result.expect("the UI thread dropped a host task"))
 }
 
 fn set_current(platform: &Rc<OhosPlatform>) {
@@ -208,6 +243,29 @@ pub fn write_picked_file_bytes(fd: i32, data: &[u8]) -> Result<(), String> {
 /// Open a picked file read/write and return its descriptor.
 pub fn open_picked_file(uri: &str) -> Option<i32> {
     host::open_file(uri)
+}
+
+/// List a picked directory, on the UI thread.
+pub fn list_picked_dir_async(uri: String) -> BoxFuture<'static, Vec<(String, bool, String)>> {
+    Box::pin(run_on_ui(move || host::list_dir(&uri)))
+}
+
+/// Open a picked file, on the UI thread.
+pub fn open_picked_file_async(uri: String) -> BoxFuture<'static, Option<i32>> {
+    Box::pin(run_on_ui(move || host::open_file(&uri)))
+}
+
+/// Read a picked file's bytes, on the UI thread.
+pub fn read_picked_file_bytes_async(fd: i32) -> BoxFuture<'static, std::io::Result<Vec<u8>>> {
+    Box::pin(run_on_ui(move || host::read_fd_bytes(fd)))
+}
+
+/// Overwrite a picked file, on the UI thread.
+pub fn write_picked_file_bytes_async(
+    fd: i32,
+    data: Vec<u8>,
+) -> BoxFuture<'static, std::io::Result<()>> {
+    Box::pin(run_on_ui(move || host::write_fd_bytes(fd, &data)))
 }
 
 /// List a picked directory as (name, is_directory, uri).
