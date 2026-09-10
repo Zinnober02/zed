@@ -6,6 +6,8 @@
 //! ohos_gpui_app_main with its surface. The shared platform receives the
 //! surface, Zed builds its application on it, and the host drives the frames.
 
+mod host_abi;
+
 use std::ffi::{CStr, c_char, c_void};
 
 use gpui_ohos::LogFn;
