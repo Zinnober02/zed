@@ -101,6 +101,9 @@ fn new_platform() -> Rc<OhosPlatform> {
         OhosPlatform::new()
             .unwrap_or_else(|error| panic!("Failed to initialize OHOS platform: {error}")),
     );
+    if let Some(density) = host::density() {
+        set_density(density);
+    }
     set_current(&platform);
     platform
 }
@@ -365,10 +368,27 @@ fn map_button(button: u32) -> MouseButton {
     }
 }
 
-// The host converts ArkUI's vp coordinates into GPUI logical pixels before
-// calling in, so this is a pass-through.
+/// Device pixels per ArkUI vp, in thousandths, from the host. Pointer events
+/// carry vp coordinates while GPUI works in logical pixels (device pixels
+/// divided by SCALE), so without this every hit test is off by
+/// density / SCALE.
+static DENSITY_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Remember the display density once the host has reported it.
+pub(crate) fn set_density(density: f32) {
+    DENSITY_MILLI.store(
+        (density * 1000.0) as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 fn logical(value: f32) -> crate::Pixels {
-    crate::px(value)
+    let milli = DENSITY_MILLI.load(std::sync::atomic::Ordering::Relaxed);
+    if milli == 0 {
+        return crate::px(value);
+    }
+    let factor = (milli as f32 / 1000.0) / window::SCALE;
+    crate::px(value * factor)
 }
 
 pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
