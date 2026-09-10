@@ -382,12 +382,17 @@ pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
     ));
     with_current(|platform| {
         for window in platform.route_targets(id) {
-            window.pointer_down(map_button(button), crate::point(logical(x), logical(y)));
+            let position = crate::point(logical(x), logical(y));
+            // Hit testing follows the last mouse position, which a synthetic
+            // click never updates, so seed it before pressing.
+            window.pointer_move(position);
+            window.pointer_down(map_button(button), position);
         }
     });
 }
 
 pub fn pointer_up(id: &str, x: f32, y: f32, button: u32) {
+    vk::log(&format!("[gpui_ohos] pointer up ({x:.1},{y:.1})"));
     with_current(|platform| {
         for window in platform.route_targets(id) {
             window.pointer_up(map_button(button), crate::point(logical(x), logical(y)));
