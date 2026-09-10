@@ -18,3 +18,6 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 gpui_ohos.workspace = true
 zed = { path = "../zed" }
+
+[build-dependencies]
+cc = "1"

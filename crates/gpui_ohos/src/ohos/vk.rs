@@ -2123,21 +2123,28 @@ struct TextPipeline {
     atlas_extent: (u32, u32),
 }
 
-fn load_spirv() -> &'static [u32] {
+/// Decode SPIR-V words without assuming the byte array is 4-byte aligned
+/// (debug builds check that precondition and abort when it does not hold).
+fn spirv_words(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn load_spirv() -> Vec<u32> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glyph.spv"));
-    // The array is 4-byte aligned because it is a static byte slice of a
-    // multiple-of-4 length; reinterpret as u32 words.
-    unsafe { std::slice::from_raw_parts(BYTES.as_ptr() as *const u32, BYTES.len() / 4) }
+    spirv_words(BYTES)
 }
 
-fn load_quad_spirv() -> &'static [u32] {
+fn load_quad_spirv() -> Vec<u32> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.spv"));
-    unsafe { std::slice::from_raw_parts(BYTES.as_ptr() as *const u32, BYTES.len() / 4) }
+    spirv_words(BYTES)
 }
 
-fn load_path_spirv() -> &'static [u32] {
+fn load_path_spirv() -> Vec<u32> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/path.spv"));
-    unsafe { std::slice::from_raw_parts(BYTES.as_ptr() as *const u32, BYTES.len() / 4) }
+    spirv_words(BYTES)
 }
 
 impl VkRenderer {
@@ -2795,7 +2802,7 @@ impl VkRenderer {
         );
         let (pipeline_layout, pipeline) = self.create_vertex_pipeline(
             "quad",
-            load_quad_spirv(),
+            &load_quad_spirv(),
             std::mem::size_of::<QuadVertex>() as u32,
             &attributes,
         )?;
@@ -2832,7 +2839,7 @@ impl VkRenderer {
         );
         let (pipeline_layout, pipeline) = self.create_vertex_pipeline(
             "path",
-            load_path_spirv(),
+            &load_path_spirv(),
             std::mem::size_of::<PathVertex>() as u32,
             &attributes,
         )?;

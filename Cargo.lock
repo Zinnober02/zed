@@ -23284,6 +23284,7 @@ dependencies = [
 name = "zed_ohos"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "gpui_ohos",
  "zed",
 ]

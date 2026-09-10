@@ -98,6 +98,18 @@ where
         "[gpui_ohos] run_app_on_surface id={id} window={:p} {}x{}",
         window, width, height
     ));
+    // Panic messages go to stderr, which the HAP host does not capture; route
+    // them through the logger so they show up in hilog.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        vk::log(&format!("[gpui_ohos] PANIC: {info}"));
+        vk::log(&format!(
+            "[gpui_ohos] {}",
+            std::backtrace::Backtrace::force_capture()
+        ));
+        previous_hook(info);
+    }));
+
     let platform = new_platform();
     platform.set_surface(id, window, width, height);
     run_app();
