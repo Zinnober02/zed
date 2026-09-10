@@ -156,6 +156,12 @@ impl OhosPlatform {
                     self.window_rect.set(rect);
                 }
             }
+            host::event::BENCHMARK => {
+                let frames: u32 = arg.parse().unwrap_or(720);
+                super::window::BENCHMARK_FRAMES.store(frames, std::sync::atomic::Ordering::Relaxed);
+                super::vk::log(&format!("[gpui_ohos] benchmark enabled frames={frames}"));
+                self.request_frames();
+            }
             host::event::LIFECYCLE => match arg {
                 "background" | "destroy" => {
                     // Take the callback out first: holding the RefMut across
@@ -167,16 +173,20 @@ impl OhosPlatform {
                     *self.on_quit.borrow_mut() = callback;
                 }
                 "newwant" => {
-                    if let Some(mut callback) = self.on_reopen.borrow_mut().take() {
+                    // The RefMut temporary lives until the end of the if-let
+                    // body, so storing the callback back inside it would panic.
+                    let mut callback = self.on_reopen.borrow_mut().take();
+                    if let Some(callback) = callback.as_mut() {
                         callback();
-                        *self.on_reopen.borrow_mut() = Some(callback);
                     }
+                    *self.on_reopen.borrow_mut() = callback;
                 }
                 "foreground" => {
-                    if let Some(mut callback) = self.on_system_wake.borrow_mut().take() {
+                    let mut callback = self.on_system_wake.borrow_mut().take();
+                    if let Some(callback) = callback.as_mut() {
                         callback();
-                        *self.on_system_wake.borrow_mut() = Some(callback);
                     }
+                    *self.on_system_wake.borrow_mut() = callback;
                 }
                 _ => {}
             },

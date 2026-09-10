@@ -3,7 +3,10 @@ use std::{
     ffi::c_void,
     ptr::NonNull,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -35,6 +38,29 @@ const CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.45, 1.0];
 /// Logical-to-device pixel scale. The 2in1 panel is 3120x2080 at a high DPI,
 /// so a logical pixel maps to ~3 device pixels (otherwise 16px text is tiny).
 pub(crate) const SCALE: f32 = 3.0;
+
+/// Frames left in the forced-redraw benchmark; zero means the normal
+/// on-demand rendering path. The host enables it when the app is launched
+/// with the `gpuiBenchmark` parameter so frame-rate measurements present on
+/// every vsync instead of only when the scene changes.
+pub(crate) static BENCHMARK_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn benchmark_enabled() -> bool {
+    BENCHMARK_FRAMES.load(Ordering::Relaxed) > 0
+}
+
+/// Consume one benchmark frame, returning true while the benchmark runs.
+fn take_benchmark_frame() -> bool {
+    let remaining = BENCHMARK_FRAMES.load(Ordering::Relaxed);
+    if remaining == 0 {
+        return false;
+    }
+    if remaining == 1 {
+        super::vk::log("[gpui_ohos] benchmark finished");
+    }
+    BENCHMARK_FRAMES.store(remaining - 1, Ordering::Relaxed);
+    true
+}
 
 pub(crate) struct WindowCallbacks {
     request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -158,7 +184,7 @@ impl WindowShared {
         if let Some(cb) = callback.as_mut() {
             cb(RequestFrameOptions {
                 require_presentation: true,
-                force_render: false,
+                force_render: benchmark_enabled(),
             });
         }
         self.callbacks.borrow_mut().request_frame = callback;
@@ -351,7 +377,8 @@ impl WindowShared {
             return;
         }
         let hash = scene_hash(scene);
-        if self.last_scene_hash.get() == Some(hash) {
+        let benchmark = take_benchmark_frame();
+        if !benchmark && self.last_scene_hash.get() == Some(hash) {
             return;
         }
         let frame = self.frame_count.get() + 1;

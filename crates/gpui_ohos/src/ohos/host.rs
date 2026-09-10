@@ -49,6 +49,9 @@ pub(crate) mod event {
     pub const WINDOW_RECT: i32 = 6;
     /// A folder URI to restore after the app restarts.
     pub const RESTORE_FOLDER: i32 = 7;
+    /// Enable the forced-redraw frame-rate benchmark; the argument is the
+    /// number of frames to present.
+    pub const BENCHMARK: i32 = 8;
 }
 
 /// Function pointers implemented by the ArkTS host.
