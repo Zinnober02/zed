@@ -229,14 +229,23 @@ impl OhosPlatform {
     /// as a path, so writing the tagged handle after that scheme delivers a
     /// `dir:` path the filesystem wrapper understands.
     fn deliver_restore_folder(&self) {
-        let mut uri = self.take_restore_folder();
-        if uri.is_none() && !self.restore_pulled.replace(true) {
-            // The host may have pushed the folder before the backend was ready
-            // to receive events, so ask for it once the listener exists.
-            uri = host::restore_folder();
-        }
-        let Some(uri) = uri else {
-            return;
+        let uri = match self.take_restore_folder() {
+            Some(uri) => {
+                // A pushed folder is the one delivery; without this the later
+                // pull would hand the same folder over twice and the host would
+                // open the workspace in a second window.
+                self.restore_pulled.set(true);
+                uri
+            }
+            None if !self.restore_pulled.replace(true) => {
+                // The host may have pushed the folder before the backend was
+                // ready to receive events, so ask for it once.
+                match host::restore_folder() {
+                    Some(uri) => uri,
+                    None => return,
+                }
+            }
+            None => return,
         };
         let mut callback = self.open_urls.borrow_mut();
         match callback.as_mut() {

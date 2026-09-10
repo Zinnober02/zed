@@ -1025,6 +1025,13 @@ pub(super) fn build_draw_list(
     let mut paths = Vec::new();
     let mut glyphs = Vec::new();
     let mut batches = Vec::new();
+    let mut skipped = 0usize;
+    let mut first_skipped: Option<(f32, f32, f32, f32)> = None;
+    let mut unhandled = 0usize;
+    let mut shadows = 0usize;
+    let mut subpixel = 0usize;
+    let mut polychrome = 0usize;
+    let mut surfaces = 0usize;
 
     macro_rules! emit {
         ($list:expr, $pipeline:expr, $mask:expr, $body:expr) => {{
@@ -1039,6 +1046,17 @@ pub(super) fn build_draw_list(
                         vertex_count: ($list.len() - first) as u32,
                         scissor,
                     });
+                }
+            } else {
+                skipped += 1;
+                if first_skipped.is_none() {
+                    let bounds = $mask.bounds;
+                    first_skipped = Some((
+                        bounds.origin.x.as_f32(),
+                        bounds.origin.y.as_f32(),
+                        bounds.size.width.as_f32(),
+                        bounds.size.height.as_f32(),
+                    ));
                 }
             }
         }};
@@ -1099,11 +1117,48 @@ pub(super) fn build_draw_list(
                 }
             }
             // Not rendered yet; skipping them must not disturb painter order.
-            PrimitiveBatch::Shadows(_)
-            | PrimitiveBatch::SubpixelSprites { .. }
-            | PrimitiveBatch::PolychromeSprites { .. }
-            | PrimitiveBatch::Surfaces(_) => {}
+            PrimitiveBatch::Shadows(range) => {
+                shadows += range.len();
+                unhandled += range.len();
+            }
+            PrimitiveBatch::SubpixelSprites { range, .. } => {
+                subpixel += range.len();
+                unhandled += range.len();
+            }
+            PrimitiveBatch::PolychromeSprites { range, .. } => {
+                polychrome += range.len();
+                unhandled += range.len();
+            }
+            PrimitiveBatch::Surfaces(range) => {
+                surfaces += range.len();
+                unhandled += range.len();
+            }
         }
+    }
+
+    // A scene with primitives that produced no geometry is the signature of the
+    // blank frames seen on device, so always report those; sample the rest.
+    // Shadows are intentionally skipped; only the batch kinds that hold content
+    // we do not draw yet (or a scene that produced no geometry) are anomalies.
+    let empty_draw = (!scene.quads.is_empty() && quads.is_empty())
+        || subpixel > 0
+        || polychrome > 0
+        || surfaces > 0;
+    static DRAW_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let sample = DRAW_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if empty_draw || sample % 120 == 0 {
+        super::vk::log(&format!(
+            "[gpui_ohos] draw scene q={} p={} g={} u={} | emitted q={} p={} g={} | skipped={} unhandled={} (shadows={shadows} subpixel={subpixel} polychrome={polychrome} surfaces={surfaces}) first_skip={first_skipped:?}",
+            scene.quads.len(),
+            scene.paths.len(),
+            scene.monochrome_sprites.len(),
+            scene.underlines.len(),
+            quads.len(),
+            paths.len(),
+            glyphs.len(),
+            skipped,
+            unhandled,
+        ));
     }
     (quads, paths, glyphs, batches)
 }
