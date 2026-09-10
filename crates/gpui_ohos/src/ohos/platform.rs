@@ -74,6 +74,9 @@ pub(crate) struct OhosPlatform {
     next_pick_id: Cell<u64>,
     /// Folder URI the host restored from its persisted authorization.
     restore_folder: RefCell<Option<String>>,
+    /// Whether the folder was already pulled from the host, so the restore only
+    /// happens once even though the delivery path runs repeatedly.
+    restore_pulled: Cell<bool>,
     /// Window rect in physical pixels: (x, y, width, height).
     window_rect: Cell<(f32, f32, f32, f32)>,
 }
@@ -114,6 +117,7 @@ impl OhosPlatform {
             pending_picks: RefCell::new(HashMap::new()),
             next_pick_id: Cell::new(1),
             restore_folder: RefCell::new(None),
+            restore_pulled: Cell::new(false),
             window_rect: Cell::new(window_rect),
         })
     }
@@ -225,7 +229,13 @@ impl OhosPlatform {
     /// as a path, so writing the tagged handle after that scheme delivers a
     /// `dir:` path the filesystem wrapper understands.
     fn deliver_restore_folder(&self) {
-        let Some(uri) = self.take_restore_folder() else {
+        let mut uri = self.take_restore_folder();
+        if uri.is_none() && !self.restore_pulled.replace(true) {
+            // The host may have pushed the folder before the backend was ready
+            // to receive events, so ask for it once the listener exists.
+            uri = host::restore_folder();
+        }
+        let Some(uri) = uri else {
             return;
         };
         let mut callback = self.open_urls.borrow_mut();

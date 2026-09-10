@@ -37,6 +37,9 @@ pub(crate) mod query {
     pub const OPEN_FILE: i32 = 105;
     /// List a picked directory: "name|isDir|uri" per line.
     pub const LIST_DIR: i32 = 106;
+    /// The folder to restore, if the host has one. Pulled instead of pushed so
+    /// the backend cannot miss it by starting a moment late.
+    pub const RESTORE_FOLDER: i32 = 107;
 }
 
 /// Events the host pushes into the backend.
@@ -190,6 +193,15 @@ pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
 /// Ask the host to open a picked file read/write, returning its descriptor.
 pub(crate) fn open_file(uri: &str) -> Option<i32> {
     query(query::OPEN_FILE, uri)?.trim().parse().ok()
+}
+
+/// The folder the host wants restored, if any.
+pub(crate) fn restore_folder() -> Option<String> {
+    let answer = query(query::RESTORE_FOLDER, "")?;
+    if answer.is_empty() {
+        return None;
+    }
+    Some(answer)
 }
 
 /// Ask the host to list a picked directory as (name, is_dir, uri).
