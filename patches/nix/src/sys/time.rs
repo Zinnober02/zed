@@ -1,5 +1,8 @@
-#[cfg_attr(target_env = "musl", allow(deprecated))]
-// https://github.com/rust-lang/libc/issues/1848
+// libc deprecated these aliases while preparing the 64-bit change for musl
+// 1.2 (https://github.com/rust-lang/libc/issues/1848); this module uses them
+// throughout, so allow the lint for the whole file on every target.
+#![allow(deprecated)]
+
 pub use libc::{suseconds_t, time_t};
 use libc::{timespec, timeval};
 use std::time::Duration;

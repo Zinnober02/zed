@@ -213,7 +213,7 @@ impl Rawmidi {
         from_const("snd_rawmidi_name", c).map(|s| s.to_string())
     }
 
-    pub fn io(&self) -> IO {
+    pub fn io(&self) -> IO<'_> {
         IO(self)
     }
 }

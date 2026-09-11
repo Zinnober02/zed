@@ -1570,7 +1570,7 @@ struct SetOsString<'a> {
 }
 
 impl<'a> Set<'a, OsString> for SetOsString<'a> {
-    fn new(val: &'a OsString) -> SetOsString {
+    fn new(val: &'a OsString) -> SetOsString<'a> {
         SetOsString {
             val: val.as_os_str(),
         }

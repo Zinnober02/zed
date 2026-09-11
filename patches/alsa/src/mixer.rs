@@ -29,7 +29,7 @@ impl Mixer {
     }
 
     /// Creates a Selem by looking for a specific selem by name given a mixer (of a card)
-    pub fn find_selem(&self, id: &SelemId) -> Option<Selem> {
+    pub fn find_selem(&self, id: &SelemId) -> Option<Selem<'_>> {
         let selem = unsafe { alsa::snd_mixer_find_selem(self.0, id.as_ptr()) };
 
         if selem.is_null() {
@@ -56,7 +56,7 @@ impl Mixer {
         acheck!(snd_mixer_load(self.0)).map(|_| ())
     }
 
-    pub fn iter(&self) -> Iter {
+    pub fn iter(&self) -> Iter<'_> {
         Iter {
             last_handle: ptr::null_mut(),
             mixer: self,
@@ -604,7 +604,7 @@ impl<'a> Selem<'a> {
     }
 
     /// Enumerates over valid Enum values
-    pub fn iter_enum(&self) -> Result<IterEnum> {
+    pub fn iter_enum(&self) -> Result<IterEnum<'_>> {
         Ok(IterEnum(self, 0, self.get_enum_items()?))
     }
 
