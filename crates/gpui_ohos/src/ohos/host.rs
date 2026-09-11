@@ -217,7 +217,10 @@ pub(crate) fn create_dir(uri: &str) -> std::io::Result<()> {
 
 /// Remove a file, or a directory when `is_dir` is set, inside a picked root.
 pub(crate) fn remove(uri: &str, is_dir: bool) -> std::io::Result<()> {
-    status(query::REMOVE, &format!("{}	{uri}", if is_dir { 1 } else { 0 }))
+    status(
+        query::REMOVE,
+        &format!("{}	{uri}", if is_dir { 1 } else { 0 }),
+    )
 }
 
 /// Rename an entry inside a picked root.
