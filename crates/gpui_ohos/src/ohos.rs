@@ -268,6 +268,27 @@ pub fn write_picked_file_bytes_async(
     Box::pin(run_on_ui(move || host::write_fd_bytes(fd, &data)))
 }
 
+/// Create a directory under a picked root, on the UI thread.
+pub fn create_picked_dir_async(uri: String) -> BoxFuture<'static, std::io::Result<()>> {
+    Box::pin(run_on_ui(move || host::create_dir(&uri)))
+}
+
+/// Remove a file or directory under a picked root, on the UI thread.
+pub fn remove_picked_path_async(
+    uri: String,
+    is_dir: bool,
+) -> BoxFuture<'static, std::io::Result<()>> {
+    Box::pin(run_on_ui(move || host::remove(&uri, is_dir)))
+}
+
+/// Rename an entry under a picked root, on the UI thread.
+pub fn rename_picked_path_async(
+    from: String,
+    to: String,
+) -> BoxFuture<'static, std::io::Result<()>> {
+    Box::pin(run_on_ui(move || host::rename(&from, &to)))
+}
+
 /// List a picked directory as (name, is_directory, uri).
 pub fn list_picked_dir(uri: &str) -> Vec<(String, bool, String)> {
     host::list_dir(uri)

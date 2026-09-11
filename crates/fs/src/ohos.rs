@@ -50,6 +50,12 @@ pub struct OhosFsBridge {
     pub open_file: fn(String) -> BoxFuture<'static, Option<i32>>,
     pub read_fd: fn(i32) -> BoxFuture<'static, io::Result<Vec<u8>>>,
     pub write_fd: fn(i32, Vec<u8>) -> BoxFuture<'static, io::Result<()>>,
+    /// Create a directory under a picked root.
+    pub create_dir: fn(String) -> BoxFuture<'static, io::Result<()>>,
+    /// Remove a file or, when the flag is set, a directory.
+    pub remove: fn(String, bool) -> BoxFuture<'static, io::Result<()>>,
+    /// Rename or move an entry inside a picked root.
+    pub rename: fn(String, String) -> BoxFuture<'static, io::Result<()>>,
     /// Diagnostic sink; the app log lives in a sandbox hdc cannot read.
     pub log: fn(&str),
 }
@@ -201,7 +207,12 @@ impl OhosFs {
 #[async_trait::async_trait]
 impl Fs for OhosFs {
     async fn create_dir(&self, path: &Path) -> Result<()> {
-        self.inner.create_dir(path).await
+        let Some(uri) = self.picked_uri(path) else {
+            return self.inner.create_dir(path).await;
+        };
+        (bridge()?.create_dir)(uri).await?;
+        debug(format!("ohosfs create_dir {}", path.display()));
+        Ok(())
     }
 
     async fn create_symlink(&self, path: &Path, target: PathBuf) -> Result<()> {
@@ -237,11 +248,37 @@ impl Fs for OhosFs {
     }
 
     async fn rename(&self, source: &Path, target: &Path, options: RenameOptions) -> Result<()> {
-        self.inner.rename(source, target, options).await
+        let (Some(from), Some(to)) = (self.picked_uri(source), self.picked_uri(target)) else {
+            return self.inner.rename(source, target, options).await;
+        };
+        (bridge()?.rename)(from, to).await?;
+        // Keep the listing cache in step with the new name.
+        let entry = self.picked.lock().unwrap().remove(source);
+        if let Some(mut entry) = entry {
+            entry.uri = self
+                .picked_uri(target)
+                .unwrap_or_else(|| target.to_string_lossy().into_owned());
+            self.picked
+                .lock()
+                .unwrap()
+                .insert(target.to_path_buf(), entry);
+        }
+        debug(format!(
+            "ohosfs rename {} -> {}",
+            source.display(),
+            target.display()
+        ));
+        Ok(())
     }
 
     async fn remove_dir(&self, path: &Path, options: RemoveOptions) -> Result<()> {
-        self.inner.remove_dir(path, options).await
+        let Some(uri) = self.picked_uri(path) else {
+            return self.inner.remove_dir(path, options).await;
+        };
+        (bridge()?.remove)(uri, true).await?;
+        self.picked.lock().unwrap().remove(path);
+        debug(format!("ohosfs remove_dir {}", path.display()));
+        Ok(())
     }
 
     async fn trash(&self, path: &Path, options: RemoveOptions) -> Result<TrashId> {
@@ -249,7 +286,13 @@ impl Fs for OhosFs {
     }
 
     async fn remove_file(&self, path: &Path, options: RemoveOptions) -> Result<()> {
-        self.inner.remove_file(path, options).await
+        let Some(uri) = self.picked_uri(path) else {
+            return self.inner.remove_file(path, options).await;
+        };
+        (bridge()?.remove)(uri, false).await?;
+        self.picked.lock().unwrap().remove(path);
+        debug(format!("ohosfs remove_file {}", path.display()));
+        Ok(())
     }
 
     async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>> {
@@ -416,10 +459,52 @@ impl Fs for OhosFs {
         Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
         Arc<dyn Watcher>,
     ) {
-        if self.is_picked(path) {
-            return (Box::pin(stream::empty()), Arc::new(NullWatcher));
-        }
-        self.inner.watch(path, latency).await
+        let Some(uri) = self.picked_uri(path) else {
+            return self.inner.watch(path, latency).await;
+        };
+        // The host can only list a directory on demand, so watch picked trees by
+        // polling the listing and diffing the entries. Modified files are not
+        // reported, only created and removed ones.
+        let (sender, receiver) = futures::channel::mpsc::unbounded();
+        let root = path.to_path_buf();
+        let interval = latency.max(std::time::Duration::from_millis(800));
+        std::thread::spawn(move || {
+            let mut known: Option<std::collections::HashSet<PathBuf>> = None;
+            loop {
+                if sender.is_closed() {
+                    return;
+                }
+                let entries = match bridge() {
+                    Ok(bridge) => smol::block_on((bridge.list_dir)(uri.clone())),
+                    Err(_) => Vec::new(),
+                };
+                let current: std::collections::HashSet<PathBuf> = entries
+                    .into_iter()
+                    .map(|(name, _, _)| root.join(name))
+                    .collect();
+                if let Some(previous) = known.as_ref() {
+                    let mut events = Vec::new();
+                    for path in current.difference(previous) {
+                        events.push(PathEvent {
+                            path: path.clone(),
+                            kind: Some(crate::PathEventKind::Created),
+                        });
+                    }
+                    for path in previous.difference(&current) {
+                        events.push(PathEvent {
+                            path: path.clone(),
+                            kind: Some(crate::PathEventKind::Removed),
+                        });
+                    }
+                    if !events.is_empty() && sender.unbounded_send(events).is_err() {
+                        return;
+                    }
+                }
+                known = Some(current);
+                std::thread::sleep(interval);
+            }
+        });
+        (Box::pin(receiver), Arc::new(NullWatcher))
     }
 
     fn open_repo(

@@ -40,6 +40,12 @@ pub(crate) mod query {
     /// The folder to restore, if the host has one. Pulled instead of pushed so
     /// the backend cannot miss it by starting a moment late.
     pub const RESTORE_FOLDER: i32 = 107;
+    /// Create a directory inside a picked root.
+    pub const CREATE_DIR: i32 = 109;
+    /// Remove a file (or a directory) inside a picked root.
+    pub const REMOVE: i32 = 110;
+    /// Rename an entry inside a picked root.
+    pub const RENAME: i32 = 111;
 }
 
 /// Events the host pushes into the backend.
@@ -193,6 +199,30 @@ pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
 /// Ask the host to open a picked file read/write, returning its descriptor.
 pub(crate) fn open_file(uri: &str) -> Option<i32> {
     query(query::OPEN_FILE, uri)?.trim().parse().ok()
+}
+
+/// Run a command whose answer is "0" on success.
+fn status(op: i32, arg: &str) -> std::io::Result<()> {
+    match query(op, arg) {
+        Some(answer) if answer.trim() == "0" => Ok(()),
+        Some(answer) => Err(std::io::Error::other(answer.trim().to_string())),
+        None => Err(std::io::Error::other("the host did not answer")),
+    }
+}
+
+/// Create a directory inside a picked root.
+pub(crate) fn create_dir(uri: &str) -> std::io::Result<()> {
+    status(query::CREATE_DIR, uri)
+}
+
+/// Remove a file, or a directory when `is_dir` is set, inside a picked root.
+pub(crate) fn remove(uri: &str, is_dir: bool) -> std::io::Result<()> {
+    status(query::REMOVE, &format!("{}	{uri}", if is_dir { 1 } else { 0 }))
+}
+
+/// Rename an entry inside a picked root.
+pub(crate) fn rename(from: &str, to: &str) -> std::io::Result<()> {
+    status(query::RENAME, &format!("{from}	{to}"))
 }
 
 /// The folder the host wants restored, if any.
