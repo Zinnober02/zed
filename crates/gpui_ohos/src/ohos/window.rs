@@ -700,7 +700,9 @@ impl PlatformWindow for OhosWindow {
         WindowControls {
             fullscreen: true,
             maximize: true,
-            minimize: false,
+            // Windows are self decorated, so the app has to draw the minimise
+            // control itself; the host hides a sub window when it is pressed.
+            minimize: true,
             window_menu: false,
         }
     }
@@ -719,11 +721,15 @@ impl PlatformWindow for OhosWindow {
         host::window_op_for(self.shared.id(), host::op::START_RESIZE, value);
     }
 
-    fn request_decorations(&self, _decorations: crate::WindowDecorations) {
-        // The client titlebar we could draw has no close or resize controls, so
-        // hiding the system title bar would strand the window. Keep the server
-        // decorations; the system then insets the surface below them for us.
-        host::window_op_for(self.shared.id(), host::op::SET_DECOR, "server");
+    fn request_decorations(&self, decorations: crate::WindowDecorations) {
+        // Hiding the system title bar is what lets the app blend its own into the
+        // window, but it also removes the system controls, so it only happens
+        // when the app says it draws client side decorations itself.
+        let value = match decorations {
+            crate::WindowDecorations::Client => "client",
+            crate::WindowDecorations::Server => "server",
+        };
+        host::window_op_for(self.shared.id(), host::op::SET_DECOR, value);
     }
 
     fn show_window_menu(&self, _position: Point<Pixels>) {}
