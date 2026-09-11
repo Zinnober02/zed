@@ -520,7 +520,20 @@ pub fn key_pre_ime(id: &str, action: i32, code: i32, _unicode: i32) -> bool {
     let modifiers = update_modifiers(code, down);
     if is_modifier_key(code) {
         with_current(|platform| platform.dispatch_modifiers(id, modifiers));
-        return true;
+        // The input method never sees a consumed event, and it needs the
+        // modifier state to recognise its own switch shortcuts, so modifiers are
+        // forwarded to it as well as to the application.
+        return false;
+    }
+    // Shift or Super with space switches input methods here; Ctrl with space is
+    // the application's completion shortcut, so it stays consumed.
+    let is_switch_combo = code == 2050
+        && (modifiers.shift || modifiers.platform)
+        && !modifiers.control
+        && !modifiers.alt;
+    if is_switch_combo {
+        with_current(|platform| platform.dispatch_modifiers(id, modifiers));
+        return false;
     }
     if !is_gpui_key(code, modifiers) {
         return false;
