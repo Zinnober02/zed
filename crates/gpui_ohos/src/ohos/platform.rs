@@ -23,7 +23,7 @@ use super::display::OhosDisplay;
 use super::host;
 use super::keyboard::{OhosKeyboardLayout, OhosKeyboardMapper};
 use super::text_system::OhosTextSystem;
-use super::window::{OhosWindow, WindowShared};
+use super::window::{OhosWindow, WindowShared, benchmark_enabled};
 
 /// State of the XComponent surface backing the GPUI window.
 pub(crate) struct SurfaceState {
@@ -448,9 +448,31 @@ impl OhosPlatform {
         while let Ok(Some(runnable)) = receiver.try_pop() {
             runnable.run();
         }
+        let frame_started = std::time::Instant::now();
         self.dispatcher.run_due_timers();
         self.request_frames();
+        // The benchmark measures how fast frames can be produced, not how often
+        // the display asks for one, so keep drawing until its budget runs out.
+        // The cap keeps a frame that never consumes budget from hanging here.
+        let mut burst = 0;
+        while benchmark_enabled() && burst < Self::BENCHMARK_BURST {
+            self.request_frames();
+            burst += 1;
+        }
+        // How long a frame costs on this thread is the number the frame rate
+        // work is judged by, so sample it.
+        static TICK_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sample = TICK_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if sample % 120 == 0 {
+            super::vk::log(&format!(
+                "[gpui_ohos] tick work {}us burst={burst}",
+                frame_started.elapsed().as_micros()
+            ));
+        }
     }
+
+    /// How many frames one tick may produce while the benchmark runs.
+    const BENCHMARK_BURST: usize = 32;
 
     pub(crate) fn request_frames(&self) {
         for window in self.windows.borrow().iter() {

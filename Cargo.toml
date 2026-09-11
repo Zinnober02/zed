@@ -1030,6 +1030,16 @@ syn = { opt-level = 3 }
 proc-macro2 = { opt-level = 3 }
 # proc-macros end
 
+# OHOS: the debug build is what runs on device while developing, so the crates
+# that dominate a frame are optimised there too; without this a frame costs
+# roughly four times the release budget.
+gpui = { opt-level = 3 }
+gpui_ohos = { opt-level = 3 }
+editor = { opt-level = 3 }
+ui = { opt-level = 3 }
+text = { opt-level = 2 }
+language = { opt-level = 2 }
+theme = { opt-level = 2 }
 tree-sitter = { opt-level = 3 }
 taffy = { opt-level = 3 }
 resvg = { opt-level = 3 }
@@ -1055,7 +1065,7 @@ journal = { codegen-units = 1 }
 json_schema_store = { codegen-units = 1 }
 llama_cpp = { codegen-units = 1 }
 lmstudio = { codegen-units = 1 }
-menu = { codegen-units = 1 }
+menu = { opt-level = 2, codegen-units = 1 }
 notifications = { codegen-units = 1 }
 ollama = { codegen-units = 1 }
 outline = { codegen-units = 1 }
