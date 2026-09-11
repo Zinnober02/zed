@@ -1034,7 +1034,6 @@ proc-macro2 = { opt-level = 3 }
 # that dominate a frame are optimised there too; without this a frame costs
 # roughly four times the release budget.
 gpui = { opt-level = 3 }
-gpui_ohos = { opt-level = 3 }
 editor = { opt-level = 3 }
 ui = { opt-level = 3 }
 text = { opt-level = 2 }

@@ -117,6 +117,34 @@ pub fn current_platform(_headless: bool) -> Rc<dyn Platform> {
 
 /// Attach a surface, let `run_app` build and register the application on the
 /// shared platform, then launch it and start the frame loop.
+/// Route panic messages somewhere we can read them: stderr is not captured in a
+/// HAP, and the application installs its own handler while starting, so this runs
+/// again later (see `reinstall_panic_hook`) to win that race.
+pub fn install_panic_hook() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = format!(
+            "[gpui_ohos] PANIC: {info}\n{:?}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        vk::log(&message);
+        // The next launch mirrors this file into hilog, which survives a crash
+        // that kills the process mid log flush.
+        if let Some(root) = root_dir() {
+            let path = format!("{root}/panics.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                use std::io::Write;
+                let _ = writeln!(file, "{message}");
+            }
+        }
+        previous_hook(info);
+    }));
+}
+
 pub fn run_app_on_surface<F>(
     id: &str,
     window: *mut c_void,
@@ -133,17 +161,7 @@ where
         "[gpui_ohos] run_app_on_surface id={id} window={:p} {}x{}",
         window, width, height
     ));
-    // Panic messages go to stderr, which the HAP host does not capture; route
-    // them through the logger so they show up in hilog.
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        vk::log(&format!("[gpui_ohos] PANIC: {info}"));
-        vk::log(&format!(
-            "[gpui_ohos] {}",
-            std::backtrace::Backtrace::force_capture()
-        ));
-        previous_hook(info);
-    }));
+    install_panic_hook();
 
     // The first surface starts the application. Later surfaces are the
     // XComponents the host created for windows the application asked for;
@@ -394,8 +412,9 @@ fn logical(value: f32) -> crate::Pixels {
 
 pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
     // Clicking the surface must give the XComponent ArkUI focus, otherwise its
-    // onKeyEvent never fires and non-text keys (arrows) are dropped.
-    host::window_op(host::op::REQUEST_FOCUS, "");
+    // onKeyEvent never fires and non-text keys (arrows) are dropped. The request
+    // has to name the surface, or focus lands on the main window instead.
+    host::window_op_for(id, host::op::REQUEST_FOCUS, "");
     vk::log(&format!(
         "[gpui_ohos] pointer down vp=({x:.1},{y:.1}) logical=({:.1},{:.1})",
         logical(x).as_f32(),

@@ -79,6 +79,8 @@ pub(crate) struct OhosPlatform {
     restore_pulled: Cell<bool>,
     /// Whether the folder has been handed to the open listener yet.
     restore_delivered: Cell<bool>,
+    /// Focus change reported by the host, applied from the frame loop.
+    pending_focus: RefCell<Option<(String, bool)>>,
     /// Window rect in physical pixels: (x, y, width, height).
     window_rect: Cell<(f32, f32, f32, f32)>,
 }
@@ -121,6 +123,7 @@ impl OhosPlatform {
             restore_folder: RefCell::new(None),
             restore_pulled: Cell::new(false),
             restore_delivered: Cell::new(false),
+            pending_focus: RefCell::new(None),
             window_rect: Cell::new(window_rect),
         })
     }
@@ -144,11 +147,12 @@ impl OhosPlatform {
                 }
             }
             host::event::FOCUS => {
+                // ArkUI delivers this while the application may be in the middle
+                // of updating the window, and activating it there re-enters the
+                // same update ("RefCell already borrowed"). Queue it for the frame
+                // loop instead, which runs outside any update.
                 let (id, value) = split_window_event(arg);
-                let active = value != "0";
-                for window in self.route_targets(id) {
-                    window.set_active(active);
-                }
+                *self.pending_focus.borrow_mut() = Some((id.to_string(), value != "0"));
             }
             host::event::WINDOW_STATUS => {
                 // 1 full screen, 2 maximize, 3 minimize, 4 floating, 5 split.
@@ -448,6 +452,13 @@ impl OhosPlatform {
         while let Ok(Some(runnable)) = receiver.try_pop() {
             runnable.run();
         }
+        // The application installs its own panic handler while starting; take the
+        // hook back so panics keep reaching hilog and the panic file.
+        static HOOK_TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if HOOK_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 30 {
+            super::install_panic_hook();
+        }
+        self.apply_pending_focus();
         let frame_started = std::time::Instant::now();
         self.dispatcher.run_due_timers();
         self.request_frames();
@@ -473,6 +484,24 @@ impl OhosPlatform {
 
     /// How many frames one tick may produce while the benchmark runs.
     const BENCHMARK_BURST: usize = 32;
+
+    /// Apply a focus change queued by `handle_host_event`. Only one window is
+    /// active at a time, so the others are marked inactive; leaving them active
+    /// keeps the input method attached to a window the user already left.
+    fn apply_pending_focus(&self) {
+        let Some((id, active)) = self.pending_focus.borrow_mut().take() else {
+            return;
+        };
+        if active && !id.is_empty() {
+            for window in self.windows() {
+                window.set_active(window.id() == id);
+            }
+        } else {
+            for window in self.route_targets(&id) {
+                window.set_active(active);
+            }
+        }
+    }
 
     pub(crate) fn request_frames(&self) {
         for window in self.windows.borrow().iter() {

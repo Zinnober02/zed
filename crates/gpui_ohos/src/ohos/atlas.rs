@@ -103,6 +103,12 @@ impl OhosAtlas {
         let dirty = std::mem::take(&mut state.dirty);
         let mut uploads = Vec::with_capacity(dirty.len());
         for (kind, bounds) in dirty {
+            // The renderer has a single R8 image, so a four byte per pixel tile
+            // would be read as one byte per pixel and scribble over the glyphs
+            // sharing the atlas. Images are not drawn yet either way.
+            if kind != AtlasTextureKind::Monochrome {
+                continue;
+            }
             let texture = &state.textures[kind as usize];
             let bpp = bytes_per_pixel(kind);
             let x = bounds.origin.x.0.max(0) as u32;
