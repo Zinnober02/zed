@@ -3,6 +3,7 @@ fn main() {
         ("src/ohos/shaders.wgsl", "glyph.spv"),
         ("src/ohos/quad.wgsl", "quad.spv"),
         ("src/ohos/path.wgsl", "path.spv"),
+        ("src/ohos/sprite.wgsl", "sprite.spv"),
     ] {
         println!("cargo:rerun-if-changed={source}");
         let source = std::fs::read_to_string(source).expect("read shader");

@@ -20,10 +20,10 @@ use crate::{
     AtlasTextureKind, Bounds, Capslock, ContentMask, Decorations, DispatchEventResult,
     ForegroundExecutor, GpuSpecs, Modifiers, MonochromeSprite, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PrimitiveBatch, PromptButton, PromptLevel, Quad,
-    RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, ScrollDelta, ScrollWheelEvent, Size,
-    TouchPhase, Underline, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowParams, point, px,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PrimitiveBatch, PromptButton,
+    PromptLevel, Quad, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, ScrollDelta,
+    ScrollWheelEvent, Size, TouchPhase, Underline, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowControls, WindowParams, point, px,
 };
 
 use super::atlas::OhosAtlas;
@@ -416,11 +416,20 @@ impl WindowShared {
         let work_started = std::time::Instant::now();
         let uploads = self.atlas.take_uploads();
         let (atlas_w, atlas_h) = self.atlas.texture_size(AtlasTextureKind::Monochrome);
+        let (sprite_w, sprite_h) = self.atlas.texture_size(AtlasTextureKind::Polychrome);
         let presented = if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
             let (width, height) = renderer.size();
-            let (quads, paths, glyphs, batches) =
-                build_draw_list(scene, width, height, atlas_w, atlas_h);
-            match renderer.render_scene(CLEAR_COLOR, &quads, &paths, &glyphs, &batches, &uploads) {
+            let (quads, paths, glyphs, sprites, batches) =
+                build_draw_list(scene, width, height, atlas_w, atlas_h, sprite_w, sprite_h);
+            match renderer.render_scene(
+                CLEAR_COLOR,
+                &quads,
+                &paths,
+                &glyphs,
+                &sprites,
+                &batches,
+                &uploads,
+            ) {
                 Ok(presented) => presented,
                 Err(error) => {
                     super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
@@ -1036,6 +1045,52 @@ fn push_glyph_primitive(
     true
 }
 
+/// Emit one colour image quad. The tile already carries the pixels, so the
+/// vertex only scales them by the sprite's opacity.
+fn push_polychrome_primitive(
+    vertices: &mut Vec<super::vk::GlyphVertex>,
+    sprite: &PolychromeSprite,
+    screen_width: f32,
+    screen_height: f32,
+    atlas_width: f32,
+    atlas_height: f32,
+) -> bool {
+    let x = sprite.bounds.origin.x.as_f32();
+    let y = sprite.bounds.origin.y.as_f32();
+    let sprite_width = sprite.bounds.size.width.as_f32();
+    let sprite_height = sprite.bounds.size.height.as_f32();
+    if sprite_width <= 0.0 || sprite_height <= 0.0 {
+        return false;
+    }
+    let tile = sprite.tile.bounds;
+    let u0 = tile.origin.x.0 as f32 / atlas_width;
+    let v0 = tile.origin.y.0 as f32 / atlas_height;
+    let u1 = (tile.origin.x.0 + tile.size.width.0) as f32 / atlas_width;
+    let v1 = (tile.origin.y.0 + tile.size.height.0) as f32 / atlas_height;
+    let x0 = x / screen_width * 2.0 - 1.0;
+    let y0 = 1.0 - y / screen_height * 2.0;
+    let x1 = (x + sprite_width) / screen_width * 2.0 - 1.0;
+    let y1 = 1.0 - (y + sprite_height) / screen_height * 2.0;
+    let opacity = sprite.opacity.clamp(0.0, 1.0);
+    let vertex = |px: f32, py: f32, u: f32, v: f32| super::vk::GlyphVertex {
+        x: px,
+        y: py,
+        u,
+        v,
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: opacity,
+    };
+    vertices.push(vertex(x0, y0, u0, v0));
+    vertices.push(vertex(x1, y0, u1, v0));
+    vertices.push(vertex(x1, y1, u1, v1));
+    vertices.push(vertex(x0, y0, u0, v0));
+    vertices.push(vertex(x1, y1, u1, v1));
+    vertices.push(vertex(x0, y1, u0, v1));
+    true
+}
+
 /// Builds the frame vertex arrays plus the ordered draw list.
 ///
 /// Walking Scene::batches() instead of "all quads, then all paths, then all
@@ -1043,15 +1098,19 @@ fn push_glyph_primitive(
 /// page text behind it is glyphs, so the old order drew the text on top of the
 /// popup. Each emitted primitive carries its clip rect so the renderer can set
 /// a scissor per run.
+#[allow(clippy::type_complexity)]
 pub(super) fn build_draw_list(
     scene: &Scene,
     width: u32,
     height: u32,
     atlas_width: u32,
     atlas_height: u32,
+    sprite_width: u32,
+    sprite_height: u32,
 ) -> (
     Vec<super::vk::QuadVertex>,
     Vec<super::vk::PathVertex>,
+    Vec<super::vk::GlyphVertex>,
     Vec<super::vk::GlyphVertex>,
     Vec<DrawBatch>,
 ) {
@@ -1059,9 +1118,12 @@ pub(super) fn build_draw_list(
     let screen_height = height as f32;
     let atlas_width = atlas_width as f32;
     let atlas_height = atlas_height as f32;
+    let sprite_width = sprite_width as f32;
+    let sprite_height = sprite_height as f32;
     let mut quads = Vec::new();
     let mut paths = Vec::new();
     let mut glyphs = Vec::new();
+    let mut sprites = Vec::new();
     let mut batches = Vec::new();
     let mut skipped = 0usize;
     let mut first_skipped: Option<(f32, f32, f32, f32)> = None;
@@ -1165,7 +1227,21 @@ pub(super) fn build_draw_list(
             }
             PrimitiveBatch::PolychromeSprites { range, .. } => {
                 polychrome += range.len();
-                unhandled += range.len();
+                for sprite in &scene.polychrome_sprites[range] {
+                    emit!(
+                        sprites,
+                        DrawPipeline::Sprites,
+                        &sprite.content_mask,
+                        push_polychrome_primitive(
+                            &mut sprites,
+                            sprite,
+                            screen_width,
+                            screen_height,
+                            sprite_width,
+                            sprite_height
+                        )
+                    );
+                }
             }
             PrimitiveBatch::Surfaces(range) => {
                 surfaces += range.len();
@@ -1204,7 +1280,7 @@ pub(super) fn build_draw_list(
             unhandled,
         ));
     }
-    (quads, paths, glyphs, batches)
+    (quads, paths, glyphs, sprites, batches)
 }
 
 /// Cheap identity of the rendered scene, used to skip unchanged frames.

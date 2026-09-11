@@ -573,6 +573,7 @@ pub struct VkRenderer {
     gpa: PFN_vkGetInstanceProcAddr,
     gpd: PFN_vkGetDeviceProcAddr,
     text: Option<TextPipeline>,
+    sprites: Option<TextPipeline>,
     quads: Option<QuadPipeline>,
     paths: Option<PathPipeline>,
 }
@@ -852,6 +853,7 @@ impl VkRenderer {
             gpa,
             gpd,
             text: None,
+            sprites: None,
             quads: None,
             paths: None,
         };
@@ -1560,6 +1562,7 @@ const IMAGE_TILING_OPTIMAL: u32 = 0;
 const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0002;
 const IMAGE_USAGE_SAMPLED: u32 = 0x0004;
 const FORMAT_R8_UNORM: u32 = 9;
+const FORMAT_R8G8B8A8_UNORM: u32 = 37;
 const SAMPLE_COUNT_1: u32 = 1;
 const SHADER_STAGE_VERTEX: u32 = 0x1;
 const SHADER_STAGE_FRAGMENT: u32 = 0x10;
@@ -1963,6 +1966,7 @@ pub enum DrawPipeline {
     Quads,
     Paths,
     Glyphs,
+    Sprites,
 }
 
 /// One contiguous run of primitives sharing a pipeline and a clip rect.
@@ -2069,13 +2073,25 @@ fn load_quad_spirv() -> Vec<u32> {
     spirv_words(BYTES)
 }
 
+fn load_sprite_spirv() -> Vec<u32> {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sprite.spv"));
+    spirv_words(BYTES)
+}
+
 fn load_path_spirv() -> Vec<u32> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/path.spv"));
     spirv_words(BYTES)
 }
 
 impl VkRenderer {
-    fn create_text_pipeline(&mut self) -> anyhow::Result<()> {
+    /// Build one textured-quad pipeline over its own atlas image. Glyphs sample
+    /// an R8 coverage mask, colour images sample RGBA, but the vertex layout and
+    /// the rest of the state are identical, so both share this builder.
+    fn create_image_pipeline(
+        &mut self,
+        format: u32,
+        spirv: Vec<u32>,
+    ) -> anyhow::Result<TextPipeline> {
         let create_image: PFN_vkCreateImage = dev_fn!(self, "vkCreateImage", PFN_vkCreateImage);
         let image_reqs: PFN_vkGetImageMemoryRequirements = dev_fn!(
             self,
@@ -2120,7 +2136,7 @@ impl VkRenderer {
             p_next: std::ptr::null(),
             flags: 0,
             image_type: IMAGE_TYPE_2D,
-            format: FORMAT_R8_UNORM,
+            format,
             extent: VkExtent3D {
                 width: ATLAS,
                 height: ATLAS,
@@ -2167,7 +2183,7 @@ impl VkRenderer {
             flags: 0,
             image,
             view_type: IMAGE_VIEW_TYPE_2D,
-            format: FORMAT_R8_UNORM,
+            format,
             components: VkComponentMapping {
                 r: 0,
                 g: 0,
@@ -2303,7 +2319,6 @@ impl VkRenderer {
             anyhow::bail!("vkCreatePipelineLayout failed");
         }
 
-        let spirv = load_spirv();
         let smci = VkShaderModuleCreateInfo {
             s_type: ST_SHADER_MODULE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -2489,7 +2504,7 @@ impl VkRenderer {
         let (vertex_buffer, vertex_memory, vertex_mapped) =
             self.create_host_buffer(vertex_size, BUFFER_USAGE_VERTEX_BUFFER)?;
 
-        self.text = Some(TextPipeline {
+        Ok(TextPipeline {
             descriptor_set_layout,
             descriptor_pool,
             descriptor_set,
@@ -2504,7 +2519,20 @@ impl VkRenderer {
             vertex_mapped,
             vertex_size,
             atlas_extent: (ATLAS, ATLAS),
-        });
+        })
+    }
+
+    fn create_text_pipeline(&mut self) -> anyhow::Result<()> {
+        let pipeline = self.create_image_pipeline(FORMAT_R8_UNORM, load_spirv())?;
+        self.text = Some(pipeline);
+        Ok(())
+    }
+
+    /// Colour images live in their own RGBA atlas; they used to be uploaded into
+    /// the glyph mask atlas, which scribbled over glyphs.
+    fn create_sprite_pipeline(&mut self) -> anyhow::Result<()> {
+        let pipeline = self.create_image_pipeline(FORMAT_R8G8B8A8_UNORM, load_sprite_spirv())?;
+        self.sprites = Some(pipeline);
         Ok(())
     }
 
@@ -2848,6 +2876,7 @@ impl VkRenderer {
         quads: &[QuadVertex],
         paths: &[PathVertex],
         vertices: &[GlyphVertex],
+        sprites: &[GlyphVertex],
         batches: &[DrawBatch],
         uploads: &[super::atlas::AtlasUpload],
     ) -> anyhow::Result<bool> {
@@ -2859,6 +2888,9 @@ impl VkRenderer {
         }
         if self.paths.is_none() {
             self.create_path_pipeline()?;
+        }
+        if self.sprites.is_none() {
+            self.create_sprite_pipeline()?;
         }
         let copy_image: PFN_vkCmdCopyBufferToImage =
             dev_fn!(self, "vkCmdCopyBufferToImage", PFN_vkCmdCopyBufferToImage);
@@ -2943,6 +2975,21 @@ impl VkRenderer {
                 }
             }
         }
+        let sprite_bytes = std::mem::size_of_val(sprites);
+        {
+            let pipeline = self.sprites.as_ref().expect("sprite pipeline");
+            let stride = pipeline.vertex_size / FRAMES_IN_FLIGHT as u64;
+            if sprite_bytes as u64 > stride {
+                anyhow::bail!("sprite vertex buffer too small");
+            }
+            if !sprites.is_empty() {
+                unsafe {
+                    let dst =
+                        (pipeline.vertex_mapped as *mut u8).add(frame as usize * stride as usize);
+                    std::ptr::copy_nonoverlapping(sprites.as_ptr() as *const u8, dst, sprite_bytes);
+                }
+            }
+        }
         unsafe { (self.fns.reset_command_buffer)(self.command_buffer, 0) };
         let after_upload = std::time::Instant::now();
         let cbbi = VkCommandBufferBeginInfo {
@@ -2962,7 +3009,8 @@ impl VkRenderer {
             let (staging_buffer, _staging_memory, staging_mapped, _staging_size) =
                 self.staging[frame];
             let mut offset: u64 = 0;
-            let mut regions = Vec::with_capacity(uploads.len());
+            let mut text_regions = Vec::new();
+            let mut sprite_regions = Vec::new();
             for upload in uploads {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -2971,7 +3019,7 @@ impl VkRenderer {
                         upload.data.len(),
                     );
                 }
-                regions.push(VkBufferImageCopy {
+                let region = VkBufferImageCopy {
                     buffer_offset: offset,
                     buffer_row_length: 0,
                     buffer_image_height: 0,
@@ -2991,74 +3039,95 @@ impl VkRenderer {
                         height: upload.height,
                         depth: 1,
                     },
-                });
+                };
+                // Colour tiles belong in their own RGBA atlas; putting them in the
+                // glyph mask atlas scribbles over the glyphs sharing it.
+                if upload.kind == crate::AtlasTextureKind::Monochrome {
+                    text_regions.push(region);
+                } else {
+                    sprite_regions.push(region);
+                }
                 offset += upload.data.len() as u64;
             }
-            let text = self.text.as_ref().expect("text pipeline");
-            let range = VkImageSubresourceRange {
-                aspect_mask: ASPECT_COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-            let to_dst = VkImageMemoryBarrier {
-                s_type: ST_IMAGE_MEMORY_BARRIER,
-                p_next: std::ptr::null(),
-                src_access_mask: ACCESS_SHADER_READ,
-                dst_access_mask: ACCESS_TRANSFER_WRITE,
-                old_layout: LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                new_layout: LAYOUT_TRANSFER_DST_OPTIMAL,
-                src_queue_family_index: QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: QUEUE_FAMILY_IGNORED,
-                image: text.image,
-                subresource_range: range,
-            };
-            let to_read = VkImageMemoryBarrier {
-                s_type: ST_IMAGE_MEMORY_BARRIER,
-                p_next: std::ptr::null(),
-                src_access_mask: ACCESS_TRANSFER_WRITE,
-                dst_access_mask: ACCESS_SHADER_READ,
-                old_layout: LAYOUT_TRANSFER_DST_OPTIMAL,
-                new_layout: LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                src_queue_family_index: QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: QUEUE_FAMILY_IGNORED,
-                image: text.image,
-                subresource_range: range,
-            };
-            unsafe {
-                pipeline_barrier(
-                    self.command_buffer,
-                    PIPELINE_STAGE_FRAGMENT_SHADER,
-                    PIPELINE_STAGE_TRANSFER,
-                    0,
-                    0,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
-                    1,
-                    &to_dst,
-                );
-                copy_image(
-                    self.command_buffer,
-                    staging_buffer,
-                    text.image,
-                    LAYOUT_TRANSFER_DST_OPTIMAL,
-                    regions.len() as u32,
-                    regions.as_ptr(),
-                );
-                pipeline_barrier(
-                    self.command_buffer,
-                    PIPELINE_STAGE_TRANSFER,
-                    PIPELINE_STAGE_FRAGMENT_SHADER,
-                    0,
-                    0,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
-                    1,
-                    &to_read,
-                );
+            let targets = [
+                (
+                    self.text.as_ref().expect("text pipeline").image,
+                    text_regions,
+                ),
+                (
+                    self.sprites.as_ref().expect("sprite pipeline").image,
+                    sprite_regions,
+                ),
+            ];
+            for (image, regions) in targets {
+                if regions.is_empty() {
+                    continue;
+                }
+                let range = VkImageSubresourceRange {
+                    aspect_mask: ASPECT_COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let to_dst = VkImageMemoryBarrier {
+                    s_type: ST_IMAGE_MEMORY_BARRIER,
+                    p_next: std::ptr::null(),
+                    src_access_mask: ACCESS_SHADER_READ,
+                    dst_access_mask: ACCESS_TRANSFER_WRITE,
+                    old_layout: LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    new_layout: LAYOUT_TRANSFER_DST_OPTIMAL,
+                    src_queue_family_index: QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: QUEUE_FAMILY_IGNORED,
+                    image,
+                    subresource_range: range,
+                };
+                let to_read = VkImageMemoryBarrier {
+                    s_type: ST_IMAGE_MEMORY_BARRIER,
+                    p_next: std::ptr::null(),
+                    src_access_mask: ACCESS_TRANSFER_WRITE,
+                    dst_access_mask: ACCESS_SHADER_READ,
+                    old_layout: LAYOUT_TRANSFER_DST_OPTIMAL,
+                    new_layout: LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    src_queue_family_index: QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: QUEUE_FAMILY_IGNORED,
+                    image,
+                    subresource_range: range,
+                };
+                unsafe {
+                    pipeline_barrier(
+                        self.command_buffer,
+                        PIPELINE_STAGE_FRAGMENT_SHADER,
+                        PIPELINE_STAGE_TRANSFER,
+                        0,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        1,
+                        &to_dst,
+                    );
+                    copy_image(
+                        self.command_buffer,
+                        staging_buffer,
+                        image,
+                        LAYOUT_TRANSFER_DST_OPTIMAL,
+                        regions.len() as u32,
+                        regions.as_ptr(),
+                    );
+                    pipeline_barrier(
+                        self.command_buffer,
+                        PIPELINE_STAGE_TRANSFER,
+                        PIPELINE_STAGE_FRAGMENT_SHADER,
+                        0,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        1,
+                        &to_read,
+                    );
+                }
             }
         }
         let clear = VkClearValue {
@@ -3151,6 +3220,31 @@ impl VkRenderer {
                         }
                         DrawPipeline::Glyphs => {
                             let pipeline = self.text.as_ref().expect("text pipeline");
+                            bind_pipeline(
+                                self.command_buffer,
+                                BIND_POINT_GRAPHICS,
+                                pipeline.pipeline,
+                            );
+                            bind_vertex(
+                                self.command_buffer,
+                                0,
+                                1,
+                                &pipeline.vertex_buffer,
+                                &(frame as u64 * (pipeline.vertex_size / FRAMES_IN_FLIGHT as u64)),
+                            );
+                            bind_sets(
+                                self.command_buffer,
+                                BIND_POINT_GRAPHICS,
+                                pipeline.pipeline_layout,
+                                0,
+                                1,
+                                &pipeline.descriptor_set,
+                                0,
+                                std::ptr::null(),
+                            );
+                        }
+                        DrawPipeline::Sprites => {
+                            let pipeline = self.sprites.as_ref().expect("sprite pipeline");
                             bind_pipeline(
                                 self.command_buffer,
                                 BIND_POINT_GRAPHICS,
