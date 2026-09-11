@@ -2865,6 +2865,7 @@ impl VkRenderer {
         let pipeline_barrier: PFN_vkCmdPipelineBarrier =
             dev_fn!(self, "vkCmdPipelineBarrier", PFN_vkCmdPipelineBarrier);
         let frame = self.frame;
+        let start = std::time::Instant::now();
         let mut image_index: u32 = 0;
         // Acquire before touching this slot's fence: bailing out on a stale
         // swapchain must not leave a fence unsignalled for the next frame.
@@ -2886,10 +2887,12 @@ impl VkRenderer {
         if ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR {
             anyhow::bail!("vkAcquireNextImageKHR failed: {ar}");
         }
+        let after_acquire = std::time::Instant::now();
         unsafe {
             (self.fns.wait_for_fences)(self.device, 1, &self.in_flight[frame], 1, u64::MAX);
             (self.fns.reset_fences)(self.device, 1, &self.in_flight[frame]);
         }
+        let after_fence = std::time::Instant::now();
         self.command_buffer = self.command_buffers[frame];
         {
             let quad_pipeline = self.quads.as_ref().expect("quad pipeline");
@@ -2940,6 +2943,7 @@ impl VkRenderer {
             }
         }
         unsafe { (self.fns.reset_command_buffer)(self.command_buffer, 0) };
+        let after_upload = std::time::Instant::now();
         let cbbi = VkCommandBufferBeginInfo {
             s_type: ST_COMMAND_BUFFER_BEGIN_INFO,
             p_next: std::ptr::null(),
@@ -3200,11 +3204,13 @@ impl VkRenderer {
             signal_semaphore_count: 1,
             p_signal_semaphores: &self.render_finished[frame],
         };
+        let after_record = std::time::Instant::now();
         if unsafe { (self.fns.queue_submit)(self.queue, 1, &si, self.in_flight[frame]) }
             != VK_SUCCESS
         {
             anyhow::bail!("vkQueueSubmit failed");
         }
+        let after_submit = std::time::Instant::now();
         // No wait here: the next frame records while this one executes and the
         // oldest fence is awaited before its slot is reused.
         let pi = VkPresentInfoKHR {
@@ -3225,6 +3231,26 @@ impl VkRenderer {
         }
         if pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR {
             anyhow::bail!("vkQueuePresentKHR failed: {pr}");
+        }
+        let after_present = std::time::Instant::now();
+        // Which stage owns the frame time decides what to optimise, so sample it
+        // rather than inferring it from the total.
+        static GPU_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sample = GPU_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if sample % 60 == 0 {
+            let micros = |from: std::time::Instant, to: std::time::Instant| {
+                to.duration_since(from).as_micros()
+            };
+            log(&format!(
+                "[gpui_ohos] stage acquire={} wait={} upload={} record={} submit={} present={} total={} us",
+                micros(start, after_acquire),
+                micros(after_acquire, after_fence),
+                micros(after_fence, after_upload),
+                micros(after_upload, after_record),
+                micros(after_record, after_submit),
+                micros(after_submit, after_present),
+                micros(start, after_present),
+            ));
         }
         self.frame = (frame + 1) % FRAMES_IN_FLIGHT;
         if ar == VK_SUBOPTIMAL_KHR {
