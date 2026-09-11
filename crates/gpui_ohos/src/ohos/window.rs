@@ -396,8 +396,10 @@ impl WindowShared {
         if self.closed.get() || !self.ensure_renderer() {
             return;
         }
-        let hash = scene_hash(scene);
+        // The benchmark forces redraws of an unchanged scene, so it must not pay
+        // for hashing one.
         let benchmark = take_benchmark_frame();
+        let hash = if benchmark { 0 } else { scene_hash(scene) };
         if !benchmark && self.last_scene_hash.get() == Some(hash) {
             return;
         }
@@ -422,7 +424,9 @@ impl WindowShared {
                 super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
             }
         }
-        self.last_scene_hash.set(Some(hash));
+        if !benchmark {
+            self.last_scene_hash.set(Some(hash));
+        }
     }
 
     pub(crate) fn pointer_down(&self, button: MouseButton, position: Point<Pixels>) {
@@ -1151,9 +1155,15 @@ pub(super) fn build_draw_list(
         || subpixel > 0
         || polychrome > 0
         || surfaces > 0;
+    // Anomalies are reported once and then only sampled, so a scene that keeps
+    // hitting them cannot log a line on every frame.
     static DRAW_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static ANOMALY_REPORTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     let sample = DRAW_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if empty_draw || sample % 120 == 0 {
+    let first_anomaly =
+        empty_draw && !ANOMALY_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if first_anomaly || sample % 120 == 0 {
         super::vk::log(&format!(
             "[gpui_ohos] draw scene q={} p={} g={} u={} | emitted q={} p={} g={} | skipped={} unhandled={} (shadows={shadows} subpixel={subpixel} polychrome={polychrome} surfaces={surfaces}) first_skip={first_skipped:?}",
             scene.quads.len(),

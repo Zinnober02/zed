@@ -566,6 +566,9 @@ pub struct VkRenderer {
     render_finished: Vec<u64>,
     in_flight: Vec<u64>,
     frame: usize,
+    /// One staging buffer per frame slot, grown as needed. Recreating these per
+    /// upload used to leak a buffer and its memory every frame.
+    staging: Vec<(u64, u64, *mut u8, u64)>,
     fns: DeviceFns,
     gpa: PFN_vkGetInstanceProcAddr,
     gpd: PFN_vkGetDeviceProcAddr,
@@ -844,6 +847,7 @@ impl VkRenderer {
             render_finished: Vec::new(),
             in_flight: Vec::new(),
             frame: 0,
+            staging: Vec::new(),
             fns,
             gpa,
             gpd,
@@ -993,6 +997,22 @@ impl VkRenderer {
         }
         self.command_buffer = buffers[0];
         self.command_buffers = buffers;
+        Ok(())
+    }
+
+    /// Make sure the given frame slot owns a staging buffer of at least
+    /// `bytes`, reusing the existing one whenever it is big enough.
+    fn ensure_staging(&mut self, frame: usize, bytes: u64) -> anyhow::Result<()> {
+        while self.staging.len() <= frame {
+            self.staging.push((0, 0, std::ptr::null_mut(), 0));
+        }
+        if self.staging[frame].3 >= bytes {
+            return Ok(());
+        }
+        // Growth happens while the atlas is still filling up and is rare, so the
+        // previous buffer is left to the driver rather than tracked for reuse.
+        let (buffer, memory, mapped) = self.create_host_buffer(bytes, BUFFER_USAGE_TRANSFER_SRC)?;
+        self.staging[frame] = (buffer, memory, mapped, bytes);
         Ok(())
     }
 
@@ -1146,6 +1166,11 @@ impl VkRenderer {
         } else {
             PRESENT_MODE_FIFO
         };
+        // Which modes the compositor offers decides whether the frame rate can
+        // exceed the display refresh rate at all.
+        log(&format!(
+            "[gpui_ohos] present modes {modes:?} -> mode={present_mode}"
+        ));
 
         let (sw, sh) = if caps.current_extent.width != 0 {
             (caps.current_extent.width, caps.current_extent.height)
@@ -2928,8 +2953,9 @@ impl VkRenderer {
             // Size the staging buffer by the bytes actually copied; a
             // polychrome tile is four bytes per pixel, not one.
             let total: u64 = uploads.iter().map(|u| u.data.len() as u64).sum();
-            let (staging_buffer, staging_memory, staging_mapped) =
-                self.create_host_buffer(total.max(4), BUFFER_USAGE_TRANSFER_SRC)?;
+            self.ensure_staging(frame, total.max(4))?;
+            let (staging_buffer, _staging_memory, staging_mapped, _staging_size) =
+                self.staging[frame];
             let mut offset: u64 = 0;
             let mut regions = Vec::with_capacity(uploads.len());
             for upload in uploads {
@@ -3029,7 +3055,6 @@ impl VkRenderer {
                     &to_read,
                 );
             }
-            let _ = (staging_memory, staging_buffer);
         }
         let clear = VkClearValue {
             clear_color: VkClearColorValue { f: color },
