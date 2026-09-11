@@ -398,6 +398,7 @@ impl WindowShared {
         }
         // The benchmark forces redraws of an unchanged scene, so it must not pay
         // for hashing one.
+        let hash_started = std::time::Instant::now();
         let benchmark = take_benchmark_frame();
         let hash = if benchmark { 0 } else { scene_hash(scene) };
         if !benchmark && self.last_scene_hash.get() == Some(hash) {
@@ -412,6 +413,7 @@ impl WindowShared {
                 scene.monochrome_sprites.len()
             ));
         }
+        let work_started = std::time::Instant::now();
         let uploads = self.atlas.take_uploads();
         let (atlas_w, atlas_h) = self.atlas.texture_size(AtlasTextureKind::Monochrome);
         if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
@@ -423,6 +425,19 @@ impl WindowShared {
             {
                 super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
             }
+        }
+        // What a frame costs on the CPU decides how fast it could go on a display
+        // that asks for more, since presenting itself is paced by the display.
+        static CPU_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sample = CPU_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if sample % 60 == 0 {
+            super::vk::log(&format!(
+                "[gpui_ohos] frame cpu {}us ({}us without hashing)",
+                work_started.elapsed().as_micros(),
+                work_started
+                    .saturating_duration_since(hash_started)
+                    .as_micros()
+            ));
         }
         if !benchmark {
             self.last_scene_hash.set(Some(hash));
