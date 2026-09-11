@@ -321,17 +321,7 @@ impl WindowShared {
         let mut callback = self.callbacks.borrow_mut().input.take();
         let mut result = DispatchEventResult::default();
         if let Some(cb) = callback.as_mut() {
-            let is_mouse = matches!(
-                input,
-                PlatformInput::MouseDown(_) | PlatformInput::MouseUp(_)
-            );
-            if is_mouse {
-                super::vk::log(&format!("[gpui_ohos] dispatch {input:?}"));
-            }
             result = cb(input);
-            if is_mouse {
-                super::vk::log(&format!("[gpui_ohos] dispatch result {result:?}"));
-            }
         } else {
             super::vk::log("[gpui_ohos] input dropped: no handler installed");
         }

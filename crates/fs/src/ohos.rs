@@ -263,11 +263,6 @@ impl Fs for OhosFs {
                 .unwrap()
                 .insert(target.to_path_buf(), entry);
         }
-        debug(format!(
-            "ohosfs rename {} -> {}",
-            source.display(),
-            target.display()
-        ));
         Ok(())
     }
 
@@ -306,12 +301,6 @@ impl Fs for OhosFs {
     }
 
     async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>> {
-        debug(format!(
-            "ohosfs open_sync {} picked={} uri={:?}",
-            path.display(),
-            self.is_picked(path),
-            self.picked_uri(path)
-        ));
         if self.is_picked(path) {
             let bytes = self.read_picked(path).await?;
             Ok(Box::new(io::Cursor::new(bytes)))
@@ -321,12 +310,6 @@ impl Fs for OhosFs {
     }
 
     async fn load_bytes(&self, path: &Path) -> Result<Vec<u8>> {
-        debug(format!(
-            "ohosfs load_bytes {} picked={} uri={:?}",
-            path.display(),
-            self.is_picked(path),
-            self.picked_uri(path)
-        ));
         if self.is_picked(path) {
             self.read_picked(path).await
         } else {
@@ -396,12 +379,6 @@ impl Fs for OhosFs {
     }
 
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>> {
-        debug(format!(
-            "ohosfs metadata {} picked={} cached={}",
-            path.display(),
-            self.is_picked(path),
-            self.picked_entry(path).is_some()
-        ));
         if let Some(entry) = self.picked_entry(path) {
             return Ok(Some(picked_metadata(entry.is_dir)));
         }
@@ -426,12 +403,6 @@ impl Fs for OhosFs {
             return self.inner.read_dir(path).await;
         };
         let entries = (bridge()?.list_dir)(uri.clone()).await;
-        debug(format!(
-            "ohosfs read_dir {} uri={} entries={}",
-            path.display(),
-            uri,
-            entries.len()
-        ));
         let base = path.to_path_buf();
         {
             let mut picked = self.picked.lock().unwrap();
