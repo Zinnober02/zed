@@ -416,16 +416,20 @@ impl WindowShared {
         let work_started = std::time::Instant::now();
         let uploads = self.atlas.take_uploads();
         let (atlas_w, atlas_h) = self.atlas.texture_size(AtlasTextureKind::Monochrome);
-        if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
+        let presented = if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
             let (width, height) = renderer.size();
             let (quads, paths, glyphs, batches) =
                 build_draw_list(scene, width, height, atlas_w, atlas_h);
-            if let Err(error) =
-                renderer.render_scene(CLEAR_COLOR, &quads, &paths, &glyphs, &batches, &uploads)
-            {
-                super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
+            match renderer.render_scene(CLEAR_COLOR, &quads, &paths, &glyphs, &batches, &uploads) {
+                Ok(presented) => presented,
+                Err(error) => {
+                    super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
+                    true
+                }
             }
-        }
+        } else {
+            false
+        };
         // What a frame costs on the CPU decides how fast it could go on a display
         // that asks for more, since presenting itself is paced by the display.
         static CPU_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -439,7 +443,9 @@ impl WindowShared {
                     .as_micros()
             ));
         }
-        if !benchmark {
+        // A frame that never reached the display must be drawn again, so the hash
+        // is only remembered once it has been presented.
+        if !benchmark && presented {
             self.last_scene_hash.set(Some(hash));
         }
     }
@@ -1211,6 +1217,54 @@ fn scene_hash(scene: &Scene) -> u64 {
         quad.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
         quad.bounds.size.width.as_f32().to_bits().hash(&mut hasher);
         quad.bounds.size.height.as_f32().to_bits().hash(&mut hasher);
+        // A frame that only moves a mask, reorders layers, or changes a border or
+        // a gradient still looks different, so all of it belongs in the identity.
+        quad.order.hash(&mut hasher);
+        quad.content_mask
+            .bounds
+            .origin
+            .x
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        quad.content_mask
+            .bounds
+            .origin
+            .y
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        quad.content_mask
+            .bounds
+            .size
+            .width
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        quad.content_mask
+            .bounds
+            .size
+            .height
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        for width in [
+            quad.border_widths.top,
+            quad.border_widths.right,
+            quad.border_widths.bottom,
+            quad.border_widths.left,
+        ] {
+            width.0.to_bits().hash(&mut hasher);
+        }
+        for radius in [
+            quad.corner_radii.top_left,
+            quad.corner_radii.top_right,
+            quad.corner_radii.bottom_right,
+            quad.corner_radii.bottom_left,
+        ] {
+            radius.as_f32().to_bits().hash(&mut hasher);
+        }
+        quad.background.as_solid().is_some().hash(&mut hasher);
         if let Some(color) = quad.background.as_solid() {
             let rgba = color.to_rgb();
             rgba.r.to_bits().hash(&mut hasher);

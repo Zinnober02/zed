@@ -2850,7 +2850,7 @@ impl VkRenderer {
         vertices: &[GlyphVertex],
         batches: &[DrawBatch],
         uploads: &[super::atlas::AtlasUpload],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if self.text.is_none() {
             self.create_text_pipeline()?;
         }
@@ -2882,7 +2882,8 @@ impl VkRenderer {
         if ar == VK_ERROR_OUT_OF_DATE_KHR {
             let (w, h) = (self.width, self.height);
             self.resize(w, h)?;
-            return Ok(());
+            // Nothing was drawn, so the caller must not treat this frame as shown.
+            return Ok(false);
         }
         if ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR {
             anyhow::bail!("vkAcquireNextImageKHR failed: {ar}");
@@ -3227,7 +3228,8 @@ impl VkRenderer {
         if pr == VK_ERROR_OUT_OF_DATE_KHR {
             let (w, h) = (self.width, self.height);
             self.resize(w, h)?;
-            return Ok(());
+            // The image was submitted but never reached the display.
+            return Ok(false);
         }
         if pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR {
             anyhow::bail!("vkQueuePresentKHR failed: {pr}");
@@ -3257,6 +3259,6 @@ impl VkRenderer {
             let (w, h) = (self.width, self.height);
             self.resize(w, h)?;
         }
-        Ok(())
+        Ok(true)
     }
 }
