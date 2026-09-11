@@ -43,6 +43,12 @@ unsafe extern "C" {
 const RTLD_NOW: c_int = 2;
 const VK_SUCCESS: i32 = 0;
 const VK_ERROR_OUT_OF_DATE_KHR: i32 = -1000001004;
+/// The swapchain wants a resize, but this frame can still be presented.
+const VK_SUBOPTIMAL_KHR: i32 = 1000001003;
+/// vkCreateFence with this flag returns an already signalled fence.
+const VK_FENCE_CREATE_SIGNALED_BIT: u32 = 0x0000_0001;
+/// How many frames the CPU may record while the GPU still executes one.
+const FRAMES_IN_FLIGHT: usize = 2;
 
 const VK_STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0;
 const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
@@ -551,10 +557,15 @@ pub struct VkRenderer {
     framebuffers: Vec<u64>,
     render_pass: u64,
     command_pool: u64,
+    /// Per-frame command buffers; `command_buffer` is the one being recorded.
+    command_buffers: Vec<*mut c_void>,
     command_buffer: *mut c_void,
-    image_available: u64,
-    render_finished: u64,
-    in_flight: u64,
+    /// Per-frame semaphores and fences, so the CPU can record the next frame
+    /// while the GPU still executes the previous one.
+    image_available: Vec<u64>,
+    render_finished: Vec<u64>,
+    in_flight: Vec<u64>,
+    frame: usize,
     fns: DeviceFns,
     gpa: PFN_vkGetInstanceProcAddr,
     gpd: PFN_vkGetDeviceProcAddr,
@@ -827,10 +838,12 @@ impl VkRenderer {
             framebuffers: Vec::new(),
             render_pass: 0,
             command_pool: 0,
+            command_buffers: Vec::new(),
             command_buffer: std::ptr::null_mut(),
-            image_available: 0,
-            render_finished: 0,
-            in_flight: 0,
+            image_available: Vec::new(),
+            render_finished: Vec::new(),
+            in_flight: Vec::new(),
+            frame: 0,
             fns,
             gpa,
             gpd,
@@ -970,43 +983,58 @@ impl VkRenderer {
             p_next: std::ptr::null(),
             command_pool: pool,
             level: CMD_LEVEL_PRIMARY,
-            command_buffer_count: 1,
+            command_buffer_count: FRAMES_IN_FLIGHT as u32,
         };
-        let mut cb: *mut c_void = std::ptr::null_mut();
-        let r = unsafe { (self.fns.alloc_command_buffers)(self.device, &cbaci, &mut cb) };
+        let mut buffers = vec![std::ptr::null_mut(); FRAMES_IN_FLIGHT];
+        let r =
+            unsafe { (self.fns.alloc_command_buffers)(self.device, &cbaci, buffers.as_mut_ptr()) };
         if r != VK_SUCCESS {
             anyhow::bail!("vkAllocateCommandBuffers failed: {r}");
         }
-        self.command_buffer = cb;
+        self.command_buffer = buffers[0];
+        self.command_buffers = buffers;
         Ok(())
     }
 
     fn create_sync_objects(&mut self) -> anyhow::Result<()> {
+        // Fences start signalled so waiting on a slot that was never submitted
+        // does not block.
         let fci = VkFenceCreateInfo {
             s_type: ST_FENCE_CREATE_INFO,
             p_next: std::ptr::null(),
-            flags: 0,
+            flags: VK_FENCE_CREATE_SIGNALED_BIT,
         };
-        let mut fence: u64 = 0;
-        let r = unsafe { (self.fns.create_fence)(self.device, &fci, std::ptr::null(), &mut fence) };
-        if r != VK_SUCCESS {
-            anyhow::bail!("vkCreateFence failed: {r}");
-        }
-        self.in_flight = fence;
-
         let sci = VkSemaphoreCreateInfo {
             s_type: ST_SEMAPHORE_CREATE_INFO,
             p_next: std::ptr::null(),
             flags: 0,
         };
-        let mut img_sem: u64 = 0;
-        let mut done_sem: u64 = 0;
-        unsafe {
-            (self.fns.create_semaphore)(self.device, &sci, std::ptr::null(), &mut img_sem);
-            (self.fns.create_semaphore)(self.device, &sci, std::ptr::null(), &mut done_sem);
+        for _ in 0..FRAMES_IN_FLIGHT {
+            let mut fence: u64 = 0;
+            let r =
+                unsafe { (self.fns.create_fence)(self.device, &fci, std::ptr::null(), &mut fence) };
+            if r != VK_SUCCESS {
+                anyhow::bail!("vkCreateFence failed: {r}");
+            }
+            self.in_flight.push(fence);
+
+            let mut img_sem: u64 = 0;
+            let mut done_sem: u64 = 0;
+            let r = unsafe {
+                (self.fns.create_semaphore)(self.device, &sci, std::ptr::null(), &mut img_sem)
+            };
+            if r != VK_SUCCESS {
+                anyhow::bail!("vkCreateSemaphore failed: {r}");
+            }
+            let r = unsafe {
+                (self.fns.create_semaphore)(self.device, &sci, std::ptr::null(), &mut done_sem)
+            };
+            if r != VK_SUCCESS {
+                anyhow::bail!("vkCreateSemaphore failed: {r}");
+            }
+            self.image_available.push(img_sem);
+            self.render_finished.push(done_sem);
         }
-        self.image_available = img_sem;
-        self.render_finished = done_sem;
         Ok(())
     }
 
@@ -1133,7 +1161,9 @@ impl VkRenderer {
             p_next: std::ptr::null(),
             flags: 0,
             surface: self.surface,
-            min_image_count: caps.min_image_count.max(2),
+            // Two images throttle acquisition to one frame in flight, so ask
+            // for one more than the driver's minimum when it allows it.
+            min_image_count: caps.min_image_count.max(3).min(caps.max_image_count.max(3)),
             image_format: chosen.format,
             image_color_space: chosen.color_space,
             image_extent: VkExtent2D {
@@ -1269,159 +1299,6 @@ impl VkRenderer {
         self.width = width;
         self.height = height;
         self.create_swapchain()
-    }
-
-    /// Clear the swapchain to color and present it.
-    #[allow(dead_code)] // the documented swapchain clear path; scenes use render_scene
-    pub fn render_clear(&mut self, color: [f32; 4]) -> anyhow::Result<()> {
-        self.render_frame(color, &[])
-    }
-
-    /// Clear the swapchain to color, then paint rects in order on top.
-    #[allow(dead_code)] // see render_clear
-    pub fn render_frame(&mut self, color: [f32; 4], rects: &[ClearRect]) -> anyhow::Result<()> {
-        unsafe {
-            (self.fns.wait_for_fences)(self.device, 1, &self.in_flight, 1, u64::MAX);
-            (self.fns.reset_fences)(self.device, 1, &self.in_flight);
-        }
-
-        let mut image_index: u32 = 0;
-        let ar = unsafe {
-            (self.fns.acquire_next_image)(
-                self.device,
-                self.swapchain,
-                u64::MAX,
-                self.image_available,
-                0,
-                &mut image_index,
-            )
-        };
-        if ar == VK_ERROR_OUT_OF_DATE_KHR {
-            let (w, h) = (self.width, self.height);
-            self.resize(w, h)?;
-            return Ok(());
-        }
-        if ar != VK_SUCCESS {
-            anyhow::bail!("vkAcquireNextImageKHR failed: {ar}");
-        }
-
-        unsafe { (self.fns.reset_command_buffer)(self.command_buffer, 0) };
-        let cbbi = VkCommandBufferBeginInfo {
-            s_type: ST_COMMAND_BUFFER_BEGIN_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            p_inheritance_info: std::ptr::null(),
-        };
-        let r = unsafe { (self.fns.begin_command_buffer)(self.command_buffer, &cbbi) };
-        if r != VK_SUCCESS {
-            anyhow::bail!("vkBeginCommandBuffer failed: {r}");
-        }
-
-        let clear = VkClearValue {
-            clear_color: VkClearColorValue { f: color },
-        };
-        let area = VkRect2D {
-            offset: [0, 0],
-            extent: VkExtent2D {
-                width: self.width,
-                height: self.height,
-            },
-        };
-        let rpbi = VkRenderPassBeginInfo {
-            s_type: ST_RENDER_PASS_BEGIN_INFO,
-            p_next: std::ptr::null(),
-            render_pass: self.render_pass,
-            framebuffer: self.framebuffers[image_index as usize],
-            render_area: area,
-            clear_value_count: 1,
-            p_clear_values: &clear,
-        };
-        unsafe {
-            (self.fns.begin_render_pass)(self.command_buffer, &rpbi, SUBPASS_CONTENTS_INLINE);
-            for rect in rects {
-                self.cmd_clear_rect(*rect);
-            }
-            (self.fns.cmd_end_render_pass)(self.command_buffer);
-            (self.fns.end_command_buffer)(self.command_buffer);
-        }
-
-        let wait_stage = [PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT];
-        let cmds: [*const c_void; 1] = [self.command_buffer];
-        let si = VkSubmitInfo {
-            s_type: ST_SUBMIT_INFO,
-            p_next: std::ptr::null(),
-            wait_semaphore_count: 1,
-            p_wait_semaphores: &self.image_available,
-            p_wait_dst_stage_mask: wait_stage.as_ptr(),
-            command_buffer_count: 1,
-            p_command_buffers: cmds.as_ptr(),
-            signal_semaphore_count: 1,
-            p_signal_semaphores: &self.render_finished,
-        };
-        let r = unsafe { (self.fns.queue_submit)(self.queue, 1, &si, self.in_flight) };
-        if r != VK_SUCCESS {
-            anyhow::bail!("vkQueueSubmit failed: {r}");
-        }
-        unsafe { (self.fns.wait_for_fences)(self.device, 1, &self.in_flight, 1, u64::MAX) };
-
-        let pi = VkPresentInfoKHR {
-            s_type: ST_PRESENT_INFO_KHR,
-            p_next: std::ptr::null(),
-            wait_semaphore_count: 1,
-            p_wait_semaphores: &self.render_finished,
-            swapchain_count: 1,
-            p_swapchains: &self.swapchain,
-            p_image_indices: &image_index,
-            p_results: std::ptr::null_mut(),
-        };
-        let pr = unsafe { (self.fns.queue_present)(self.queue, &pi) };
-        if pr == VK_ERROR_OUT_OF_DATE_KHR {
-            let (w, h) = (self.width, self.height);
-            self.resize(w, h)?;
-            return Ok(());
-        }
-        if pr != VK_SUCCESS {
-            anyhow::bail!("vkQueuePresentKHR failed: {pr}");
-        }
-        Ok(())
-    }
-
-    /// Paint one clipped solid rectangle inside the active render pass.
-    fn cmd_clear_rect(&self, rect: ClearRect) {
-        let x = rect.x.max(0);
-        let y = rect.y.max(0);
-        let x1 = rect
-            .x
-            .saturating_add(rect.width as i32)
-            .min(self.width as i32);
-        let y1 = rect
-            .y
-            .saturating_add(rect.height as i32)
-            .min(self.height as i32);
-        if x1 <= x || y1 <= y {
-            return;
-        }
-        let attachment = VkClearAttachment {
-            aspect_mask: ASPECT_COLOR,
-            color_attachment: 0,
-            clear_value: VkClearValue {
-                clear_color: VkClearColorValue { f: rect.color },
-            },
-        };
-        let clear_rect = VkClearRect {
-            rect: VkRect2D {
-                offset: [x, y],
-                extent: VkExtent2D {
-                    width: (x1 - x) as u32,
-                    height: (y1 - y) as u32,
-                },
-            },
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-        unsafe {
-            (self.fns.cmd_clear_attachments)(self.command_buffer, 1, &attachment, 1, &clear_rect);
-        }
     }
 }
 
@@ -2962,17 +2839,16 @@ impl VkRenderer {
             dev_fn!(self, "vkCmdCopyBufferToImage", PFN_vkCmdCopyBufferToImage);
         let pipeline_barrier: PFN_vkCmdPipelineBarrier =
             dev_fn!(self, "vkCmdPipelineBarrier", PFN_vkCmdPipelineBarrier);
-        unsafe {
-            (self.fns.wait_for_fences)(self.device, 1, &self.in_flight, 1, u64::MAX);
-            (self.fns.reset_fences)(self.device, 1, &self.in_flight);
-        }
+        let frame = self.frame;
         let mut image_index: u32 = 0;
+        // Acquire before touching this slot's fence: bailing out on a stale
+        // swapchain must not leave a fence unsignalled for the next frame.
         let ar = unsafe {
             (self.fns.acquire_next_image)(
                 self.device,
                 self.swapchain,
                 u64::MAX,
-                self.image_available,
+                self.image_available[frame],
                 0,
                 &mut image_index,
             )
@@ -2982,52 +2858,57 @@ impl VkRenderer {
             self.resize(w, h)?;
             return Ok(());
         }
-        if ar != VK_SUCCESS {
+        if ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR {
             anyhow::bail!("vkAcquireNextImageKHR failed: {ar}");
         }
+        unsafe {
+            (self.fns.wait_for_fences)(self.device, 1, &self.in_flight[frame], 1, u64::MAX);
+            (self.fns.reset_fences)(self.device, 1, &self.in_flight[frame]);
+        }
+        self.command_buffer = self.command_buffers[frame];
         {
             let quad_pipeline = self.quads.as_ref().expect("quad pipeline");
             let quad_bytes = std::mem::size_of_val(quads);
-            if quad_bytes as u64 > quad_pipeline.vertex_size {
+            let stride = quad_pipeline.vertex_size / FRAMES_IN_FLIGHT as u64;
+            if quad_bytes as u64 > stride {
                 anyhow::bail!("quad vertex buffer too small");
             }
             if !quads.is_empty() {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        quads.as_ptr() as *const u8,
-                        quad_pipeline.vertex_mapped,
-                        quad_bytes,
-                    );
+                    let dst = (quad_pipeline.vertex_mapped as *mut u8)
+                        .add(frame as usize * stride as usize);
+                    std::ptr::copy_nonoverlapping(quads.as_ptr() as *const u8, dst, quad_bytes);
                 }
             }
         }
         {
             let path_pipeline = self.paths.as_ref().expect("path pipeline");
             let path_bytes = std::mem::size_of_val(paths);
-            if path_bytes as u64 > path_pipeline.vertex_size {
+            let stride = path_pipeline.vertex_size / FRAMES_IN_FLIGHT as u64;
+            if path_bytes as u64 > stride {
                 anyhow::bail!("path vertex buffer too small");
             }
             if !paths.is_empty() {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        paths.as_ptr() as *const u8,
-                        path_pipeline.vertex_mapped,
-                        path_bytes,
-                    );
+                    let dst = (path_pipeline.vertex_mapped as *mut u8)
+                        .add(frame as usize * stride as usize);
+                    std::ptr::copy_nonoverlapping(paths.as_ptr() as *const u8, dst, path_bytes);
                 }
             }
         }
         let vertex_bytes = std::mem::size_of_val(vertices);
         {
             let text = self.text.as_ref().expect("text pipeline");
-            if vertex_bytes as u64 > text.vertex_size {
+            let stride = text.vertex_size / FRAMES_IN_FLIGHT as u64;
+            if vertex_bytes as u64 > stride {
                 anyhow::bail!("glyph vertex buffer too small");
             }
             if !vertices.is_empty() {
                 unsafe {
+                    let dst = (text.vertex_mapped as *mut u8).add(frame as usize * stride as usize);
                     std::ptr::copy_nonoverlapping(
                         vertices.as_ptr() as *const u8,
-                        text.vertex_mapped,
+                        dst,
                         vertex_bytes,
                     );
                 }
@@ -3215,7 +3096,13 @@ impl VkRenderer {
                                 BIND_POINT_GRAPHICS,
                                 pipeline.pipeline,
                             );
-                            bind_vertex(self.command_buffer, 0, 1, &pipeline.vertex_buffer, &0u64);
+                            bind_vertex(
+                                self.command_buffer,
+                                0,
+                                1,
+                                &pipeline.vertex_buffer,
+                                &(frame as u64 * (pipeline.vertex_size / FRAMES_IN_FLIGHT as u64)),
+                            );
                         }
                         DrawPipeline::Paths => {
                             let pipeline = self.paths.as_ref().expect("path pipeline");
@@ -3224,7 +3111,13 @@ impl VkRenderer {
                                 BIND_POINT_GRAPHICS,
                                 pipeline.pipeline,
                             );
-                            bind_vertex(self.command_buffer, 0, 1, &pipeline.vertex_buffer, &0u64);
+                            bind_vertex(
+                                self.command_buffer,
+                                0,
+                                1,
+                                &pipeline.vertex_buffer,
+                                &(frame as u64 * (pipeline.vertex_size / FRAMES_IN_FLIGHT as u64)),
+                            );
                         }
                         DrawPipeline::Glyphs => {
                             let pipeline = self.text.as_ref().expect("text pipeline");
@@ -3233,7 +3126,13 @@ impl VkRenderer {
                                 BIND_POINT_GRAPHICS,
                                 pipeline.pipeline,
                             );
-                            bind_vertex(self.command_buffer, 0, 1, &pipeline.vertex_buffer, &0u64);
+                            bind_vertex(
+                                self.command_buffer,
+                                0,
+                                1,
+                                &pipeline.vertex_buffer,
+                                &(frame as u64 * (pipeline.vertex_size / FRAMES_IN_FLIGHT as u64)),
+                            );
                             bind_sets(
                                 self.command_buffer,
                                 BIND_POINT_GRAPHICS,
@@ -3269,22 +3168,25 @@ impl VkRenderer {
             s_type: ST_SUBMIT_INFO,
             p_next: std::ptr::null(),
             wait_semaphore_count: 1,
-            p_wait_semaphores: &self.image_available,
+            p_wait_semaphores: &self.image_available[frame],
             p_wait_dst_stage_mask: wait_stage.as_ptr(),
             command_buffer_count: 1,
             p_command_buffers: cmds.as_ptr(),
             signal_semaphore_count: 1,
-            p_signal_semaphores: &self.render_finished,
+            p_signal_semaphores: &self.render_finished[frame],
         };
-        if unsafe { (self.fns.queue_submit)(self.queue, 1, &si, self.in_flight) } != VK_SUCCESS {
+        if unsafe { (self.fns.queue_submit)(self.queue, 1, &si, self.in_flight[frame]) }
+            != VK_SUCCESS
+        {
             anyhow::bail!("vkQueueSubmit failed");
         }
-        unsafe { (self.fns.wait_for_fences)(self.device, 1, &self.in_flight, 1, u64::MAX) };
+        // No wait here: the next frame records while this one executes and the
+        // oldest fence is awaited before its slot is reused.
         let pi = VkPresentInfoKHR {
             s_type: ST_PRESENT_INFO_KHR,
             p_next: std::ptr::null(),
             wait_semaphore_count: 1,
-            p_wait_semaphores: &self.render_finished,
+            p_wait_semaphores: &self.render_finished[frame],
             swapchain_count: 1,
             p_swapchains: &self.swapchain,
             p_image_indices: &image_index,
@@ -3296,8 +3198,13 @@ impl VkRenderer {
             self.resize(w, h)?;
             return Ok(());
         }
-        if pr != VK_SUCCESS {
+        if pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR {
             anyhow::bail!("vkQueuePresentKHR failed: {pr}");
+        }
+        self.frame = (frame + 1) % FRAMES_IN_FLIGHT;
+        if ar == VK_SUBOPTIMAL_KHR {
+            let (w, h) = (self.width, self.height);
+            self.resize(w, h)?;
         }
         Ok(())
     }
