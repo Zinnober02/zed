@@ -9,7 +9,6 @@ extern crate self as gpui;
 pub static GPUI_MANIFEST_DIR: &'static str = env!("CARGO_MANIFEST_DIR");
 #[macro_use]
 mod action;
-pub mod translations;
 mod app;
 
 mod arena;
@@ -93,7 +92,6 @@ pub use accesskit;
 pub use accesskit::Action as AccessibleAction;
 pub use accesskit::{Orientation, Role, Toggled};
 pub use action::*;
-pub use translations::{tr, tr_scoped};
 pub use anyhow::Result;
 pub use app::*;
 pub(crate) use arena::*;
