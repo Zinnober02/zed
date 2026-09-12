@@ -296,8 +296,22 @@ impl Render for PlatformTitleBar {
                     .w_full()
                     // OHOS keeps its window buttons floating over the top right
                     // corner of the window, so the title bar leaves that space
-                    // free instead of putting content underneath them.
-                    .when(cfg!(target_env = "ohos"), |el| el.pr(px(48.)))
+                    // free instead of putting content underneath them. The system
+                    // draws those buttons in a light colour, so the strip they sit
+                    // on is dark to keep them visible.
+                    .when(cfg!(target_env = "ohos"), |el| {
+                        el.pr(px(80.)).child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .h_full()
+                                .w(px(80.))
+                                // A dark strip, not the theme colour: the system
+                                // buttons are light in every theme.
+                                .bg(gpui::black().opacity(0.75)),
+                        )
+                    })
                     .children(children),
             )
             .when(
