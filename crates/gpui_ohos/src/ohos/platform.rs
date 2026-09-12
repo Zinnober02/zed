@@ -232,9 +232,9 @@ impl OhosPlatform {
 
     /// Hand the previous session's folder to the open listener once it exists.
     ///
-    /// `OpenRequest::parse` strips the `file://` scheme and then treats the rest
-    /// as a path, so writing the tagged handle after that scheme delivers a
-    /// `dir:` path the filesystem wrapper understands.
+    /// The host answers with the folder's sandbox path, and
+    /// `OpenRequest::parse` strips the `file://` scheme and treats the rest as a
+    /// path, so the URL carries that path unchanged.
     fn deliver_restore_folder(&self) {
         let uri = match self.take_restore_folder() {
             Some(uri) => {
@@ -255,7 +255,7 @@ impl OhosPlatform {
         };
         let mut callback = self.open_urls.borrow_mut();
         match callback.as_mut() {
-            Some(callback) => callback(vec![format!("file://dir:{uri}")]),
+            Some(callback) => callback(vec![format!("file://{uri}")]),
             None => *self.restore_folder.borrow_mut() = Some(uri),
         }
     }
@@ -670,16 +670,21 @@ fn cursor_style_name(style: CursorStyle) -> &'static str {
     }
 }
 
-/// Encode a raw picker answer as the opaque handle GPUI passes around:
-/// "f|fd|name" becomes "fd:<fd>", "d|uri" becomes "dir:<uri>".
+/// Encode a raw picker answer as the handle GPUI passes around: "f|fd|name"
+/// becomes "fd:<fd>" and "d|path|uri" becomes the plain sandbox path, because a
+/// project opened from a tagged handle would otherwise show that tag as its
+/// location in the UI.
 fn picked_handle(line: &str) -> PathBuf {
     if let Some(rest) = line.strip_prefix("f|") {
         if let Some((fd, _name)) = rest.split_once('|') {
             return PathBuf::from(format!("fd:{fd}"));
         }
     }
-    if let Some(uri) = line.strip_prefix("d|") {
-        return PathBuf::from(format!("dir:{uri}"));
+    if let Some(rest) = line.strip_prefix("d|") {
+        if let Some((path, _uri)) = rest.split_once('|') {
+            return PathBuf::from(path);
+        }
+        return PathBuf::from(rest);
     }
     PathBuf::from(line)
 }

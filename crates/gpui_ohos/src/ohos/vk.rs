@@ -335,20 +335,6 @@ struct VkClearValue {
 }
 
 #[repr(C)]
-struct VkClearAttachment {
-    aspect_mask: u32,
-    color_attachment: u32,
-    clear_value: VkClearValue,
-}
-
-#[repr(C)]
-struct VkClearRect {
-    rect: VkRect2D,
-    base_array_layer: u32,
-    layer_count: u32,
-}
-
-#[repr(C)]
 struct VkRect2D {
     offset: [i32; 2],
     extent: VkExtent2D,
