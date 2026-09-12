@@ -110,6 +110,7 @@ pub(crate) fn derive_action(input: TokenStream) -> TokenStream {
         );
     }
 
+    let plain_name = name.clone();
     let full_name = if let Some(namespace) = namespace {
         format!("{namespace}::{name}")
     } else {
@@ -164,7 +165,10 @@ pub(crate) fn derive_action(input: TokenStream) -> TokenStream {
 
         impl gpui::Action for #struct_name {
             fn name(&self) -> &'static str {
-                #full_name
+                // Translated here rather than at each use so every surface that
+                // shows an action name (command palette, menus, keymap editor)
+                // picks it up from one place.
+                gpui::tr_scoped(#plain_name, #full_name)
             }
 
             fn name_for_type() -> &'static str
