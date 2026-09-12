@@ -219,14 +219,20 @@ impl PlatformTextSystem for OhosTextSystem {
 }
 
 impl OhosTextSystemState {
+    /// Fold a family name down to what actually identifies it.
+    ///
+    /// The system fonts disagree with the settings about where the separators
+    /// go: the file FTAeroSans-Regular.ttf reports the family "FT AeroSans",
+    /// while the settings pickers offer and store it without the space. Dropping
+    /// every separator on both sides is what makes those two spellings the same
+    /// font instead of silently falling back to the default.
     fn normalize_family_name(name: &str) -> String {
-        name.trim()
-            .to_lowercase()
-            .replace('_', " ")
-            .replace('-', " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
+        name.chars()
+            .filter(|character| {
+                !character.is_whitespace() && *character != '-' && *character != '_'
+            })
+            .flat_map(char::to_lowercase)
+            .collect()
     }
 
     fn ensure_system_fonts_loaded(&mut self) {
@@ -273,6 +279,17 @@ impl OhosTextSystemState {
                 families.len(),
                 Path::new("/system/fonts").is_dir(),
             ));
+            // What the settings ask for has to be findable here by name, so report
+            // the entries that look like the two families the settings name.
+            for needle in ["zhong", "harmony"] {
+                let hits: Vec<&str> = families
+                    .iter()
+                    .filter(|family| family.to_lowercase().contains(needle))
+                    .map(String::as_str)
+                    .take(8)
+                    .collect();
+                super::vk::log(&format!("[gpui_ohos] fonts matching {needle:?}: {hits:?}"));
+            }
         }
 
         self.system_fonts_loaded = true;
@@ -323,6 +340,12 @@ impl OhosTextSystemState {
         candidates.push("sans-serif");
         candidates.push("Noto Sans");
 
+        // What the editor actually asks for decides everything below, so report
+        // the request together with what it matched.
+        super::vk::log(&format!(
+            "[gpui_ohos] font request name={name:?} primary={primary_name:?}"
+        ));
+
         for candidate in candidates {
             let normalized_candidate = Self::normalize_family_name(candidate);
             for face in self.font_system.db().faces().filter(|face| {
@@ -338,6 +361,18 @@ impl OhosTextSystemState {
             if !families.is_empty() {
                 break;
             }
+        }
+
+        {
+            let matched: Vec<&str> = families
+                .iter()
+                .map(|(_, post_script)| post_script.as_str())
+                .take(6)
+                .collect();
+            super::vk::log(&format!(
+                "[gpui_ohos] font request name={name:?} matched={} faces={matched:?}",
+                families.len()
+            ));
         }
 
         if families.is_empty() {
