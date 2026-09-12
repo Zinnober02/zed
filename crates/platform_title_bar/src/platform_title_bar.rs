@@ -294,6 +294,10 @@ impl Render for PlatformTitleBar {
                     .justify_between()
                     .overflow_x_hidden()
                     .w_full()
+                    // OHOS keeps its window buttons floating over the top right
+                    // corner of the window, so the title bar leaves that space
+                    // free instead of putting content underneath them.
+                    .when(cfg!(target_env = "ohos"), |el| el.pr(px(48.)))
                     .children(children),
             )
             .when(

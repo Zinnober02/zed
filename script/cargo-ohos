@@ -13,6 +13,10 @@ here=$(dirname "$0")
 export PKG_CONFIG="${PKG_CONFIG:-$PWD/$here/fake-pkg-config}"
 sdk=${OHOS_NDK:-/storage/Users/currentUser/deveco_tools/sdk/default/openharmony/native}
 export AWS_LC_SYS_CMAKE_BUILDER=1
+# aws-lc's CPU jitter entropy source aborts the process without any log when its
+# health check fails, which is what killed the app as soon as a TLS handshake
+# asked for random bytes on OHOS. The OS entropy sources stay enabled.
+export AWS_LC_SYS_NO_JITTER_ENTROPY=1
 export CMAKE_TOOLCHAIN_FILE="$sdk/build/cmake/ohos.toolchain.cmake"
 export OHOS_ARCH=arm64-v8a
 export OHOS_PLATFORM=OHOS
