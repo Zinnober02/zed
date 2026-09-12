@@ -218,6 +218,21 @@ impl PlatformTextSystem for OhosTextSystem {
     }
 }
 
+/// Drop a trailing region or script suffix such as " SC" from a family name.
+///
+/// Returns the original name when there is nothing to drop, so callers can put
+/// both spellings in front of the lookup without checking first.
+fn strip_region_suffix(name: &str) -> &str {
+    const SUFFIXES: [&str; 7] = [" SC", " TC", " HK", " JP", " KR", " UI", " GB"];
+    for suffix in SUFFIXES {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            if !stripped.is_empty() {
+                return stripped;
+            }
+        }
+    }
+    name
+}
 impl OhosTextSystemState {
     /// Fold a family name down to what actually identifies it.
     ///
@@ -226,6 +241,7 @@ impl OhosTextSystemState {
     /// while the settings pickers offer and store it without the space. Dropping
     /// every separator on both sides is what makes those two spellings the same
     /// font instead of silently falling back to the default.
+
     fn normalize_family_name(name: &str) -> String {
         name.chars()
             .filter(|character| {
@@ -333,7 +349,13 @@ impl OhosTextSystemState {
 
         let system_name = "HarmonyOS Sans";
         let primary_name = font_name_with_fallbacks(name, system_name);
-        let mut candidates = SmallVec::<[&str; 5]>::new();
+        // A family is often written with a region or script suffix that the font
+        // itself does not carry: the settings on this device ask for "HarmonyOS
+        // Sans SC" while the family is "HarmonyOS Sans", and without trying the
+        // trimmed spelling the request silently lands on the fallback.
+        let trimmed_name = strip_region_suffix(primary_name);
+        let mut candidates = SmallVec::<[&str; 6]>::new();
+        candidates.push(trimmed_name);
         candidates.push(primary_name);
         candidates.push("HarmonyOS Sans");
         candidates.push("HarmonyOS_Sans");
@@ -346,6 +368,7 @@ impl OhosTextSystemState {
             "[gpui_ohos] font request name={name:?} primary={primary_name:?}"
         ));
 
+        let mut matched_candidate = "";
         for candidate in candidates {
             let normalized_candidate = Self::normalize_family_name(candidate);
             for face in self.font_system.db().faces().filter(|face| {
@@ -359,6 +382,7 @@ impl OhosTextSystemState {
                 }
             }
             if !families.is_empty() {
+                matched_candidate = candidate;
                 break;
             }
         }
@@ -370,7 +394,7 @@ impl OhosTextSystemState {
                 .take(6)
                 .collect();
             super::vk::log(&format!(
-                "[gpui_ohos] font request name={name:?} matched={} faces={matched:?}",
+                "[gpui_ohos] font request name={name:?} matched={} via={matched_candidate:?} faces={matched:?}",
                 families.len()
             ));
         }

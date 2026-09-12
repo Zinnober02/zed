@@ -344,7 +344,16 @@ async fn load_directory_shell_environment(
     // process already has is the whole answer, and asking a shell for it only
     // ever produced "Failed to load environment variables" in the status bar.
     #[cfg(target_env = "ohos")]
-    let mut envs: collections::HashMap<String, String> = std::env::vars().collect();
+    let mut envs: collections::HashMap<String, String> = {
+        let mut envs: collections::HashMap<String, String> = std::env::vars().collect();
+        // Tools the editor starts look for a shell in the environment, and this
+        // platform hands us one worth naming even though nothing here logs in.
+        let (program, _) = shell.program_and_args();
+        if !program.is_empty() {
+            envs.entry("SHELL".to_string()).or_insert(program);
+        }
+        envs
+    };
     #[cfg(not(target_env = "ohos"))]
     let mut envs = {
         let (shell, args) = shell.program_and_args();
