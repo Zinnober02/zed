@@ -62,16 +62,30 @@ pub fn root_dir() -> Option<String> {
 /// The host bridge ends up in the JavaScript VM, which may only be entered from
 /// the thread it was created on, so filesystem work running on a background
 /// executor has to be marshalled back here.
-static UI_TASKS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
+static UI_TASKS: Mutex<std::collections::VecDeque<Box<dyn FnOnce() + Send>>> =
+    Mutex::new(std::collections::VecDeque::new());
 
 /// Run every closure queued by run_on_ui. Called from the UI thread.
-pub(crate) fn drain_ui_tasks() {
-    let tasks = {
-        let mut tasks = UI_TASKS.lock().unwrap();
-        std::mem::take(&mut *tasks)
-    };
-    for task in tasks {
-        task();
+/// Run the tasks the filesystem bridge queued, for at most `budget`.
+///
+/// These tasks call into the host and some of them read whole files, so one of
+/// them can easily outlast a frame; whatever the budget does not cover stays
+/// queued and runs on the next frame instead of holding the display back for
+/// several periods.
+pub(crate) fn drain_ui_tasks(budget: std::time::Duration) {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        let task = {
+            let mut tasks = UI_TASKS.lock().unwrap();
+            tasks.pop_front()
+        };
+        match task {
+            Some(task) => task(),
+            None => return,
+        }
     }
 }
 
@@ -82,7 +96,7 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let (sender, receiver) = oneshot::channel();
-    UI_TASKS.lock().unwrap().push(Box::new(move || {
+    UI_TASKS.lock().unwrap().push_back(Box::new(move || {
         let _ = sender.send(f());
     }));
     receiver.map(|result| result.expect("the UI thread dropped a host task"))

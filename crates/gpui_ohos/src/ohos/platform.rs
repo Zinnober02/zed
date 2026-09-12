@@ -434,8 +434,9 @@ impl OhosPlatform {
     /// then draw.
     pub(crate) fn tick(&self) {
         // Filesystem work hops here to reach the host bridge, which may only be
-        // called from this thread.
-        super::drain_ui_tasks();
+        // called from this thread. The budget keeps one slow read from costing
+        // several frames.
+        super::drain_ui_tasks(std::time::Duration::from_millis(2));
         // Asking for the previous folder while the app is still creating its
         // startup window opens the workspace in a second window and leaves an
         // empty one on top, so wait until a window has actually drawn.
