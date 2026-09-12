@@ -152,6 +152,7 @@ impl OhosPlatform {
                 // same update ("RefCell already borrowed"). Queue it for the frame
                 // loop instead, which runs outside any update.
                 let (id, value) = split_window_event(arg);
+                super::note_focus(id, value != "0");
                 *self.pending_focus.borrow_mut() = Some((id.to_string(), value != "0"));
             }
             host::event::WINDOW_STATUS => {
@@ -947,7 +948,9 @@ impl Platform for OhosPlatform {
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
-        host::window_op(host::op::SET_CURSOR, cursor_style_name(style));
+        // Cursor updates follow the mouse, so logging each one would drown the
+        // log the same way a frame request would.
+        host::window_op_quiet(host::op::SET_CURSOR, cursor_style_name(style));
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {

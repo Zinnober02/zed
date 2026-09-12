@@ -25,6 +25,8 @@ pub(crate) mod op {
     pub const PICK_PATHS: i32 = 12;
     pub const PICK_NEW_PATH: i32 = 13;
     pub const REQUEST_FOCUS: i32 = 15;
+    /// Ask the host to draw a frame now rather than at the next refresh.
+    pub const REQUEST_FRAME: i32 = 17;
     /// Create another OHOS window with an XComponent named by the argument.
     pub const CREATE_WINDOW: i32 = 16;
 }
@@ -88,17 +90,33 @@ pub(crate) fn window_op_for(id: &str, op: i32, arg: &str) {
 
 /// Send a command to the host. Silently no-ops when the host is absent.
 pub(crate) fn window_op(op: i32, arg: &str) {
+    super::vk::log(&format!("[gpui_ohos] host op {op}: {arg}"));
+    send(op, arg);
+}
+
+/// Send a command that fires often enough that logging it would drown the log.
+pub(crate) fn window_op_quiet(op: i32, arg: &str) {
+    send(op, arg);
+}
+
+fn send(op: i32, arg: &str) {
     let Some(ops) = OPS.get() else {
         return;
     };
     let Some(call) = ops.window_op else {
         return;
     };
-    super::vk::log(&format!("[gpui_ohos] host op {op}: {arg}"));
     let Ok(arg) = CString::new(arg) else {
         return;
     };
     unsafe { call(op, arg.as_ptr()) };
+}
+
+/// Ask for a frame now. gpui calls this as soon as anything changes, and the
+/// host answers by running a frame immediately instead of waiting for the next
+/// refresh, which is what keeps a keystroke from landing a period late.
+pub(crate) fn request_frame() {
+    window_op_quiet(op::REQUEST_FRAME, "");
 }
 
 /// Ask the host a question, returning its UTF-8 answer.

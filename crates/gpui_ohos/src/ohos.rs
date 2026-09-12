@@ -413,13 +413,13 @@ fn logical(value: f32) -> crate::Pixels {
 pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
     // Clicking the surface must give the XComponent ArkUI focus, otherwise its
     // onKeyEvent never fires and non-text keys (arrows) are dropped. The request
-    // has to name the surface, or focus lands on the main window instead.
-    host::window_op_for(id, host::op::REQUEST_FOCUS, "");
-    vk::log(&format!(
-        "[gpui_ohos] pointer down vp=({x:.1},{y:.1}) logical=({:.1},{:.1})",
-        logical(x).as_f32(),
-        logical(y).as_f32()
-    ));
+    // has to name the surface, or focus lands on the main window instead. A
+    // surface that already holds focus needs no request, and skipping it keeps
+    // the common case free of a synchronous call into JS.
+    let needs_focus = FOCUSED_SURFACE.with(|cell| cell.borrow().as_deref() != Some(id));
+    if needs_focus {
+        host::window_op_for(id, host::op::REQUEST_FOCUS, "");
+    }
     with_current(|platform| {
         for window in platform.route_targets(id) {
             let position = crate::point(logical(x), logical(y));
@@ -432,7 +432,6 @@ pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
 }
 
 pub fn pointer_up(id: &str, x: f32, y: f32, button: u32) {
-    vk::log(&format!("[gpui_ohos] pointer up ({x:.1},{y:.1})"));
     with_current(|platform| {
         for window in platform.route_targets(id) {
             window.pointer_up(map_button(button), crate::point(logical(x), logical(y)));
@@ -462,6 +461,25 @@ pub fn scroll(id: &str, x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) 
                 crate::point(crate::px(delta_x), crate::px(delta_y)),
                 phase,
             );
+        }
+    });
+}
+
+thread_local! {
+    /// The surface ArkUI currently focuses. Only a different one needs a focus
+    /// request; the host reports every change, so this cannot go stale.
+    static FOCUSED_SURFACE: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Record a focus change reported by the host.
+pub(crate) fn note_focus(id: &str, focused: bool) {
+    FOCUSED_SURFACE.with(|cell| {
+        let mut current = cell.borrow_mut();
+        if focused {
+            *current = Some(id.to_string());
+        } else if current.as_deref() == Some(id) {
+            *current = None;
         }
     });
 }

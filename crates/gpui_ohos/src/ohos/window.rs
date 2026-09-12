@@ -649,6 +649,18 @@ impl PlatformWindow for OhosWindow {
         self.shared.callbacks.borrow_mut().request_frame = Some(callback);
     }
 
+    /// gpui tells the platform that it wants a frame drawn. The host draws on
+    /// every refresh anyway, so this only has to bring the next frame forward
+    /// for changes that arrive between refreshes, such as background work
+    /// finishing.
+    fn schedule_frame(&self) {
+        super::host::request_frame();
+    }
+
+    fn frame_waker(&self) -> Option<std::rc::Rc<dyn Fn()>> {
+        Some(std::rc::Rc::new(super::host::request_frame))
+    }
+
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
         self.shared.callbacks.borrow_mut().input = Some(callback);
     }
