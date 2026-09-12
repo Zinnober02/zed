@@ -24,7 +24,7 @@ use libc::{F_GETFD, F_SETFD, FD_CLOEXEC};
 use libc::{FIOCLEX, FIONCLEX};
 use libc::{FIONBIO, ioctl};
 use libc::{SO_ERROR, SOL_SOCKET, c_void, getsockopt};
-#[cfg_attr(target_env = "musl", allow(deprecated))]
+#[cfg_attr(any(target_env = "musl", target_env = "ohos"), allow(deprecated))]
 use libc::{SO_RCVTIMEO, SO_SNDTIMEO, setsockopt, time_t, timeval};
 #[cfg(not(any(target_vendor = "apple", target_os = "haiku")))]
 use libc::{SOCK_CLOEXEC, SOCK_NONBLOCK};
@@ -160,7 +160,7 @@ pub fn set_timeout(
             // tv_sec is time_t on all unices supported by libc.
             // (there is no polymorphic way to get the max value of a signed type.)
             // TODO change to ::MAX after MSRV is bumped to 1.43.
-            #[cfg_attr(target_env = "musl", allow(deprecated))]
+            #[cfg_attr(any(target_env = "musl", target_env = "ohos"), allow(deprecated))]
             Err(_) => time_t::max_value() as _,
         };
         time.tv_usec = duration.subsec_micros() as _;

@@ -366,7 +366,7 @@ impl<'a> FdSlice<'a> {
     }
 
     /// Returns an iterator over the elements of this [`FdSlice`]
-    pub fn iter(&self) -> FdSliceIterator {
+    pub fn iter(&self) -> FdSliceIterator<'_> {
         (&self).into_iter()
     }
 }

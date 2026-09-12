@@ -348,19 +348,6 @@ struct VkClearRect {
     layer_count: u32,
 }
 
-type PFN_vkCmdClearAttachments =
-    unsafe extern "C" fn(*mut c_void, u32, *const VkClearAttachment, u32, *const VkClearRect);
-
-/// A solid rectangle painted over the base clear color, in surface pixels.
-#[derive(Clone, Copy)]
-pub struct ClearRect {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-    pub color: [f32; 4],
-}
-
 #[repr(C)]
 struct VkRect2D {
     offset: [i32; 2],
@@ -528,7 +515,6 @@ struct DeviceFns {
     begin_command_buffer: PFN_vkBeginCommandBuffer,
     begin_render_pass: PFN_vkBeginRenderPass,
     cmd_end_render_pass: PFN_vkCmdEndRenderPass,
-    cmd_clear_attachments: PFN_vkCmdClearAttachments,
     end_command_buffer: PFN_vkEndCommandBuffer,
     queue_submit: PFN_vkQueueSubmit,
     queue_present: PFN_vkQueuePresentKHR,
@@ -801,12 +787,6 @@ impl VkRenderer {
             ),
             begin_render_pass: load!(gpd, device, "vkCmdBeginRenderPass", PFN_vkBeginRenderPass),
             cmd_end_render_pass: load!(gpd, device, "vkCmdEndRenderPass", PFN_vkCmdEndRenderPass),
-            cmd_clear_attachments: load!(
-                gpd,
-                device,
-                "vkCmdClearAttachments",
-                PFN_vkCmdClearAttachments
-            ),
             end_command_buffer: load!(gpd, device, "vkEndCommandBuffer", PFN_vkEndCommandBuffer),
             queue_submit: load!(gpd, device, "vkQueueSubmit", PFN_vkQueueSubmit),
             queue_present: load!(gpd, device, "vkQueuePresentKHR", PFN_vkQueuePresentKHR),

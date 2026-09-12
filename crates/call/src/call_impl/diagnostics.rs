@@ -235,7 +235,9 @@ impl Serialize for ConnectionQualityDTO {
     }
 }
 
-#[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
+// The fields are populated when a track is described but nothing reads them
+// back on any platform, so the struct is kept for its constructor's checks.
+#[allow(dead_code)]
 struct TrackContext {
     participant_id: String,
     participant_name: String,
@@ -250,7 +252,8 @@ struct PollResult {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
+// Same as TrackContext: filled in from the statistics but never read back.
+#[allow(dead_code)]
 struct InboundCounters {
     packets_received: u64,
     packets_lost: i64,

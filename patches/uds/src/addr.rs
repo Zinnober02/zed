@@ -484,7 +484,7 @@ impl UnixSocketAddr {
     ///     );
     /// }
     /// ```
-    pub fn name(&self) -> AddrName {
+    pub fn name(&self) -> AddrName<'_> {
         AddrName::from(self)
     }
 
@@ -529,7 +529,7 @@ impl UnixSocketAddr {
     /// assert_eq!(addr.as_ref(), UnixSocketAddrRef::Unnamed);
     /// # std::fs::remove_file("dgram.socket").expect("clean up socket file");
     /// ```
-    pub fn as_ref(&self) -> UnixSocketAddrRef {
+    pub fn as_ref(&self) -> UnixSocketAddrRef<'_> {
         UnixSocketAddrRef::from(self)
     }
 
