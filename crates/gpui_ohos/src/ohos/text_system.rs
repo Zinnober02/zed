@@ -256,6 +256,25 @@ impl OhosTextSystemState {
             db.load_system_fonts();
         }
 
+        // One line that says whether the font picker can offer anything: how many
+        // faces and families came back, whether the system directory was even
+        // visible, and what the first families are called.
+        {
+            let mut families: Vec<String> = db
+                .faces()
+                .filter_map(|face| face.families.first().map(|family| family.0.clone()))
+                .collect();
+            families.sort();
+            families.dedup();
+            let sample: Vec<&str> = families.iter().take(20).map(String::as_str).collect();
+            super::vk::log(&format!(
+                "[gpui_ohos] fonts faces={} families={} system_fonts_readable={} sample={sample:?}",
+                db.faces().count(),
+                families.len(),
+                Path::new("/system/fonts").is_dir(),
+            ));
+        }
+
         self.system_fonts_loaded = true;
         if db.faces().next().is_none() {
             warn!(

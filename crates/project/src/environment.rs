@@ -339,14 +339,23 @@ async fn load_directory_shell_environment(
             .into()
     };
 
-    let (shell, args) = shell.program_and_args();
-    let mut envs = util::shell_env::capture(shell.clone(), args, abs_path)
-        .await
-        .with_context(|| {
-            tx.unbounded_send("Failed to load environment variables".into())
-                .ok();
-            format!("capturing shell environment with {shell:?}")
-        })?;
+    // OHOS runs the editor as a library inside the ability process, so there is
+    // no login shell to ask and no "zed --printenv" to run; the environment the
+    // process already has is the whole answer, and asking a shell for it only
+    // ever produced "Failed to load environment variables" in the status bar.
+    #[cfg(target_env = "ohos")]
+    let mut envs: collections::HashMap<String, String> = std::env::vars().collect();
+    #[cfg(not(target_env = "ohos"))]
+    let mut envs = {
+        let (shell, args) = shell.program_and_args();
+        util::shell_env::capture(shell.clone(), args, abs_path)
+            .await
+            .with_context(|| {
+                tx.unbounded_send("Failed to load environment variables".into())
+                    .ok();
+                format!("capturing shell environment with {shell:?}")
+            })?
+    };
 
     if cfg!(target_os = "windows")
         && let Some(path) = envs.remove("Path")
