@@ -678,7 +678,16 @@ fn cursor_style_name(style: CursorStyle) -> &'static str {
 /// location in the UI.
 fn picked_handle(line: &str) -> PathBuf {
     if let Some(rest) = line.strip_prefix("f|") {
-        if let Some((fd, _name)) = rest.split_once('|') {
+        let mut parts = rest.split('|');
+        let fd = parts.next().unwrap_or_default();
+        let _name = parts.next();
+        // The host sends the sandbox path after the name, because a path of the
+        // form "fd:8" is relative as far as the editor is concerned and it
+        // refuses to trust a project containing one.
+        if let Some(path) = parts.next().filter(|path| path.starts_with('/')) {
+            return PathBuf::from(path);
+        }
+        if !fd.is_empty() {
             return PathBuf::from(format!("fd:{fd}"));
         }
     }
