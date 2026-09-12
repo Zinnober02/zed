@@ -15662,7 +15662,6 @@ checksum = "fa84884e45ed4a1e663120cef3fc11f14d1a2a1933776e1c31599f7bd2dd0c9e"
 dependencies = [
  "async-dispatcher",
  "async-std",
- "aws-lc-rs",
  "base64 0.22.1",
  "bytes 1.11.1",
  "chrono",
@@ -15671,6 +15670,7 @@ dependencies = [
  "futures 0.3.32",
  "glob",
  "jupyter-protocol",
+ "ring",
  "serde",
  "serde_json",
  "shellexpand",
