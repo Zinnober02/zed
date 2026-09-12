@@ -526,23 +526,16 @@ fn update_modifiers(code: i32, down: bool) -> crate::Modifiers {
 /// Keys GPUI must see before the input method: modifiers, navigation and any
 /// shortcut combination. Everything else is text and goes to the input method.
 fn is_gpui_key(code: i32, modifiers: crate::Modifiers) -> bool {
+    // Only shortcuts are taken before the input method. Navigation and editing
+    // keys are left to it as well, because it needs them while it composes:
+    // backspace edits the pinyin, the arrows pick a candidate, escape cancels
+    // and enter accepts. Whatever it does not consume comes back through the
+    // post input method callback, so the editor still sees every key.
     is_modifier_key(code)
         || modifiers.control
         || modifiers.alt
         || modifiers.platform
-        || matches!(
-            code,
-            2012 | 2013 | 2014 | 2015 // arrows
-                | 2049 // tab
-                | 2054 // enter
-                | 2055 // backspace
-                | 2068 | 2069 // page up / down
-                | 2070 // escape
-                | 2071 // delete
-                | 2081 | 2082 // home / end
-                | 2083 // insert
-                | 2090..=2101 // function keys
-        )
+        || matches!(code, 2090..=2101) // function keys
 }
 
 /// Pre-IME key event. Returns true to consume it so the input method never
