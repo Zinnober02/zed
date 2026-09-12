@@ -8,10 +8,12 @@ static TLS_CONFIG: OnceLock<rustls::ClientConfig> = OnceLock::new();
 pub fn tls_config() -> ClientConfig {
     TLS_CONFIG
         .get_or_init(|| {
-            // rustls uses the `aws_lc_rs` provider by default
-            // This only errors if the default provider has already
-            // been installed. We can ignore this `Result`.
-            rustls::crypto::aws_lc_rs::default_provider()
+            // aws-lc aborts inside its AES key schedule on OHOS, where its own
+            // CI has never run it, so the ring provider is chosen instead. Both
+            // are compiled in through other dependencies, which is why the
+            // provider has to be explicit; installing only fails when another
+            // provider is already in place, and that is ignored.
+            rustls::crypto::ring::default_provider()
                 .install_default()
                 .ok();
 
