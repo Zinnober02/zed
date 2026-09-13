@@ -233,6 +233,75 @@ fn strip_region_suffix(name: &str) -> &str {
     }
     name
 }
+/// Load the fonts the user installed through the system.
+///
+/// Those live outside every directory the scan above can read, so the drawing
+/// library is the only thing that knows their paths. Everything here is best
+/// effort: the symbol is newer than some devices and the library may be absent,
+/// so a missing symbol means "no extra fonts", never a failure to start.
+fn load_installed_fonts(db: &mut cosmic_text::fontdb::Database) -> usize {
+    #[repr(C)]
+    struct DrawingString {
+        data: *mut u8,
+        length: u32,
+    }
+
+    const INSTALLED: i32 = 1 << 3;
+    const RTLD_NOW: std::os::raw::c_int = 2;
+
+    unsafe extern "C" {
+        fn dlopen(
+            filename: *const std::os::raw::c_char,
+            flags: std::os::raw::c_int,
+        ) -> *mut std::os::raw::c_void;
+        fn dlsym(
+            handle: *mut std::os::raw::c_void,
+            symbol: *const std::os::raw::c_char,
+        ) -> *mut std::os::raw::c_void;
+    }
+
+    type GetFontPaths = unsafe extern "C" fn(i32, *mut usize) -> *mut DrawingString;
+
+    let mut loaded = 0;
+    unsafe {
+        let library = dlopen(c"libnative_drawing.so".as_ptr(), RTLD_NOW);
+        if library.is_null() {
+            return 0;
+        }
+        let symbol = dlsym(library, c"OH_Drawing_GetFontPathsByType".as_ptr());
+        if symbol.is_null() {
+            return 0;
+        }
+        let get_paths: GetFontPaths = std::mem::transmute(symbol);
+        let mut count = 0usize;
+        let paths = get_paths(INSTALLED, &mut count);
+        if paths.is_null() {
+            return 0;
+        }
+        for index in 0..count {
+            let entry = &*paths.add(index);
+            if entry.data.is_null() || entry.length == 0 {
+                continue;
+            }
+            let bytes = std::slice::from_raw_parts(entry.data, entry.length as usize);
+            // Paths come back as a byte string; a UTF-16 buffer would show up as
+            // interleaved NULs, which no real path contains.
+            let path = if bytes.len() > 1 && bytes[1] == 0 {
+                let units: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+                String::from_utf16_lossy(&units)
+            } else {
+                String::from_utf8_lossy(bytes).into_owned()
+            };
+            if !path.is_empty() && db.load_font_file(std::path::Path::new(&path)).is_ok() {
+                loaded += 1;
+            }
+        }
+    }
+    loaded
+}
 impl OhosTextSystemState {
     /// Fold a family name down to what actually identifies it.
     ///
@@ -273,7 +342,16 @@ impl OhosTextSystemState {
             }
         }
 
+        // Fonts the user installed are not in any of those directories, so ask
+        // the drawing library for them before falling back to fontdb's defaults.
+        let installed = load_installed_fonts(db);
+
         let final_count = db.faces().count();
+        if installed > 0 {
+            super::vk::log(&format!(
+                "[gpui_ohos] fonts loaded {installed} user-installed files"
+            ));
+        }
         if final_count == initial_count {
             db.load_system_fonts();
         }
