@@ -527,6 +527,23 @@ pub(crate) struct OhosWindow {
     shared: Rc<WindowShared>,
 }
 
+/// Whether closing a window from the application also closes the platform window.
+///
+/// Off for now: removing a window only clears the application's own bookkeeping,
+/// and the host's only way to close one - the ArkTS call that destroys it - was
+/// measured to leave a black window behind rather than removing it, which is
+/// worse than doing nothing. Turn this on once the host has a call that really
+/// closes a window.
+const CLOSE_WINDOW_WITH_APP: bool = false;
+
+impl Drop for OhosWindow {
+    fn drop(&mut self) {
+        if CLOSE_WINDOW_WITH_APP {
+            host::window_op_for(self.shared.id(), host::op::CLOSE_WINDOW, "");
+        }
+    }
+}
+
 impl OhosWindow {
     pub(crate) fn new(shared: Rc<WindowShared>) -> Self {
         Self { shared }

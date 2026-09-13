@@ -31,6 +31,8 @@ pub(crate) mod op {
     pub const CREATE_WINDOW: i32 = 16;
     /// Which way round the theme is: the host draws the window buttons for it.
     pub const SET_APPEARANCE: i32 = 18;
+    /// Close the window this id names, because the application is done with it.
+    pub const CLOSE_WINDOW: i32 = 19;
 }
 
 /// Synchronous queries. The host writes a UTF-8 answer into the buffer.
