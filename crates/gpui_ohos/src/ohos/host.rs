@@ -120,11 +120,24 @@ pub(crate) fn request_frame() {
 }
 
 /// Ask the host a question, returning its UTF-8 answer.
-pub(crate) fn query(op: i32, arg: &str) -> Option<String> {
-    let ops = OPS.get()?;
-    let call = ops.query?;
-    let arg = CString::new(arg).ok()?;
-    let mut buffer = vec![0u8; 4096];
+///
+/// The answer is asked for in two steps - size first, then bytes - because the
+/// host truncates at whatever buffer it is handed, and a fixed buffer silently
+/// cut directory listings in half. Asking twice is free: the host caches the
+/// answer so the second step does not repeat the work it did for the first.
+pub(crate) fn query(op: i32, arg: &str) -> anyhow::Result<String> {
+    let ops = OPS
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("host ops are not installed"))?;
+    let call = ops
+        .query
+        .ok_or_else(|| anyhow::anyhow!("the host does not answer queries"))?;
+    let arg = CString::new(arg).map_err(|_| anyhow::anyhow!("query argument contains a NUL"))?;
+    let needed = unsafe { call(op, arg.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        anyhow::bail!("host query {op} failed while sizing its answer: {needed}");
+    }
+    let mut buffer = vec![0u8; needed as usize];
     let written = unsafe {
         call(
             op,
@@ -134,13 +147,15 @@ pub(crate) fn query(op: i32, arg: &str) -> Option<String> {
         )
     };
     if written < 0 {
-        return None;
+        anyhow::bail!("host query {op} failed while copying its answer: {written}");
     }
-    buffer.truncate((written as usize).min(buffer.len()));
-    while buffer.last() == Some(&0) {
-        buffer.pop();
-    }
-    String::from_utf8(buffer).ok()
+    buffer.truncate(written as usize);
+    String::from_utf8(buffer).map_err(|error| {
+        anyhow::anyhow!(
+            "host query {op} answered with invalid UTF-8 at byte {}",
+            error.utf8_error().valid_up_to()
+        )
+    })
 }
 
 const SEEK_SET: i32 = 0;
@@ -231,15 +246,15 @@ pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
 
 /// Ask the host to open a picked file read/write, returning its descriptor.
 pub(crate) fn open_file(uri: &str) -> Option<i32> {
-    query(query::OPEN_FILE, uri)?.trim().parse().ok()
+    query(query::OPEN_FILE, uri).ok()?.trim().parse().ok()
 }
 
 /// Run a command whose answer is "0" on success.
 fn status(op: i32, arg: &str) -> std::io::Result<()> {
     match query(op, arg) {
-        Some(answer) if answer.trim() == "0" => Ok(()),
-        Some(answer) => Err(std::io::Error::other(answer.trim().to_string())),
-        None => Err(std::io::Error::other("the host did not answer")),
+        Ok(answer) if answer.trim() == "0" => Ok(()),
+        Ok(answer) => Err(std::io::Error::other(answer.trim().to_string())),
+        Err(error) => Err(std::io::Error::other(error.to_string())),
     }
 }
 
@@ -263,7 +278,7 @@ pub(crate) fn rename(from: &str, to: &str) -> std::io::Result<()> {
 
 /// The folder the host wants restored, if any.
 pub(crate) fn restore_folder() -> Option<String> {
-    let answer = query(query::RESTORE_FOLDER, "")?;
+    let answer = query(query::RESTORE_FOLDER, "").ok()?;
     if answer.is_empty() {
         return None;
     }
@@ -272,8 +287,14 @@ pub(crate) fn restore_folder() -> Option<String> {
 
 /// Ask the host to list a picked directory as (name, is_dir, uri).
 pub(crate) fn list_dir(uri: &str) -> Vec<(String, bool, String)> {
-    let Some(answer) = query(query::LIST_DIR, uri) else {
-        return Vec::new();
+    let answer = match query(query::LIST_DIR, uri) {
+        Ok(answer) => answer,
+        Err(error) => {
+            // An empty list and a failed query used to look identical to the
+            // caller, which turned a broken listing into an empty directory.
+            crate::log_line(&format!("list_dir failed: {error}"));
+            return Vec::new();
+        }
     };
     answer
         .lines()
