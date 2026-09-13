@@ -347,11 +347,11 @@ impl OhosTextSystemState {
         let installed = load_installed_fonts(db);
 
         let final_count = db.faces().count();
-        if installed > 0 {
-            super::vk::log(&format!(
-                "[gpui_ohos] fonts loaded {installed} user-installed files"
-            ));
-        }
+        // Always reported: "0" is what tells whether the library was missing,
+        // the symbol was missing, or the device simply has no installed fonts.
+        super::vk::log(&format!(
+            "[gpui_ohos] user-installed fonts loaded={installed}"
+        ));
         if final_count == initial_count {
             db.load_system_fonts();
         }
