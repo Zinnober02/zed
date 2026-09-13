@@ -2858,6 +2858,54 @@ impl VkRenderer {
         if self.sprites.is_none() {
             self.create_sprite_pipeline()?;
         }
+        // Clamp the incoming geometry to what this frame's ring slot holds, and
+        // do it before the fence is touched: returning after the fence was reset
+        // but before its submission would leave the next frame waiting on that
+        // fence for ever, freezing the UI thread.
+        let mut quads = quads;
+        let mut paths = paths;
+        let mut vertices = vertices;
+        let mut sprites = sprites;
+        let quad_stride =
+            self.quads.as_ref().expect("quad pipeline").vertex_size / FRAMES_IN_FLIGHT as u64;
+        let path_stride =
+            self.paths.as_ref().expect("path pipeline").vertex_size / FRAMES_IN_FLIGHT as u64;
+        let text_stride =
+            self.text.as_ref().expect("text pipeline").vertex_size / FRAMES_IN_FLIGHT as u64;
+        let sprite_stride =
+            self.sprites.as_ref().expect("sprite pipeline").vertex_size / FRAMES_IN_FLIGHT as u64;
+        let quad_max = quad_stride as usize / std::mem::size_of::<QuadVertex>();
+        let path_max = path_stride as usize / std::mem::size_of::<PathVertex>();
+        let text_max = text_stride as usize / std::mem::size_of::<GlyphVertex>();
+        let sprite_max = sprite_stride as usize / std::mem::size_of::<GlyphVertex>();
+        if quads.len() > quad_max {
+            super::vk::log(&format!(
+                "[gpui_ohos] quad overflow: {} vertices, buffer holds {quad_max}",
+                quads.len()
+            ));
+            quads = &quads[..quad_max];
+        }
+        if paths.len() > path_max {
+            super::vk::log(&format!(
+                "[gpui_ohos] path overflow: {} vertices, buffer holds {path_max}",
+                paths.len()
+            ));
+            paths = &paths[..path_max];
+        }
+        if vertices.len() > text_max {
+            super::vk::log(&format!(
+                "[gpui_ohos] glyph overflow: {} vertices, buffer holds {text_max}",
+                vertices.len()
+            ));
+            vertices = &vertices[..text_max];
+        }
+        if sprites.len() > sprite_max {
+            super::vk::log(&format!(
+                "[gpui_ohos] sprite overflow: {} vertices, buffer holds {sprite_max}",
+                sprites.len()
+            ));
+            sprites = &sprites[..sprite_max];
+        }
         let copy_image: PFN_vkCmdCopyBufferToImage =
             dev_fn!(self, "vkCmdCopyBufferToImage", PFN_vkCmdCopyBufferToImage);
         let pipeline_barrier: PFN_vkCmdPipelineBarrier =
@@ -2897,9 +2945,10 @@ impl VkRenderer {
             let quad_pipeline = self.quads.as_ref().expect("quad pipeline");
             let quad_bytes = std::mem::size_of_val(quads);
             let stride = quad_pipeline.vertex_size / FRAMES_IN_FLIGHT as u64;
-            if quad_bytes as u64 > stride {
-                anyhow::bail!("quad vertex buffer too small");
-            }
+            // On overflow draw as much as fits: bailing here would return with
+            // this slot's fence reset but never submitted, and the next frame
+            // would wait on it for ever, freezing the UI thread.
+
             if !quads.is_empty() {
                 unsafe {
                     let dst = (quad_pipeline.vertex_mapped as *mut u8)
@@ -2912,9 +2961,7 @@ impl VkRenderer {
             let path_pipeline = self.paths.as_ref().expect("path pipeline");
             let path_bytes = std::mem::size_of_val(paths);
             let stride = path_pipeline.vertex_size / FRAMES_IN_FLIGHT as u64;
-            if path_bytes as u64 > stride {
-                anyhow::bail!("path vertex buffer too small");
-            }
+
             if !paths.is_empty() {
                 unsafe {
                     let dst = (path_pipeline.vertex_mapped as *mut u8)
@@ -2927,9 +2974,7 @@ impl VkRenderer {
         {
             let text = self.text.as_ref().expect("text pipeline");
             let stride = text.vertex_size / FRAMES_IN_FLIGHT as u64;
-            if vertex_bytes as u64 > stride {
-                anyhow::bail!("glyph vertex buffer too small");
-            }
+
             if !vertices.is_empty() {
                 unsafe {
                     let dst = (text.vertex_mapped as *mut u8).add(frame as usize * stride as usize);
@@ -2945,9 +2990,7 @@ impl VkRenderer {
         {
             let pipeline = self.sprites.as_ref().expect("sprite pipeline");
             let stride = pipeline.vertex_size / FRAMES_IN_FLIGHT as u64;
-            if sprite_bytes as u64 > stride {
-                anyhow::bail!("sprite vertex buffer too small");
-            }
+
             if !sprites.is_empty() {
                 unsafe {
                     let dst =

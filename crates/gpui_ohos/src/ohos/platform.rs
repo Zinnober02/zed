@@ -342,6 +342,11 @@ impl OhosPlatform {
     fn surface_for_window(&self, params: &WindowParams) -> (String, Rc<RefCell<SurfaceState>>) {
         let index = self.windows_opened.get();
         self.windows_opened.set(index + 1);
+        super::vk::log(&format!(
+            "[gpui_ohos] window request index={index} surfaces={} reopened={}",
+            self.surfaces.borrow().len(),
+            index < self.surfaces.borrow().len()
+        ));
         let mut surfaces = self.surfaces.borrow_mut();
         let (width, height) = surfaces
             .first()
