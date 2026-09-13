@@ -97,6 +97,16 @@ impl OhosAtlas {
         (texture.width, texture.height)
     }
 
+    /// Whether any dirty region is still waiting to be uploaded.
+    ///
+    /// Separate from `take_uploads` because the window asks this before deciding
+    /// that an unchanged scene can be skipped: when a decoded image reuses an
+    /// existing tile the scene stays byte-identical while its pixels change, and
+    /// the dirty flag is the only signal that a redraw is needed.
+    pub(crate) fn has_pending_uploads(&self) -> bool {
+        !self.state.borrow().dirty.is_empty()
+    }
+
     /// Drain dirty regions, cloning their pixel data for upload.
     pub(crate) fn take_uploads(&self) -> Vec<AtlasUpload> {
         let mut state = self.state.borrow_mut();

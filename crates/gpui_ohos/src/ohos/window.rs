@@ -401,7 +401,10 @@ impl WindowShared {
         let hash_started = std::time::Instant::now();
         let benchmark = take_benchmark_frame();
         let hash = if benchmark { 0 } else { scene_hash(scene) };
-        if !benchmark && self.last_scene_hash.get() == Some(hash) {
+        if !benchmark
+            && self.last_scene_hash.get() == Some(hash)
+            && !self.atlas.has_pending_uploads()
+        {
             return;
         }
         let frame = self.frame_count.get() + 1;
