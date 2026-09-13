@@ -165,6 +165,14 @@ impl PlatformAtlas for OhosAtlas {
         let Some(alloc) =
             state.allocators[kind_idx].allocate(size2(glyph_size.width.0, glyph_size.height.0))
         else {
+            // A quiet `None` from here is indistinguishable from "nothing to draw",
+            // and the glyph simply stops appearing with no trace of why.
+            crate::log_line(&format!(
+                "atlas has no room left for {:?}: a {}x{} glyph was dropped",
+                key.texture_kind(),
+                glyph_size.width.0,
+                glyph_size.height.0
+            ));
             return Ok(None);
         };
         let rect = alloc.rectangle;
@@ -177,12 +185,26 @@ impl PlatformAtlas for OhosAtlas {
         let texture = &mut state.textures[kind_idx];
         let dst_stride = texture.width as usize * bpp;
         let src_stride = glyph_size.width.0 as usize * bpp;
+        let mut skipped_rows = 0usize;
         for row in 0..glyph_size.height.0 as usize {
             let dst = (rect.min.y as usize + row) * dst_stride + rect.min.x as usize * bpp;
             let src = row * src_stride;
             if src + src_stride <= bytes.len() && dst + src_stride <= texture.cpu.len() {
                 texture.cpu[dst..dst + src_stride].copy_from_slice(&bytes[src..src + src_stride]);
+            } else {
+                skipped_rows += 1;
             }
+        }
+        if skipped_rows > 0 {
+            // The glyph's data and the size it was stored with disagree; skipping
+            // the rows silently leaves a half-drawn glyph and no explanation.
+            crate::log_line(&format!(
+                "atlas stored only {} of {} rows for a {}x{} glyph",
+                glyph_size.height.0 as usize - skipped_rows,
+                glyph_size.height.0,
+                glyph_size.width.0,
+                glyph_size.height.0
+            ));
         }
         state.dirty.push((kind, bounds));
 
