@@ -287,6 +287,11 @@ pub fn open_picked_file_async(uri: String) -> BoxFuture<'static, Option<i32>> {
     Box::pin(run_on_ui(move || host::open_file(&uri)))
 }
 
+/// Release a descriptor opened for a single picked-file operation.
+pub fn close_picked_file(fd: i32) {
+    host::close_fd(fd);
+}
+
 /// Read a picked file's bytes, on the UI thread.
 pub fn read_picked_file_bytes_async(fd: i32) -> BoxFuture<'static, std::io::Result<Vec<u8>>> {
     Box::pin(run_on_ui(move || host::read_fd_bytes(fd)))

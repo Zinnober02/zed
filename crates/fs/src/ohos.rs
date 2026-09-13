@@ -50,6 +50,8 @@ pub struct OhosFsBridge {
     pub open_file: fn(String) -> BoxFuture<'static, Option<i32>>,
     pub read_fd: fn(i32) -> BoxFuture<'static, io::Result<Vec<u8>>>,
     pub write_fd: fn(i32, Vec<u8>) -> BoxFuture<'static, io::Result<()>>,
+    /// Release a descriptor opened for one operation, success or failure alike.
+    pub close_fd: fn(i32),
     /// Create a directory under a picked root.
     pub create_dir: fn(String) -> BoxFuture<'static, io::Result<()>>,
     /// Remove a file or, when the flag is set, a directory.
@@ -187,7 +189,9 @@ impl OhosFs {
         let fd = (bridge()?.open_file)(uri.clone())
             .await
             .ok_or_else(|| anyhow!("could not open {uri}"))?;
-        Ok((bridge()?.read_fd)(fd).await?)
+        let bytes = (bridge()?.read_fd)(fd).await;
+        (bridge()?.close_fd)(fd);
+        Ok(bytes?)
     }
 
     async fn write_picked(&self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -200,7 +204,9 @@ impl OhosFs {
         let fd = (bridge()?.open_file)(uri.clone())
             .await
             .ok_or_else(|| anyhow!("could not open {uri}"))?;
-        Ok((bridge()?.write_fd)(fd, bytes.to_vec()).await?)
+        let written = (bridge()?.write_fd)(fd, bytes.to_vec()).await;
+        (bridge()?.close_fd)(fd);
+        Ok(written?)
     }
 }
 

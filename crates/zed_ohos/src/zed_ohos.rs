@@ -52,6 +52,7 @@ fn install_filesystem_bridge() {
         list_dir: gpui_ohos::list_picked_dir_async,
         open_file: gpui_ohos::open_picked_file_async,
         read_fd: gpui_ohos::read_picked_file_bytes_async,
+        close_fd: gpui_ohos::close_picked_file,
         write_fd: gpui_ohos::write_picked_file_bytes_async,
         create_dir: gpui_ohos::create_picked_dir_async,
         remove: gpui_ohos::remove_picked_path_async,

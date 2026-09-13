@@ -146,6 +146,7 @@ pub(crate) fn query(op: i32, arg: &str) -> Option<String> {
 const SEEK_SET: i32 = 0;
 
 unsafe extern "C" {
+    fn close(fd: i32) -> i32;
     fn read(fd: i32, buffer: *mut c_void, count: usize) -> isize;
     fn write(fd: i32, buffer: *const c_void, count: usize) -> isize;
     fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
@@ -177,6 +178,20 @@ pub(crate) fn read_fd_bytes(fd: i32) -> std::io::Result<Vec<u8>> {
         out.len()
     ));
     Ok(out)
+}
+
+/// Release a descriptor the host opened for a single operation.
+///
+/// Nothing else closes these: leaking one per read or write exhausts the
+/// process descriptor table after a few hundred operations.
+pub(crate) fn close_fd(fd: i32) {
+    let closed = unsafe { close(fd) };
+    if closed != 0 {
+        crate::log_line(&format!(
+            "close_fd {fd} failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
 }
 
 /// Read a picked public file as UTF-8 text.
