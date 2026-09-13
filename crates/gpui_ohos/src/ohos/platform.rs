@@ -460,10 +460,15 @@ impl OhosPlatform {
         if HOOK_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 30 {
             super::install_panic_hook();
         }
-        self.apply_pending_focus();
+        // Focus changes reach gpui through a callback that updates the window,
+        // and gpui's own appearance callback documents that this must not happen
+        // while it still holds the app borrow: doing it here, between the frame
+        // requests, produced "RefCell already borrowed" on every window
+        // activation. Applying it after the frames leaves gpui idle.
         let frame_started = std::time::Instant::now();
         self.dispatcher.run_due_timers();
         self.request_frames();
+        self.apply_pending_focus();
         // The benchmark measures how fast frames can be produced, not how often
         // the display asks for one, so keep drawing until its budget runs out.
         // The cap keeps a frame that never consumes budget from hanging here.

@@ -1719,24 +1719,42 @@ impl Window {
         platform_window.on_active_status_change(Box::new({
             let mut cx = cx.to_async();
             move |active| {
-                handle
-                    .update(&mut cx, |_, window, cx| {
-                        window.active.set(active);
-                        window.modifiers = window.platform_window.modifiers();
-                        window.capslock = window.platform_window.capslock();
-                        window
-                            .activation_observers
-                            .clone()
-                            .retain(&(), |callback| callback(window, cx));
+                let apply = |handle: &mut AnyWindowHandle, cx: &mut crate::AsyncApp, active: bool| {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            window.active.set(active);
+                            window.modifiers = window.platform_window.modifiers();
+                            window.capslock = window.platform_window.capslock();
+                            window
+                                .activation_observers
+                                .clone()
+                                .retain(&(), |callback| callback(window, cx));
 
-                        window.bounds_changed(cx);
-                        #[cfg(target_env = "ohos")]
-                        window.update_virtual_keyboard_visibility(cx);
-                        window.refresh();
+                            window.bounds_changed(cx);
+                            #[cfg(target_env = "ohos")]
+                            window.update_virtual_keyboard_visibility(cx);
+                            window.refresh();
 
-                        SystemWindowTabController::update_last_active(cx, window.handle.id);
-                    })
-                    .log_err();
+                            SystemWindowTabController::update_last_active(cx, window.handle.id);
+                        })
+                        .log_err();
+                };
+                // OHOS reports activation from inside the frame loop, where the
+                // app is still borrowed, so this update has to be deferred for
+                // the same reason the appearance callback above is.
+                #[cfg(target_env = "ohos")]
+                {
+                    let mut cx = cx.clone();
+                    let mut handle = handle.clone();
+                    let executor = cx.foreground_executor().clone();
+                    executor
+                        .spawn(async move {
+                            apply(&mut handle, &mut cx, active);
+                        })
+                        .detach();
+                }
+                #[cfg(not(target_env = "ohos"))]
+                apply(&mut handle, &mut cx, active);
             }
         }));
         #[cfg(target_env = "ohos")]
