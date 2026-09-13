@@ -992,8 +992,13 @@ impl VkRenderer {
         if self.staging[frame].3 >= bytes {
             return Ok(());
         }
-        // Growth happens while the atlas is still filling up and is rare, so the
-        // previous buffer is left to the driver rather than tracked for reuse.
+        // The previous buffer is released before its slot is replaced: handing
+        // it to the driver and forgetting it leaked a buffer plus its memory on
+        // every growth.
+        let (mut old_buffer, mut old_memory, _mapped, _size) = self.staging[frame];
+        if old_buffer != 0 || old_memory != 0 {
+            self.release_buffer(&mut old_buffer, &mut old_memory);
+        }
         let (buffer, memory, mapped) = self.create_host_buffer(bytes, BUFFER_USAGE_TRANSFER_SRC)?;
         self.staging[frame] = (buffer, memory, mapped, bytes);
         Ok(())
