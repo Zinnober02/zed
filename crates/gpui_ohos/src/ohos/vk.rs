@@ -405,6 +405,14 @@ type PFN_vkDestroyRenderPass = unsafe extern "C" fn(*mut c_void, u64, *const c_v
 type PFN_vkDestroyCommandPool = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
 type PFN_vkDestroyFence = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
 type PFN_vkDestroySemaphore = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroyBuffer = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkFreeMemory = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroyImage = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroySampler = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroyPipeline = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroyPipelineLayout = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroyDescriptorPool = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroyDescriptorSetLayout = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
 type PFN_vkGetInstanceProcAddr = unsafe extern "C" fn(*mut c_void, *const c_char) -> *const c_void;
 type PFN_vkGetDeviceProcAddr = unsafe extern "C" fn(*mut c_void, *const c_char) -> *const c_void;
 type PFN_vkCreateInstance =
@@ -1303,6 +1311,33 @@ impl VkRenderer {
 }
 
 impl VkRenderer {
+    /// Fetch a device entry point without failing.
+    ///
+    /// Teardown runs even when the driver is already unhappy, so a symbol that
+    /// is not there skips that one step instead of aborting the whole release.
+    fn try_dev_proc<T: Copy>(&self, name: &str) -> Option<T> {
+        let pointer = self.dev_proc(name);
+        if pointer.is_null() {
+            return None;
+        }
+        Some(unsafe { std::mem::transmute_copy::<*const c_void, T>(&pointer) })
+    }
+
+    /// Release a buffer and the memory bound to it.
+    fn release_buffer(&self, buffer: &mut u64, memory: &mut u64) {
+        if *buffer != 0 {
+            if let Some(destroy) = self.try_dev_proc::<PFN_vkDestroyBuffer>("vkDestroyBuffer") {
+                unsafe { destroy(self.device, *buffer, std::ptr::null()) };
+            }
+            *buffer = 0;
+        }
+        if *memory != 0 {
+            if let Some(free) = self.try_dev_proc::<PFN_vkFreeMemory>("vkFreeMemory") {
+                unsafe { free(self.device, *memory, std::ptr::null()) };
+            }
+            *memory = 0;
+        }
+    }
     /// Releases everything this renderer created.
     ///
     /// The order is the one the specification requires: children before their
@@ -1313,6 +1348,23 @@ impl VkRenderer {
     fn destroy(&mut self) {
         if !self.device.is_null() {
             unsafe { (self.fns.wait_idle)(self.device) };
+            // Pipelines and their buffers before the device goes: they reference
+            // descriptor pools, views and memory that must not outlive them.
+            if let Some(mut pipeline) = self.text.take() {
+                pipeline.destroy(self);
+            }
+            if let Some(mut pipeline) = self.sprites.take() {
+                pipeline.destroy(self);
+            }
+            if let Some(mut pipeline) = self.quads.take() {
+                pipeline.destroy(self);
+            }
+            if let Some(mut pipeline) = self.paths.take() {
+                pipeline.destroy(self);
+            }
+            for (mut buffer, mut memory, _mapped, _size) in std::mem::take(&mut self.staging) {
+                self.release_buffer(&mut buffer, &mut memory);
+            }
             if self.command_pool != 0 {
                 let destroy: PFN_vkDestroyCommandPool =
                     unsafe { std::mem::transmute(self.dev_proc("vkDestroyCommandPool")) };
@@ -2093,6 +2145,127 @@ struct TextPipeline {
     atlas_extent: (u32, u32),
 }
 
+impl TextPipeline {
+    /// Releases what this pipeline owns, in the order the references require:
+    /// descriptor sets belong to their pool, a pipeline to its layout, a view to
+    /// its image.
+    fn destroy(&mut self, renderer: &VkRenderer) {
+        if self.descriptor_pool != 0 {
+            if let Some(destroy) =
+                renderer.try_dev_proc::<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")
+            {
+                unsafe { destroy(renderer.device, self.descriptor_pool, std::ptr::null()) };
+            }
+            self.descriptor_pool = 0;
+            self.descriptor_set = 0;
+        }
+        if self.descriptor_set_layout != 0 {
+            if let Some(destroy) = renderer
+                .try_dev_proc::<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")
+            {
+                unsafe {
+                    destroy(
+                        renderer.device,
+                        self.descriptor_set_layout,
+                        std::ptr::null(),
+                    )
+                };
+            }
+            self.descriptor_set_layout = 0;
+        }
+        if self.sampler != 0 {
+            if let Some(destroy) = renderer.try_dev_proc::<PFN_vkDestroySampler>("vkDestroySampler")
+            {
+                unsafe { destroy(renderer.device, self.sampler, std::ptr::null()) };
+            }
+            self.sampler = 0;
+        }
+        if self.view != 0 {
+            if let Some(destroy) =
+                renderer.try_dev_proc::<PFN_vkDestroyImageView>("vkDestroyImageView")
+            {
+                unsafe { destroy(renderer.device, self.view, std::ptr::null()) };
+            }
+            self.view = 0;
+        }
+        if self.pipeline != 0 {
+            if let Some(destroy) =
+                renderer.try_dev_proc::<PFN_vkDestroyPipeline>("vkDestroyPipeline")
+            {
+                unsafe { destroy(renderer.device, self.pipeline, std::ptr::null()) };
+            }
+            self.pipeline = 0;
+        }
+        if self.pipeline_layout != 0 {
+            if let Some(destroy) =
+                renderer.try_dev_proc::<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")
+            {
+                unsafe { destroy(renderer.device, self.pipeline_layout, std::ptr::null()) };
+            }
+            self.pipeline_layout = 0;
+        }
+        if self.image != 0 {
+            if let Some(destroy) = renderer.try_dev_proc::<PFN_vkDestroyImage>("vkDestroyImage") {
+                unsafe { destroy(renderer.device, self.image, std::ptr::null()) };
+            }
+            self.image = 0;
+        }
+        if self.image_memory != 0 {
+            if let Some(free) = renderer.try_dev_proc::<PFN_vkFreeMemory>("vkFreeMemory") {
+                unsafe { free(renderer.device, self.image_memory, std::ptr::null()) };
+            }
+            self.image_memory = 0;
+        }
+        renderer.release_buffer(&mut self.vertex_buffer, &mut self.vertex_memory);
+        self.vertex_mapped = std::ptr::null_mut();
+    }
+}
+
+impl QuadPipeline {
+    fn destroy(&mut self, renderer: &VkRenderer) {
+        if self.pipeline != 0 {
+            if let Some(destroy) =
+                renderer.try_dev_proc::<PFN_vkDestroyPipeline>("vkDestroyPipeline")
+            {
+                unsafe { destroy(renderer.device, self.pipeline, std::ptr::null()) };
+            }
+            self.pipeline = 0;
+        }
+        if self.pipeline_layout != 0 {
+            if let Some(destroy) =
+                renderer.try_dev_proc::<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")
+            {
+                unsafe { destroy(renderer.device, self.pipeline_layout, std::ptr::null()) };
+            }
+            self.pipeline_layout = 0;
+        }
+        renderer.release_buffer(&mut self.vertex_buffer, &mut self.vertex_memory);
+        self.vertex_mapped = std::ptr::null_mut();
+    }
+}
+
+impl PathPipeline {
+    fn destroy(&mut self, renderer: &VkRenderer) {
+        if self.pipeline != 0 {
+            if let Some(destroy) =
+                renderer.try_dev_proc::<PFN_vkDestroyPipeline>("vkDestroyPipeline")
+            {
+                unsafe { destroy(renderer.device, self.pipeline, std::ptr::null()) };
+            }
+            self.pipeline = 0;
+        }
+        if self.pipeline_layout != 0 {
+            if let Some(destroy) =
+                renderer.try_dev_proc::<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")
+            {
+                unsafe { destroy(renderer.device, self.pipeline_layout, std::ptr::null()) };
+            }
+            self.pipeline_layout = 0;
+        }
+        renderer.release_buffer(&mut self.vertex_buffer, &mut self.vertex_memory);
+        self.vertex_mapped = std::ptr::null_mut();
+    }
+}
 /// Decode SPIR-V words without assuming the byte array is 4-byte aligned
 /// (debug builds check that precondition and abort when it does not hold).
 fn spirv_words(bytes: &[u8]) -> Vec<u32> {
