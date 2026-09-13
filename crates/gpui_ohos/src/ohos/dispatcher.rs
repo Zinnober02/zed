@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant};
+use crate::{
+    PlatformDispatcher, Priority, PriorityQueueReceiver, PriorityQueueSender, RunnableVariant,
+};
 
 struct TimerAfter {
     when: Instant,
@@ -45,6 +47,7 @@ type Waker = Box<dyn Fn() + Send + Sync + 'static>;
 pub(crate) struct OhosDispatcher {
     main_thread_id: thread::ThreadId,
     main_sender: PriorityQueueSender<RunnableVariant>,
+    background_sender: PriorityQueueSender<RunnableVariant>,
     timer_queue: Arc<(Mutex<BinaryHeap<TimerAfter>>, Condvar)>,
     ready_timers: Arc<Mutex<VecDeque<RunnableVariant>>>,
     waker: Arc<Mutex<Option<Waker>>>,
@@ -57,6 +60,33 @@ impl OhosDispatcher {
             Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new()));
         let ready_timers = Arc::new(Mutex::new(VecDeque::new()));
         let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+
+        // A fixed pool rather than a thread per runnable: gpui reschedules a
+        // background future after every poll, so one thread per dispatch is one
+        // thread per await step, with no ceiling at all.
+        let (background_sender, background_receiver) =
+            PriorityQueueReceiver::<RunnableVariant>::new();
+        let workers = thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(2)
+            .clamp(2, 8);
+        for index in 0..workers {
+            let receiver = background_receiver.clone();
+            let spawned = thread::Builder::new()
+                .name(format!("OhosBg{index}"))
+                .spawn(move || {
+                    let mut receiver = receiver;
+                    while let Ok(runnable) = receiver.pop() {
+                        runnable.run();
+                    }
+                });
+            match spawned {
+                Ok(_) => {}
+                Err(error) => {
+                    crate::log_line(&format!("background worker {index} did not start: {error}"));
+                }
+            }
+        }
 
         let timer_queue_thread = timer_queue.clone();
         let ready_timers_thread = ready_timers.clone();
@@ -104,6 +134,7 @@ impl OhosDispatcher {
         Self {
             main_thread_id: thread::current().id(),
             main_sender,
+            background_sender,
             timer_queue,
             ready_timers,
             waker,
@@ -131,9 +162,21 @@ impl PlatformDispatcher for OhosDispatcher {
         thread::current().id() == self.main_thread_id
     }
 
-    fn dispatch(&self, runnable: RunnableVariant, _priority: Priority) {
-        // Background work runs on its own thread.
-        thread::spawn(move || runnable.run());
+    fn dispatch(&self, runnable: RunnableVariant, priority: Priority) {
+        if priority == Priority::RealtimeAudio {
+            // The background queue refuses audio work by design: it belongs on a
+            // thread of its own rather than in a pool shared with everything else.
+            thread::spawn(move || runnable.run());
+            return;
+        }
+        match self.background_sender.send(priority, runnable) {
+            Ok(_) => {}
+            Err(runnable) => {
+                // No worker is left (shutdown). Runnable may be !Send, so it
+                // cannot be dropped here; the process is exiting anyway.
+                std::mem::forget(runnable);
+            }
+        }
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {

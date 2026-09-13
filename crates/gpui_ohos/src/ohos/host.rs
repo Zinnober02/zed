@@ -29,6 +29,8 @@ pub(crate) mod op {
     pub const REQUEST_FRAME: i32 = 17;
     /// Create another OHOS window with an XComponent named by the argument.
     pub const CREATE_WINDOW: i32 = 16;
+    /// Which way round the theme is: the host draws the window buttons for it.
+    pub const SET_APPEARANCE: i32 = 18;
 }
 
 /// Synchronous queries. The host writes a UTF-8 answer into the buffer.

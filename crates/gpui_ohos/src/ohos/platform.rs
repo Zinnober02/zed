@@ -56,6 +56,8 @@ pub(crate) struct OhosPlatform {
     surfaces: Rc<RefCell<Vec<(String, Rc<RefCell<SurfaceState>>)>>>,
     /// How many GPUI windows have been bound to a surface.
     windows_opened: Cell<usize>,
+    /// Which way round the theme is, as Zed last reported it.
+    theme_appearance: Cell<&'static str>,
     pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
     windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
     /// GPUI window handles paired with their platform window, in open order.
@@ -107,6 +109,7 @@ impl OhosPlatform {
             main_receiver,
             surfaces: Rc::new(RefCell::new(Vec::new())),
             windows_opened: Cell::new(0),
+            theme_appearance: Cell::new("system"),
             pending_launch: RefCell::new(None),
             windows: Rc::new(RefCell::new(Vec::new())),
             handles: RefCell::new(Vec::new()),
@@ -370,6 +373,9 @@ impl OhosPlatform {
             drop(surfaces);
             let payload = create_window_payload(&id, params, width, height);
             host::window_op(host::op::CREATE_WINDOW, &payload);
+            // The window needs the theme's appearance too: the report arrived
+            // before this window existed.
+            host::window_op_for(&id, host::op::SET_APPEARANCE, self.theme_appearance.get());
             surfaces = self.surfaces.borrow_mut();
         }
         let id = surfaces[index].0.clone();
@@ -838,6 +844,24 @@ impl Platform for OhosPlatform {
             .borrow_mut()
             .push((handle, Rc::downgrade(&shared)));
         Ok(Box::new(OhosWindow::new(shared)))
+    }
+
+    /// Zed reports which way round its theme is so that the native window chrome
+    /// matches it. On this platform that chrome is drawn by the system, so the
+    /// answer has to reach the host: it is what decides how the window buttons
+    /// are drawn, and a light theme needs dark buttons and the other way round.
+    fn set_window_appearance(&self, appearance: Option<WindowAppearance>) {
+        let value = match appearance {
+            Some(WindowAppearance::Dark) | Some(WindowAppearance::VibrantDark) => "dark",
+            Some(WindowAppearance::Light) | Some(WindowAppearance::VibrantLight) => "light",
+            None => "system",
+        };
+        // Remembered because Zed reports this before any window exists, and each
+        // window is told again when it is created.
+        self.theme_appearance.set(value);
+        for window in self.windows.borrow().iter() {
+            host::window_op_for(window.id(), host::op::SET_APPEARANCE, value);
+        }
     }
 
     fn window_appearance(&self) -> WindowAppearance {

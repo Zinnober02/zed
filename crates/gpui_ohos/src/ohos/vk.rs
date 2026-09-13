@@ -3104,6 +3104,18 @@ impl VkRenderer {
         if self.sprites.is_none() {
             self.create_sprite_pipeline()?;
         }
+        // The four pipelines were created just above, so their absence is a bug;
+        // noticing it here rather than where they are used keeps that bug from
+        // panicking inside the draw path, which would take the whole application
+        // down over a single frame.
+        if self.text.is_none()
+            || self.sprites.is_none()
+            || self.quads.is_none()
+            || self.paths.is_none()
+        {
+            super::vk::log("[gpui_ohos] a pipeline is missing, skipping the frame");
+            return Ok(false);
+        }
         // Clamp the incoming geometry to what this frame's ring slot holds, and
         // do it before the fence is touched: returning after the fence was reset
         // but before its submission would leave the next frame waiting on that
