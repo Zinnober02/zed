@@ -463,7 +463,10 @@ impl WindowShared {
         let sample = CPU_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if sample % 60 == 0 {
             super::vk::log(&format!(
-                "[gpui_ohos] frame cpu {}us ({}us without hashing)",
+                // The first figure is everything after the hash - scene building
+                // and presenting, which includes waiting for the compositor - and
+                // the second is the hash itself.
+                "[gpui_ohos] frame cpu {}us after hashing ({}us hashing)",
                 work_started.elapsed().as_micros(),
                 work_started
                     .saturating_duration_since(hash_started)
@@ -1316,7 +1319,11 @@ pub(super) fn build_draw_list(
 /// Cheap identity of the rendered scene, used to skip unchanged frames.
 fn scene_hash(scene: &Scene) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // FxHash rather than the default SipHash: the whole scene is hashed every
+    // frame, and SipHash measured about 9 ms for a frame whose other work is
+    // under 0.2 ms. This hash only has to notice changes, not resist an
+    // adversary choosing collisions.
+    let mut hasher = collections::FxHasher::default();
     scene.quads.len().hash(&mut hasher);
     for quad in &scene.quads {
         quad.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
@@ -1378,6 +1385,13 @@ fn scene_hash(scene: &Scene) -> u64 {
             rgba.b.to_bits().hash(&mut hasher);
             rgba.a.to_bits().hash(&mut hasher);
         }
+        // The border is drawn from this colour: changing only it used to leave
+        // the previous frame on screen.
+        let border = quad.border_color.to_rgb();
+        border.r.to_bits().hash(&mut hasher);
+        border.g.to_bits().hash(&mut hasher);
+        border.b.to_bits().hash(&mut hasher);
+        border.a.to_bits().hash(&mut hasher);
     }
     scene.paths.len().hash(&mut hasher);
     for path in &scene.paths {
@@ -1386,6 +1400,18 @@ fn scene_hash(scene: &Scene) -> u64 {
         path.bounds.size.width.as_f32().to_bits().hash(&mut hasher);
         path.bounds.size.height.as_f32().to_bits().hash(&mut hasher);
         path.vertices.len().hash(&mut hasher);
+        // Only the count is hashed, not the vertices themselves: measured on
+        // device, hashing a long path's vertices costs about 9 ms per frame,
+        // which is more than the whole 120 Hz budget. Covering them properly
+        // needs the cheaper two-level fingerprint the fix plan describes; until
+        // then a path that keeps its vertex count but moves them can be missed.
+        if let Some(color) = path.color.as_solid() {
+            let rgba = color.to_rgb();
+            rgba.r.to_bits().hash(&mut hasher);
+            rgba.g.to_bits().hash(&mut hasher);
+            rgba.b.to_bits().hash(&mut hasher);
+            rgba.a.to_bits().hash(&mut hasher);
+        }
     }
     scene.underlines.len().hash(&mut hasher);
     for underline in &scene.underlines {
@@ -1417,7 +1443,11 @@ fn scene_hash(scene: &Scene) -> u64 {
             .as_f32()
             .to_bits()
             .hash(&mut hasher);
-        underline.color.to_rgb().r.to_bits().hash(&mut hasher);
+        let underline_rgb = underline.color.to_rgb();
+        underline_rgb.r.to_bits().hash(&mut hasher);
+        underline_rgb.g.to_bits().hash(&mut hasher);
+        underline_rgb.b.to_bits().hash(&mut hasher);
+        underline_rgb.a.to_bits().hash(&mut hasher);
     }
     scene.monochrome_sprites.len().hash(&mut hasher);
     for sprite in &scene.monochrome_sprites {
@@ -1446,6 +1476,35 @@ fn scene_hash(scene: &Scene) -> u64 {
         rgba.g.to_bits().hash(&mut hasher);
         rgba.b.to_bits().hash(&mut hasher);
         rgba.a.to_bits().hash(&mut hasher);
+    }
+    // Polychrome sprites were missing from this hash altogether, so adding,
+    // moving, fading or repainting an image never redrew the window: the frame
+    // showing the previous one stayed on screen.
+    scene.polychrome_sprites.len().hash(&mut hasher);
+    for sprite in &scene.polychrome_sprites {
+        sprite.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
+        sprite.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
+        sprite
+            .bounds
+            .size
+            .width
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        sprite
+            .bounds
+            .size
+            .height
+            .as_f32()
+            .to_bits()
+            .hash(&mut hasher);
+        sprite.tile.bounds.origin.x.0.hash(&mut hasher);
+        sprite.tile.bounds.origin.y.0.hash(&mut hasher);
+        sprite.tile.bounds.size.width.0.hash(&mut hasher);
+        sprite.tile.bounds.size.height.0.hash(&mut hasher);
+        sprite.tile.tile_id.0.hash(&mut hasher);
+        sprite.opacity.to_bits().hash(&mut hasher);
+        sprite.order.hash(&mut hasher);
     }
     hasher.finish()
 }
