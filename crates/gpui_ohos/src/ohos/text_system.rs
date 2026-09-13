@@ -625,29 +625,30 @@ impl OhosTextSystemState {
         {
             FontId(index)
         } else {
-            let font = self
-                .font_system
-                .get_font(
-                    id,
-                    self.font_system
-                        .db()
-                        .face(id)
-                        .map(|face| face.weight)
-                        .unwrap_or(cosmic_text::Weight::NORMAL),
-                )
-                .expect("font id should be valid");
-            let face = self
+            // An id the database no longer knows means it changed under us. That
+            // is not a reason to take the application down: an already loaded
+            // font is reused and the caller keeps working.
+            let Some(weight) = self.font_system.db().face(id).map(|face| face.weight) else {
+                warn!("font id {id:?} is not in the database; reusing an already loaded font");
+                return FontId(0);
+            };
+            let is_emoji = self
                 .font_system
                 .db()
                 .face(id)
-                .expect("font face should exist");
+                .map(|face| check_is_known_emoji_font(&face.post_script_name))
+                .unwrap_or(false);
+            let Some(font) = self.font_system.get_font(id, weight) else {
+                warn!("font id {id:?} could not be loaded; reusing an already loaded font");
+                return FontId(0);
+            };
 
             let font_id = FontId(self.loaded_fonts.len());
             self.loaded_fonts.push(LoadedFont {
                 font,
-                font_weight: face.weight,
+                font_weight: weight,
                 features: CosmicFontFeatures::new(),
-                is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
+                is_known_emoji_font: is_emoji,
             });
 
             font_id
@@ -659,18 +660,22 @@ impl OhosTextSystemState {
         let mut offset = 0;
         for run in font_runs {
             let loaded_font = self.loaded_font(run.font_id);
-            let font = self
-                .font_system
-                .db()
-                .face(loaded_font.font.id())
-                .expect("font face should exist");
+            // The run names a font whose face is gone: skipping the run keeps the
+            // line drawable instead of panicking in the middle of layout.
+            let Some(font) = self.font_system.db().face(loaded_font.font.id()) else {
+                warn!("face {:?} vanished; skipping a run", loaded_font.font.id());
+                continue;
+            };
 
             attrs_list.add_span(
                 offset..(offset + run.len),
                 &Attrs::new()
                     .metadata(run.font_id.0)
                     .family(Family::Name(
-                        &font.families.first().expect("font family should exist").0,
+                        font.families
+                            .first()
+                            .map(|family| family.0.as_str())
+                            .unwrap_or("sans-serif"),
                     ))
                     .stretch(font.stretch)
                     .style(font.style)
@@ -698,9 +703,20 @@ impl OhosTextSystemState {
             None,
             cosmic_text::Hinting::Disabled,
         );
-        let layout = layout_lines
-            .first()
-            .expect("layout should contain one line");
+        // Shaping can produce no lines at all - an empty string does - and that
+        // is no reason to take the application down: the caller gets an empty
+        // layout instead.
+        let Some(layout) = layout_lines.first() else {
+            warn!("shaped {text:?} into no lines");
+            return LineLayout {
+                font_size,
+                width: f32::default().into(),
+                ascent: f32::default().into(),
+                descent: f32::default().into(),
+                runs: Vec::new(),
+                len: 0,
+            };
+        };
 
         let mut runs: Vec<ShapedRun> = Vec::new();
         for glyph in &layout.glyphs {
