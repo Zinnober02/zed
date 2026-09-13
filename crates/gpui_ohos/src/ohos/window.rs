@@ -105,6 +105,12 @@ pub(crate) struct WindowShared {
     input_handler: RefCell<Option<PlatformInputHandler>>,
     callbacks: RefCell<WindowCallbacks>,
     renderer: RefCell<Option<VkRenderer>>,
+    /// Native window the current renderer was built for, as an address.
+    ///
+    /// A rebuilt surface hands over a different native window while the renderer
+    /// stays bound to the old one, so the renderer has to be rebuilt too; the
+    /// pointer is kept as an address because it is only ever compared.
+    renderer_window: Cell<usize>,
     pointer_position: Cell<Point<Pixels>>,
     pressed_button: Cell<Option<MouseButton>>,
     modifiers: Cell<Modifiers>,
@@ -155,6 +161,7 @@ impl WindowShared {
             input_handler: RefCell::new(None),
             callbacks: RefCell::new(WindowCallbacks::default()),
             renderer: RefCell::new(None),
+            renderer_window: Cell::new(0),
             pointer_position: Cell::new(point(px(0.0), px(0.0))),
             pressed_button: Cell::new(None),
             modifiers: Cell::new(Modifiers::default()),
@@ -356,15 +363,22 @@ impl WindowShared {
     }
 
     fn ensure_renderer(&self) -> bool {
-        if self.renderer.borrow().is_some() {
-            return true;
-        }
         let (window, width, height, valid) = {
             let s = self.surface.borrow();
             (s.window, s.width, s.height, s.valid)
         };
         if !valid || window.is_null() {
             return false;
+        }
+        if self.renderer.borrow().is_some() {
+            if self.renderer_window.get() == window as usize {
+                return true;
+            }
+            // Keeping a renderer built for the previous native window would draw
+            // into a window that no longer exists; drop it first so its own
+            // teardown runs before a replacement is created.
+            super::vk::log("[gpui_ohos] native window changed, rebuilding the renderer");
+            *self.renderer.borrow_mut() = None;
         }
         match VkRenderer::new(window, width, height) {
             Ok(renderer) => {
@@ -380,6 +394,7 @@ impl WindowShared {
                     ));
                 }
                 *self.renderer.borrow_mut() = Some(renderer);
+                self.renderer_window.set(window as usize);
                 true
             }
             Err(error) => {
