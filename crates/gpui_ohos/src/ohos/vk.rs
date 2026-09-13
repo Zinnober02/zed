@@ -398,6 +398,13 @@ struct VkSurfaceCreateInfoOHOS {
     window: *mut c_void,
 }
 
+type PFN_vkDestroyInstance = unsafe extern "C" fn(*mut c_void, *const c_void);
+type PFN_vkDestroySurfaceKHR = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroyDevice = unsafe extern "C" fn(*mut c_void, *const c_void);
+type PFN_vkDestroyRenderPass = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroyCommandPool = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroyFence = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
+type PFN_vkDestroySemaphore = unsafe extern "C" fn(*mut c_void, u64, *const c_void);
 type PFN_vkGetInstanceProcAddr = unsafe extern "C" fn(*mut c_void, *const c_char) -> *const c_void;
 type PFN_vkGetDeviceProcAddr = unsafe extern "C" fn(*mut c_void, *const c_char) -> *const c_void;
 type PFN_vkCreateInstance =
@@ -1295,17 +1302,83 @@ impl VkRenderer {
     }
 }
 
+impl VkRenderer {
+    /// Releases everything this renderer created.
+    ///
+    /// The order is the one the specification requires: children before their
+    /// parents, and the library last of all because every function pointer came
+    /// from it. Dropping it before the device it created objects with was an
+    /// order the driver does not promise to survive. Idempotent, so the failure
+    /// paths in `new` can call it as well.
+    fn destroy(&mut self) {
+        if !self.device.is_null() {
+            unsafe { (self.fns.wait_idle)(self.device) };
+            if self.command_pool != 0 {
+                let destroy: PFN_vkDestroyCommandPool =
+                    unsafe { std::mem::transmute(self.dev_proc("vkDestroyCommandPool")) };
+                if destroy as *const c_void as usize != 0 {
+                    unsafe { destroy(self.device, self.command_pool, std::ptr::null()) };
+                }
+                self.command_pool = 0;
+            }
+            for fence in std::mem::take(&mut self.in_flight) {
+                let destroy: PFN_vkDestroyFence =
+                    unsafe { std::mem::transmute(self.dev_proc("vkDestroyFence")) };
+                if destroy as *const c_void as usize != 0 {
+                    unsafe { destroy(self.device, fence, std::ptr::null()) };
+                }
+            }
+            for semaphore in std::mem::take(&mut self.render_finished)
+                .into_iter()
+                .chain(std::mem::take(&mut self.image_available))
+            {
+                let destroy: PFN_vkDestroySemaphore =
+                    unsafe { std::mem::transmute(self.dev_proc("vkDestroySemaphore")) };
+                if destroy as *const c_void as usize != 0 {
+                    unsafe { destroy(self.device, semaphore, std::ptr::null()) };
+                }
+            }
+            if self.render_pass != 0 {
+                let destroy: PFN_vkDestroyRenderPass =
+                    unsafe { std::mem::transmute(self.dev_proc("vkDestroyRenderPass")) };
+                if destroy as *const c_void as usize != 0 {
+                    unsafe { destroy(self.device, self.render_pass, std::ptr::null()) };
+                }
+                self.render_pass = 0;
+            }
+            self.destroy_swapchain_resources();
+            let destroy: PFN_vkDestroyDevice =
+                unsafe { std::mem::transmute(self.dev_proc("vkDestroyDevice")) };
+            if destroy as *const c_void as usize != 0 {
+                unsafe { destroy(self.device, std::ptr::null()) };
+            }
+            self.device = std::ptr::null_mut();
+        }
+        if self.surface != 0 && !self.instance.is_null() {
+            let destroy: PFN_vkDestroySurfaceKHR =
+                unsafe { std::mem::transmute(self.inst_proc("vkDestroySurfaceKHR")) };
+            if destroy as *const c_void as usize != 0 {
+                unsafe { destroy(self.instance, self.surface, std::ptr::null()) };
+            }
+            self.surface = 0;
+        }
+        if !self.instance.is_null() {
+            let destroy: PFN_vkDestroyInstance =
+                unsafe { std::mem::transmute(self.inst_proc("vkDestroyInstance")) };
+            if destroy as *const c_void as usize != 0 {
+                unsafe { destroy(self.instance, std::ptr::null()) };
+            }
+            self.instance = std::ptr::null_mut();
+        }
+        if !self.lib.is_null() {
+            unsafe { dlclose(self.lib) };
+            self.lib = std::ptr::null_mut();
+        }
+    }
+}
 impl Drop for VkRenderer {
     fn drop(&mut self) {
-        unsafe {
-            (self.fns.wait_idle)(self.device);
-        }
-        self.destroy_swapchain_resources();
-        unsafe {
-            if !self.lib.is_null() {
-                dlclose(self.lib);
-            }
-        }
+        self.destroy();
     }
 }
 
