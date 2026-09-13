@@ -571,7 +571,15 @@ impl OhosPlatform {
     pub(crate) fn ime_context(&self) -> Option<(String, usize, (f64, f64, f64, f64))> {
         let (rect_x, rect_y, _, _) = self.window_rect.get();
         let scale = super::window::SCALE as f64;
-        for window in self.windows() {
+        // The focused window first: with several windows open, the first one with
+        // an input handler is not necessarily the one being typed into, and the
+        // input method would then be mirroring another window's text and caret.
+        let windows = self.windows();
+        let ordered = windows
+            .iter()
+            .filter(|window| window.is_active())
+            .chain(windows.iter().filter(|window| !window.is_active()));
+        for window in ordered {
             if let Some((text, caret, cursor)) = window.ime_context() {
                 let left = rect_x as f64 + cursor.origin.x.as_f32() as f64 * scale;
                 let top = rect_y as f64 + cursor.origin.y.as_f32() as f64 * scale;

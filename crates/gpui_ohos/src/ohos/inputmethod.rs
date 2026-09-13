@@ -349,32 +349,55 @@ pub(crate) fn drain() -> Vec<ImeCommand> {
     std::mem::take(&mut *QUEUE.lock().unwrap())
 }
 
+/// Most UTF-16 units one notification may carry. The input method replaces its
+/// text with whatever it is given and rejects anything longer, so sending the
+/// whole document silently disabled composition in every larger file.
+const IME_TEXT_LIMIT: usize = 8192;
+
 /// Mirror the focused editor's text and caret to the input method. The IME
-/// needs these notifications to start composing.
+/// needs these notifications to start composing, and only ever sees a window
+/// around the caret.
 pub(crate) fn update_context(text: &str, caret: usize, cursor: (f64, f64, f64, f64)) {
     {
         let mut context = IME_CONTEXT.lock().unwrap();
         if context.0 == text && context.1 == caret && context.2 == cursor {
             return;
         }
-        context.0 = text.to_string();
-        context.1 = caret;
-        context.2 = cursor;
     }
     let proxy = PROXY.load(Ordering::Relaxed) as *mut c_void;
     if proxy.is_null() {
         return;
     }
     let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    let caret_units = caret.min(utf16.len());
+    // Only the window around the caret is sent, with the offsets made relative
+    // to it: the input method reads them against the text it was handed.
+    let half = IME_TEXT_LIMIT / 2;
+    let start = caret_units
+        .saturating_sub(half)
+        .min(utf16.len().saturating_sub(IME_TEXT_LIMIT));
+    let end = (start + IME_TEXT_LIMIT).min(utf16.len());
+    let window = &mut utf16[start..end];
+    let caret_in_window = caret_units - start;
+    let length = window.len();
+    let mut accepted = false;
     unsafe {
         if let Some(notify) = NOTIFY_SELECTION.get() {
-            notify(
-                proxy,
-                utf16.as_mut_ptr(),
-                utf16.len(),
-                caret as i32,
-                caret as i32,
-            );
+            // An empty text is rejected too, so a document that is empty (or a
+            // window that collapsed) only gets the cursor update below.
+            if length > 0 {
+                let code = notify(
+                    proxy,
+                    window.as_mut_ptr(),
+                    length,
+                    caret_in_window as i32,
+                    caret_in_window as i32,
+                );
+                accepted = code == 0;
+                if !accepted {
+                    log_notify_failure(code, length, caret_in_window, start);
+                }
+            }
         }
         if let (Some(create), Some(notify)) = (CURSOR_CREATE.get(), NOTIFY_CURSOR.get()) {
             let info = create(cursor.0, cursor.1, cursor.2, cursor.3);
@@ -383,6 +406,27 @@ pub(crate) fn update_context(text: &str, caret: usize, cursor: (f64, f64, f64, f
             }
         }
     }
+    // Recorded only once the input method took the notification: committing it
+    // first meant a rejection was never retried and the editor's idea of what
+    // the input method knows stayed wrong for good.
+    if length == 0 || accepted {
+        let mut context = IME_CONTEXT.lock().unwrap();
+        context.0 = text.to_string();
+        context.1 = caret;
+        context.2 = cursor;
+    }
+}
+
+/// Report a rejected notification without letting a repeating failure flood the
+/// log, which is what an unchanged refusal on every frame would do.
+fn log_notify_failure(code: i32, length: usize, caret: usize, window_start: usize) {
+    static LAST_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    if LAST_CODE.swap(code, Ordering::Relaxed) == code {
+        return;
+    }
+    crate::log_line(&format!(
+        "input method rejected the context update: code={code} length={length} caret={caret} window_start={window_start}"
+    ));
 }
 
 pub fn commit_text(text: &str) {
