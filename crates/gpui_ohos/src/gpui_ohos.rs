@@ -11,6 +11,7 @@ pub use ohos::{
     pointer_up, read_clipboard, read_picked_file, read_picked_file_bytes,
     read_picked_file_bytes_async, remove_picked_path_async, rename_picked_path_async, root_dir,
     run_app_on_surface, run_with_surface, scale, scroll, set_host_ops, set_root_dir,
-    surface_created, surface_destroyed, surface_resized, take_restore_folder, tick,
-    write_clipboard, write_picked_file, write_picked_file_bytes, write_picked_file_bytes_async,
+    should_close_window, surface_created, surface_destroyed, surface_resized, take_restore_folder,
+    tick, write_clipboard, write_picked_file, write_picked_file_bytes,
+    write_picked_file_bytes_async,
 };

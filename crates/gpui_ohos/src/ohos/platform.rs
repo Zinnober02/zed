@@ -573,6 +573,16 @@ impl OhosPlatform {
 
     /// Windows an input event from a surface should reach. An empty id keeps
     /// the legacy broadcast to every window.
+    /// Ask the windows an id names whether they may close.
+    ///
+    /// A window with no opinion allows it, so an unknown or already closed id
+    /// does not hold a window open for ever.
+    pub(crate) fn should_close_window(&self, id: &str) -> bool {
+        self.route_targets(id)
+            .iter()
+            .all(|window| window.should_close())
+    }
+
     pub(crate) fn route_targets(&self, id: &str) -> Vec<Rc<WindowShared>> {
         if id.is_empty() {
             return self.windows();
@@ -854,16 +864,6 @@ impl Platform for OhosPlatform {
                 .map(|(handle, _)| *handle)
                 .collect(),
         )
-    }
-
-    /// Ask the windows an id names whether they may close.
-    ///
-    /// A window with no opinion allows it, so an unknown or already closed id
-    /// does not hold a window open for ever.
-    pub(crate) fn should_close_window(&self, id: &str) -> bool {
-        self.route_targets(id)
-            .iter()
-            .all(|window| window.should_close())
     }
 
     fn is_screen_capture_supported(&self) -> bool {

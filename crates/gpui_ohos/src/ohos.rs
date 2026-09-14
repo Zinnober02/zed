@@ -378,7 +378,8 @@ pub fn host_event(kind: i32, arg: &str) {
 /// Whether the application lets this window close. Asked by the host before it
 /// closes a window on its own.
 pub fn should_close_window(id: &str) -> bool {
-    with_current(|platform| platform.should_close_window(id))
+    // No platform at all means nothing to ask, which allows the close.
+    with_current(|platform| platform.should_close_window(id)).unwrap_or(true)
 }
 
 /// An additional XComponent surface was created for another window.
