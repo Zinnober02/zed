@@ -375,6 +375,12 @@ pub fn host_event(kind: i32, arg: &str) {
     with_current(|platform| platform.handle_host_event(kind, arg));
 }
 
+/// Whether the application lets this window close. Asked by the host before it
+/// closes a window on its own.
+pub fn should_close_window(id: &str) -> bool {
+    with_current(|platform| platform.should_close_window(id))
+}
+
 /// An additional XComponent surface was created for another window.
 pub fn surface_created(id: &str, window: *mut c_void, width: u32, height: u32) {
     vk::log(&format!(

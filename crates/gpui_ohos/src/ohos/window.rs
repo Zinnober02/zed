@@ -263,6 +263,21 @@ impl WindowShared {
         self.callbacks.borrow_mut().appearance_changed = callback;
     }
 
+    /// Ask the application whether this window may close.
+    ///
+    /// The application answers here when it needs to save something first, and
+    /// closes the window itself once it is done; saying yes means the platform
+    /// may close it straight away.
+    pub(crate) fn should_close(&self) -> bool {
+        let mut callback = self.callbacks.borrow_mut().should_close.take();
+        let allowed = match callback.as_mut() {
+            Some(callback) => callback(),
+            None => true,
+        };
+        self.callbacks.borrow_mut().should_close = callback;
+        allowed
+    }
+
     /// Tell the application the platform window is gone.
     ///
     /// Without this the application only ever cleared a window it closed itself,

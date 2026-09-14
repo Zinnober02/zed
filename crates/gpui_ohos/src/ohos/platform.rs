@@ -856,6 +856,16 @@ impl Platform for OhosPlatform {
         )
     }
 
+    /// Ask the windows an id names whether they may close.
+    ///
+    /// A window with no opinion allows it, so an unknown or already closed id
+    /// does not hold a window open for ever.
+    pub(crate) fn should_close_window(&self, id: &str) -> bool {
+        self.route_targets(id)
+            .iter()
+            .all(|window| window.should_close())
+    }
+
     fn is_screen_capture_supported(&self) -> bool {
         false
     }

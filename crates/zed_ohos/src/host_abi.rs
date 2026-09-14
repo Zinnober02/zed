@@ -27,6 +27,17 @@ pub extern "C" fn ohos_gpui_set_root_dir(path: *const c_char) {
     }
 }
 
+/// Ask the application whether this window may close.
+///
+/// The platform has to ask before a window closes: that question is what runs
+/// the application's own close handling, which saves dirty buffers and takes the
+/// window's workspace out of the session. Closing without asking removed the
+/// window under the application's feet.
+#[unsafe(no_mangle)]
+pub extern "C" fn ohos_gpui_should_close_window(id: *const c_char) -> bool {
+    gpui_ohos::should_close_window(&text(id))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ohos_gpui_key_event(id: *const c_char, action: i32, code: i32, unicode: i32) {
     gpui_ohos::key_event(&text(id), action, code, unicode);
