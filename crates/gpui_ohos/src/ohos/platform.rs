@@ -578,9 +578,36 @@ impl OhosPlatform {
     /// A window with no opinion allows it, so an unknown or already closed id
     /// does not hold a window open for ever.
     pub(crate) fn should_close_window(&self, id: &str) -> bool {
-        self.route_targets(id)
+        // Not route_targets: that one skips windows already marked closed, and a
+        // window whose surface has gone is exactly the one the application still
+        // needs to be asked about - it is the application's answer that saves the
+        // workspace out of the session before the window goes.
+        self.targets_for_surface(id)
             .iter()
             .all(|window| window.should_close())
+    }
+
+    /// Every window bound to a surface, closed one included.
+    fn targets_for_surface(&self, id: &str) -> Vec<Rc<WindowShared>> {
+        if id.is_empty() {
+            return self.windows.borrow().clone();
+        }
+        let surface = {
+            let surfaces = self.surfaces.borrow();
+            surfaces
+                .iter()
+                .find(|(existing, _)| existing == id)
+                .map(|(_, surface)| surface.clone())
+        };
+        let Some(surface) = surface else {
+            return Vec::new();
+        };
+        self.windows
+            .borrow()
+            .iter()
+            .filter(|window| window.shares_surface(&surface))
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn route_targets(&self, id: &str) -> Vec<Rc<WindowShared>> {
