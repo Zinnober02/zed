@@ -189,14 +189,21 @@ impl OhosPlatform {
                 // on its own, with no "\t" and value after it; parsing it as one
                 // of those produced an empty id, which routes to every window.
                 let id = arg.trim();
-                forget_window(&self.handles, id);
-                let targets = self.route_targets(id);
-                super::vk::log(&format!(
-                    "[gpui_ohos] window closed {id}: {} window(s) matched",
-                    targets.len()
-                ));
-                for window in targets {
-                    window.notify_closed();
+                if id.is_empty() {
+                    // An empty id routes to every window, and this event means the
+                    // application dropped one: acting on it closed windows that
+                    // were still open.
+                    super::vk::log("[gpui_ohos] window closed with no id: ignored");
+                } else {
+                    forget_window(&self.handles, id);
+                    let targets = self.route_targets(id);
+                    super::vk::log(&format!(
+                        "[gpui_ohos] window closed {id}: {} window(s) matched",
+                        targets.len()
+                    ));
+                    for window in targets {
+                        window.notify_closed();
+                    }
                 }
             }
             host::event::WINDOW_STATUS => {
@@ -278,7 +285,12 @@ impl OhosPlatform {
             }
             host::event::PICK_RESULT => {
                 let (token, rest) = arg.split_once('\t').unwrap_or((arg, ""));
-                let id: u64 = token[1..].parse().unwrap_or(0);
+                // Not token[1..]: an argument that starts with a tab leaves the
+                // token empty, and slicing past the end of a string panics.
+                let id: u64 = token
+                    .strip_prefix('#')
+                    .and_then(|number| number.parse().ok())
+                    .unwrap_or(0);
                 if let Some(sender) = self.pending_picks.borrow_mut().remove(&id) {
                     let lines: Vec<String> = rest
                         .lines()
