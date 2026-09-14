@@ -569,7 +569,7 @@ pub(crate) struct OhosWindow {
 /// the system's close is what actually removes the window, and until then the
 /// user closes it again. Turn this on if the platform ever gains a call that
 /// closes one window and nothing else.
-const CLOSE_WINDOW_WITH_APP: bool = false;
+const CLOSE_WINDOW_WITH_APP: bool = true;
 
 impl Drop for OhosWindow {
     fn drop(&mut self) {
