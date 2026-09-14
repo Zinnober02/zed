@@ -1160,13 +1160,12 @@ impl VkRenderer {
             "[gpui_ohos] present modes {modes:?} -> mode={present_mode}"
         ));
 
-        let (sw, sh) = if caps.current_extent.width != 0 {
-            (caps.current_extent.width, caps.current_extent.height)
-        } else {
-            (self.width, self.height)
-        };
-        self.width = sw;
-        self.height = sh;
+        // The requested size is what both the comparison in resize and the image
+        // extent are keyed on. Taking the driver's current_extent here wrote a
+        // value that lags the window back into these fields, so a fast sequence
+        // of resizes kept landing on the previous size and the correct request
+        // was then swallowed as a duplicate.
+        let (sw, sh) = (self.width, self.height);
 
         let old = self.swapchain;
         let swci = VkSwapchainCreateInfoKHR {
@@ -1311,6 +1310,21 @@ impl VkRenderer {
         self.destroy_swapchain_resources();
         self.width = width;
         self.height = height;
+        self.create_swapchain()
+    }
+
+    /// Rebuild the swapchain at the size this renderer already records.
+    ///
+    /// The driver reporting the swapchain as out of date or suboptimal used to
+    /// call resize with the size it already believed it had, which the comparison
+    /// above turns into a no-op - so a stale swapchain was never replaced and the
+    /// window kept showing the old picture stretched to the new size.
+    pub fn recreate_swapchain(&mut self) -> anyhow::Result<()> {
+        if self.width == 0 || self.height == 0 {
+            return Ok(());
+        }
+        unsafe { (self.fns.wait_idle)(self.device) };
+        self.destroy_swapchain_resources();
         self.create_swapchain()
     }
 }
@@ -3189,8 +3203,7 @@ impl VkRenderer {
             )
         };
         if ar == VK_ERROR_OUT_OF_DATE_KHR {
-            let (w, h) = (self.width, self.height);
-            self.resize(w, h)?;
+            self.recreate_swapchain()?;
             // Nothing was drawn, so the caller must not treat this frame as shown.
             return Ok(false);
         }
@@ -3592,8 +3605,7 @@ impl VkRenderer {
         };
         let pr = unsafe { (self.fns.queue_present)(self.queue, &pi) };
         if pr == VK_ERROR_OUT_OF_DATE_KHR {
-            let (w, h) = (self.width, self.height);
-            self.resize(w, h)?;
+            self.recreate_swapchain()?;
             // The image was submitted but never reached the display.
             return Ok(false);
         }
@@ -3622,8 +3634,7 @@ impl VkRenderer {
         }
         self.frame = (frame + 1) % FRAMES_IN_FLIGHT;
         if ar == VK_SUBOPTIMAL_KHR {
-            let (w, h) = (self.width, self.height);
-            self.resize(w, h)?;
+            self.recreate_swapchain()?;
         }
         Ok(true)
     }

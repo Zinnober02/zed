@@ -98,6 +98,12 @@ pub(crate) struct OhosPlatform {
     restore_delivered: Cell<bool>,
     /// Focus change reported by the host, applied from the frame loop.
     pending_focus: RefCell<Option<(String, bool)>>,
+    /// The size a surface last reported, applied once per tick.
+    ///
+    /// Rebuilding the swapchain blocks this thread until the GPU is idle, and one
+    /// maximize arrives from two places, so the work waits for the frame loop and
+    /// only the latest size is applied.
+    pending_surface_size: RefCell<Option<(String, u32, u32)>>,
     /// Window rect in physical pixels: (x, y, width, height).
     window_rect: Cell<(f32, f32, f32, f32)>,
 }
@@ -143,6 +149,7 @@ impl OhosPlatform {
             restore_pulled: Cell::new(false),
             restore_delivered: Cell::new(false),
             pending_focus: RefCell::new(None),
+            pending_surface_size: RefCell::new(None),
             window_rect: Cell::new(window_rect),
         })
     }
@@ -437,6 +444,23 @@ impl OhosPlatform {
     }
 
     pub(crate) fn surface_resized(&self, id: &str, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        // Recorded, not applied: this is called from the ArkUI resize callback,
+        // and the work below blocks on the GPU and rebuilds the swapchain.
+        *self.pending_surface_size.borrow_mut() = Some((id.to_string(), width, height));
+    }
+
+    /// Apply the size a surface last reported, if any. Runs once per frame.
+    fn apply_pending_surface_size(&self) {
+        let Some((id, width, height)) = self.pending_surface_size.borrow_mut().take() else {
+            return;
+        };
+        self.apply_surface_resized(&id, width, height);
+    }
+
+    fn apply_surface_resized(&self, id: &str, width: u32, height: u32) {
         let surface = {
             let surfaces = self.surfaces.borrow();
             surfaces
@@ -503,6 +527,8 @@ impl OhosPlatform {
         // called from this thread. The budget keeps one slow read from costing
         // several frames.
         super::drain_ui_tasks(std::time::Duration::from_millis(2));
+        // A resize waited for this moment: it blocks on the GPU.
+        self.apply_pending_surface_size();
         // Asking for the previous folder while the app is still creating its
         // startup window opens the workspace in a second window and leaves an
         // empty one on top, so wait until a window has actually drawn.
