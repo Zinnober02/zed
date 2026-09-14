@@ -203,9 +203,30 @@ impl OhosPlatform {
                 }
             }
             host::event::WINDOW_RECT => {
-                let (_, value) = split_window_event(arg);
+                let (id, value) = split_window_event(arg);
                 if let Some(rect) = parse_rect(value) {
                     self.window_rect.set(rect);
+                    // The same size change also arrives as a window rectangle, and
+                    // this used to be remembered only for the caret's origin. The
+                    // surface was never told, so a maximized window kept rendering
+                    // at its old size while the compositor stretched the picture,
+                    // and layout and hit testing stayed stale at the old size too.
+                    let (width, height) = (rect.2, rect.3);
+                    if width > 0.0 && height > 0.0 {
+                        let current = self
+                            .surfaces
+                            .borrow()
+                            .iter()
+                            .find(|(existing, _)| existing == id)
+                            .map(|(_, surface)| {
+                                let state = surface.borrow();
+                                (state.width, state.height)
+                            });
+                        let wanted = (width as u32, height as u32);
+                        if current != Some(wanted) {
+                            self.surface_resized(id, wanted.0, wanted.1);
+                        }
+                    }
                 }
             }
             host::event::BENCHMARK => {

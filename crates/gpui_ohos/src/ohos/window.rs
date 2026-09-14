@@ -570,6 +570,11 @@ const CLOSE_WINDOW_WITH_APP: bool = false;
 
 impl Drop for OhosWindow {
     fn drop(&mut self) {
+        // The application drops this whenever it closes a window itself, and that
+        // is the only notice this side gets of it. Without marking the window
+        // closed the frame loop kept asking a window the application no longer
+        // had to draw, and every frame came back "window not found".
+        self.shared.mark_closed();
         if CLOSE_WINDOW_WITH_APP {
             host::window_op_for(self.shared.id(), host::op::CLOSE_WINDOW, "");
         }

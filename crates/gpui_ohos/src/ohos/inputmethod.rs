@@ -81,8 +81,10 @@ unsafe extern "C" fn on_preview(
     start: i32,
     end: i32,
 ) -> i32 {
+    let composing = utf16_to_string(text, length);
+    *PREVIEW.lock().unwrap() = composing.clone();
     QUEUE.lock().unwrap().push(ImeCommand::Preview {
-        text: utf16_to_string(text, length),
+        text: composing,
         start,
         end,
     });
@@ -90,6 +92,7 @@ unsafe extern "C" fn on_preview(
 }
 
 unsafe extern "C" fn on_finish_preview(_proxy: *mut c_void) {
+    PREVIEW.lock().unwrap().clear();
     QUEUE.lock().unwrap().push(ImeCommand::ClearPreview);
 }
 
@@ -148,11 +151,22 @@ unsafe extern "C" fn on_get_right_text(
     unsafe { write_text_slice(number, text, length, false) };
 }
 
+/// The text the input method is composing right now.
+///
+/// Pressing enter confirms that composition, and the input method reports the
+/// text only through the preview callbacks - the enter callback says nothing
+/// about it. Committing a bare newline instead made the composition vanish in a
+/// single-line field without ever being inserted.
+static PREVIEW: Mutex<String> = Mutex::new(String::new());
+
 unsafe extern "C" fn on_enter_key(_proxy: *mut c_void, _kind: i32) {
-    QUEUE
-        .lock()
-        .unwrap()
-        .push(ImeCommand::Commit("\n".to_string()));
+    let composing = std::mem::take(&mut *PREVIEW.lock().unwrap());
+    if composing.is_empty() {
+        // Nothing was being composed: this is an ordinary enter, and the
+        // application gets it through the ordinary key path.
+        return;
+    }
+    QUEUE.lock().unwrap().push(ImeCommand::Commit(composing));
 }
 
 unsafe extern "C" fn on_move_cursor(_proxy: *mut c_void, direction: i32) {
