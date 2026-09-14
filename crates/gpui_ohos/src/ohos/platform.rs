@@ -1001,10 +1001,14 @@ impl Platform for OhosPlatform {
     }
 
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
+        // Windows the application has already closed are left out. The session
+        // stores this list, and a closed window kept here came back the next time
+        // the application started - which is exactly what the user saw.
         Some(
             self.handles
                 .borrow()
                 .iter()
+                .filter(|(_, shared)| shared.upgrade().map_or(false, |shared| !shared.is_closed()))
                 .map(|(handle, _)| *handle)
                 .collect(),
         )
