@@ -534,7 +534,7 @@ pub(crate) struct OhosWindow {
 /// measured to leave a black window behind rather than removing it, which is
 /// worse than doing nothing. Turn this on once the host has a call that really
 /// closes a window.
-const CLOSE_WINDOW_WITH_APP: bool = false;
+const CLOSE_WINDOW_WITH_APP: bool = true;
 
 impl Drop for OhosWindow {
     fn drop(&mut self) {
