@@ -159,6 +159,15 @@ impl OhosPlatform {
                 super::note_focus(id, value != "0");
                 *self.pending_focus.borrow_mut() = Some((id.to_string(), value != "0"));
             }
+            host::event::WINDOW_CLOSED => {
+                // The system closed this window. gpui has to be told, because the
+                // application is what removes the window and drops its workspace
+                // from the session.
+                let (id, _) = split_window_event(arg);
+                for window in self.route_targets(id) {
+                    window.notify_closed();
+                }
+            }
             host::event::WINDOW_STATUS => {
                 // 1 full screen, 2 maximize, 3 minimize, 4 floating, 5 split.
                 // On 2in1 the system reports MAXIMIZE for a screen-filling

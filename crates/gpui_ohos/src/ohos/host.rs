@@ -67,6 +67,9 @@ pub(crate) mod event {
     /// Enable the forced-redraw frame-rate benchmark; the argument is the
     /// number of frames to present.
     pub const BENCHMARK: i32 = 8;
+    /// A window is gone: the platform closed it, and the application has to hear
+    /// about it or it keeps the window's workspace in its session for ever.
+    pub const WINDOW_CLOSED: i32 = 9;
 }
 
 /// Function pointers implemented by the ArkTS host.

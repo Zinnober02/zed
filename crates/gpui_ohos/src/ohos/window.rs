@@ -263,6 +263,17 @@ impl WindowShared {
         self.callbacks.borrow_mut().appearance_changed = callback;
     }
 
+    /// Tell the application the platform window is gone.
+    ///
+    /// Without this the application only ever cleared a window it closed itself,
+    /// so a window closed from the system stayed in the session and came back the
+    /// next time it started.
+    pub(crate) fn notify_closed(&self) {
+        if let Some(close) = self.callbacks.borrow_mut().close.take() {
+            close();
+        }
+    }
+
     /// Apply an IME command to the focused input handler.
     pub(crate) fn handle_ime(&self, command: &super::inputmethod::ImeCommand) {
         use super::inputmethod::ImeCommand;
@@ -534,7 +545,7 @@ pub(crate) struct OhosWindow {
 /// measured to leave a black window behind rather than removing it, which is
 /// worse than doing nothing. Turn this on once the host has a call that really
 /// closes a window.
-const CLOSE_WINDOW_WITH_APP: bool = true;
+const CLOSE_WINDOW_WITH_APP: bool = false;
 
 impl Drop for OhosWindow {
     fn drop(&mut self) {
