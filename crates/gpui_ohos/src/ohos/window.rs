@@ -571,6 +571,15 @@ pub(crate) struct OhosWindow {
 /// closes one window and nothing else.
 const CLOSE_WINDOW_WITH_APP: bool = true;
 
+/// Set once the application has asked to quit.
+///
+/// Windows dropped as part of that quit must not each ask the host to close
+/// their own window: the host is already ending the whole application, and doing
+/// both left white windows behind, because the host destroyed the surfaces while
+/// the window's own instance was going away.
+pub(crate) static QUITTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Drop for OhosWindow {
     fn drop(&mut self) {
         // The application drops this whenever it closes a window itself, and that
@@ -578,7 +587,7 @@ impl Drop for OhosWindow {
         // closed the frame loop kept asking a window the application no longer
         // had to draw, and every frame came back "window not found".
         self.shared.mark_closed();
-        if CLOSE_WINDOW_WITH_APP {
+        if CLOSE_WINDOW_WITH_APP && !QUITTING.load(std::sync::atomic::Ordering::Relaxed) {
             host::window_op_for(self.shared.id(), host::op::CLOSE_WINDOW, "");
         }
     }

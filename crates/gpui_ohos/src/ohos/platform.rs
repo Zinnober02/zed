@@ -877,6 +877,11 @@ impl Platform for OhosPlatform {
         // killed by the platform, so the application never got to run its
         // shutdown - which is where it writes the session, and why closed windows
         // kept coming back on the next start.
+        //
+        // The windows the application drops on the way out must not also ask the
+        // host to close themselves: the host is ending the whole application, and
+        // doing both left white windows behind.
+        super::window::QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
         host::window_op(host::op::QUIT, "");
     }
 
