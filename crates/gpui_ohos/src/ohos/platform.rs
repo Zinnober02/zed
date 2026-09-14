@@ -45,6 +45,21 @@ impl Default for SurfaceState {
     }
 }
 
+/// Drop a closed window from the list the application saves as its session.
+///
+/// A handle that is never removed means the list only ever grows, so the session
+/// could never shrink and every window the user closed came back the next time
+/// the application started.
+fn forget_window(handles: &RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>, id: &str) {
+    handles
+        .borrow_mut()
+        .retain(|(_, shared)| shared.upgrade().map_or(false, |shared| shared.id() != id));
+    super::vk::log(&format!(
+        "[gpui_ohos] window stack now {} after closing {id}",
+        handles.borrow().len()
+    ));
+}
+
 pub(crate) struct OhosPlatform {
     dispatcher: Arc<OhosDispatcher>,
     background_executor: BackgroundExecutor,
@@ -167,6 +182,7 @@ impl OhosPlatform {
                 // on its own, with no "\t" and value after it; parsing it as one
                 // of those produced an empty id, which routes to every window.
                 let id = arg.trim();
+                forget_window(&self.handles, id);
                 let targets = self.route_targets(id);
                 super::vk::log(&format!(
                     "[gpui_ohos] window closed {id}: {} window(s) matched",
