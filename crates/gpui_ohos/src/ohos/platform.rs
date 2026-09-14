@@ -15,7 +15,7 @@ use crate::{
     Keymap, Menu, MenuItem, Modifiers, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay,
     PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, PriorityQueueReceiver, Result as GpuiResult, RunnableVariant, Task,
-    ThermalState, WindowAppearance, WindowParams,
+    ThermalState, WindowAppearance, WindowKind, WindowParams,
 };
 
 use super::dispatcher::OhosDispatcher;
@@ -771,7 +771,28 @@ fn split_window_event(arg: &str) -> (&str, &str) {
     }
 }
 
-/// Payload for CREATE_WINDOW: "<id>\t<left>,<top>,<width>,<height>\t<title>\t<resizable>".
+/// How the host should open the window.
+///
+/// An editor window is a real top-level window that the taskbar lists and that
+/// can be maximized on its own. The application's auxiliary windows - about,
+/// settings, notifications - are marked with their own kinds, and they belong to
+/// the window that opened them: they float above it and can be closed on their
+/// own, which a window of a whole ability instance cannot be.
+fn window_kind_name(kind: &WindowKind) -> &'static str {
+    match kind {
+        WindowKind::Normal => "normal",
+        WindowKind::Floating => "floating",
+        WindowKind::PopUp | WindowKind::AnchoredPopup(_) => "popup",
+        WindowKind::Dialog => "dialog",
+        // LayerShell only exists in builds that turn on gpui's wayland feature,
+        // which this crate does not control; it is not a window a 2in1 host opens
+        // anyway, so anything else counts as an ordinary window.
+        _ => "normal",
+    }
+}
+
+/// Payload for CREATE_WINDOW:
+/// "<id>\t<left>,<top>,<width>,<height>\t<title>\t<resizable>\t<kind>".
 fn create_window_payload(
     id: &str,
     params: &WindowParams,
@@ -796,7 +817,8 @@ fn create_window_payload(
         .map(|title| title.to_string())
         .unwrap_or_default();
     let resizable = if params.is_resizable { "1" } else { "0" };
-    format!("{id}\t{left},{top},{width},{height}\t{title}\t{resizable}")
+    let kind = window_kind_name(&params.kind);
+    format!("{id}\t{left},{top},{width},{height}\t{title}\t{resizable}\t{kind}")
 }
 
 /// Map a GPUI cursor style to the OHOS PointerStyle enum member name.
