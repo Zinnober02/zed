@@ -35,6 +35,9 @@ pub(crate) mod op {
     pub const CLOSE_WINDOW: i32 = 19;
     /// The application is quitting: it has finished, and the host should end it.
     pub const QUIT: i32 = 20;
+    /// What shows through the window: opaque, transparent or blurred, as the
+    /// theme asks for.
+    pub const SET_BACKGROUND: i32 = 21;
 }
 
 /// Synchronous queries. The host writes a UTF-8 answer into the buffer.

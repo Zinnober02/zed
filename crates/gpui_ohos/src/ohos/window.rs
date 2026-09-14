@@ -677,7 +677,21 @@ impl PlatformWindow for OhosWindow {
         host::window_op_for(self.shared.id(), host::op::SET_TITLE, title);
     }
 
-    fn set_background_appearance(&self, _appearance: WindowBackgroundAppearance) {}
+    fn set_background_appearance(&self, appearance: WindowBackgroundAppearance) {
+        // Driven by the theme: a theme with a transparent or blurred background
+        // needs the window itself to be see-through, and leaving this empty made
+        // every theme opaque whatever it asked for.
+        let value = match appearance {
+            WindowBackgroundAppearance::Opaque => "opaque",
+            WindowBackgroundAppearance::Transparent => "transparent",
+            WindowBackgroundAppearance::Blurred => "blurred",
+            // The Mica backdrops are a Windows idea; a blur is the closest the
+            // platform here has, and it is free to ignore it.
+            WindowBackgroundAppearance::MicaBackdrop
+            | WindowBackgroundAppearance::MicaAltBackdrop => "blurred",
+        };
+        host::window_op_for(self.shared.id(), host::op::SET_BACKGROUND, value);
+    }
 
     fn minimize(&self) {
         host::window_op_for(self.shared.id(), host::op::MINIMIZE, "");
