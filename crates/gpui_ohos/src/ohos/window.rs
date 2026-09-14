@@ -587,7 +587,16 @@ impl Drop for OhosWindow {
         // closed the frame loop kept asking a window the application no longer
         // had to draw, and every frame came back "window not found".
         self.shared.mark_closed();
-        if CLOSE_WINDOW_WITH_APP && !QUITTING.load(std::sync::atomic::Ordering::Relaxed) {
+        // Never for the main window. It belongs to the entry ability, and asking
+        // the host to close it takes that ability - and with it the whole user
+        // interface - down, which is what left every other window blank. The
+        // system's own close button is the only thing that should end it, and that
+        // path asks the application first.
+        // The host names the first surface this, and its window is the one the
+        // entry ability's page owns.
+        let is_main = self.shared.id() == "gpui_surface";
+        if CLOSE_WINDOW_WITH_APP && !is_main && !QUITTING.load(std::sync::atomic::Ordering::Relaxed)
+        {
             host::window_op_for(self.shared.id(), host::op::CLOSE_WINDOW, "");
         }
     }
