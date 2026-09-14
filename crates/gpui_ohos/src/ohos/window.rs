@@ -269,7 +269,13 @@ impl WindowShared {
     /// so a window closed from the system stayed in the session and came back the
     /// next time it started.
     pub(crate) fn notify_closed(&self) {
-        if let Some(close) = self.callbacks.borrow_mut().close.take() {
+        let close = self.callbacks.borrow_mut().close.take();
+        super::vk::log(&format!(
+            "[gpui_ohos] window {} closed: callback {}",
+            self.id,
+            if close.is_some() { "found" } else { "missing" }
+        ));
+        if let Some(close) = close {
             close();
         }
     }

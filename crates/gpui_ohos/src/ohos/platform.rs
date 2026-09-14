@@ -163,8 +163,16 @@ impl OhosPlatform {
                 // The system closed this window. gpui has to be told, because the
                 // application is what removes the window and drops its workspace
                 // from the session.
-                let (id, _) = split_window_event(arg);
-                for window in self.route_targets(id) {
+                // Unlike the other window events this argument is the surface id
+                // on its own, with no "\t" and value after it; parsing it as one
+                // of those produced an empty id, which routes to every window.
+                let id = arg.trim();
+                let targets = self.route_targets(id);
+                super::vk::log(&format!(
+                    "[gpui_ohos] window closed {id}: {} window(s) matched",
+                    targets.len()
+                ));
+                for window in targets {
                     window.notify_closed();
                 }
             }
@@ -763,7 +771,14 @@ impl Platform for OhosPlatform {
         *self.pending_launch.borrow_mut() = Some(on_finish_launching);
     }
 
-    fn quit(&self) {}
+    fn quit(&self) {
+        // The application asks to quit when it has no windows left, and the host
+        // is what can end it. Leaving this empty meant the process was only ever
+        // killed by the platform, so the application never got to run its
+        // shutdown - which is where it writes the session, and why closed windows
+        // kept coming back on the next start.
+        host::window_op(host::op::QUIT, "");
+    }
 
     fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {}
 

@@ -33,6 +33,8 @@ pub(crate) mod op {
     pub const SET_APPEARANCE: i32 = 18;
     /// Close the window this id names, because the application is done with it.
     pub const CLOSE_WINDOW: i32 = 19;
+    /// The application is quitting: it has finished, and the host should end it.
+    pub const QUIT: i32 = 20;
 }
 
 /// Synchronous queries. The host writes a UTF-8 answer into the buffer.
