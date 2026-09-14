@@ -98,12 +98,15 @@ pub(crate) struct OhosPlatform {
     restore_delivered: Cell<bool>,
     /// Focus change reported by the host, applied from the frame loop.
     pending_focus: RefCell<Option<(String, bool)>>,
-    /// The size a surface last reported, applied once per tick.
+    /// The size each surface last reported, applied once per tick.
     ///
     /// Rebuilding the swapchain blocks this thread until the GPU is idle, and one
-    /// maximize arrives from two places, so the work waits for the frame loop and
-    /// only the latest size is applied.
-    pending_surface_size: RefCell<Option<(String, u32, u32)>>,
+    /// maximize arrives from two places, so the work waits for the frame loop.
+    /// One slot was not enough: two windows resized within the same frame left
+    /// only the second, and the host reports a size only when it changes, so the
+    /// first window kept rendering at its old size for good. Every surface keeps
+    /// its own latest size and all of them are applied together.
+    pending_surface_size: RefCell<HashMap<String, (u32, u32)>>,
     /// Window rect in physical pixels: (x, y, width, height).
     window_rect: Cell<(f32, f32, f32, f32)>,
 }
@@ -149,7 +152,7 @@ impl OhosPlatform {
             restore_pulled: Cell::new(false),
             restore_delivered: Cell::new(false),
             pending_focus: RefCell::new(None),
-            pending_surface_size: RefCell::new(None),
+            pending_surface_size: RefCell::new(HashMap::new()),
             window_rect: Cell::new(window_rect),
         })
     }
@@ -461,15 +464,24 @@ impl OhosPlatform {
         }
         // Recorded, not applied: this is called from the ArkUI resize callback,
         // and the work below blocks on the GPU and rebuilds the swapchain.
-        *self.pending_surface_size.borrow_mut() = Some((id.to_string(), width, height));
+        self.pending_surface_size
+            .borrow_mut()
+            .insert(id.to_string(), (width, height));
     }
 
-    /// Apply the size a surface last reported, if any. Runs once per frame.
+    /// Apply the sizes the surfaces last reported. Runs once per frame, and every
+    /// surface with a pending size is applied: leaving one behind would keep that
+    /// window at its old size until it was resized again.
     fn apply_pending_surface_size(&self) {
-        let Some((id, width, height)) = self.pending_surface_size.borrow_mut().take() else {
-            return;
-        };
-        self.apply_surface_resized(&id, width, height);
+        let pending: Vec<(String, u32, u32)> = self
+            .pending_surface_size
+            .borrow_mut()
+            .drain()
+            .map(|(id, (width, height))| (id, width, height))
+            .collect();
+        for (id, width, height) in pending {
+            self.apply_surface_resized(&id, width, height);
+        }
     }
 
     fn apply_surface_resized(&self, id: &str, width: u32, height: u32) {
