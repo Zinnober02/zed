@@ -561,11 +561,14 @@ pub(crate) struct OhosWindow {
 
 /// Whether closing a window from the application also closes the platform window.
 ///
-/// Off for now: removing a window only clears the application's own bookkeeping,
-/// and the host's only way to close one - the ArkTS call that destroys it - was
-/// measured to leave a black window behind rather than removing it, which is
-/// worse than doing nothing. Turn this on once the host has a call that really
-/// closes a window.
+/// Off, and both alternatives were measured on device: ending the window's
+/// ability instance (which is what the host does for this signal) takes the whole
+/// application down with it - closing one window closed all of them - and
+/// destroying the window directly leaves a black window behind. So an application
+/// close cannot be honoured here: the application defers the close to save first,
+/// the system's close is what actually removes the window, and until then the
+/// user closes it again. Turn this on if the platform ever gains a call that
+/// closes one window and nothing else.
 const CLOSE_WINDOW_WITH_APP: bool = false;
 
 impl Drop for OhosWindow {
