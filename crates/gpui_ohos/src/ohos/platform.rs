@@ -359,6 +359,13 @@ impl OhosPlatform {
         let (sender, receiver) = oneshot::channel();
         let id = self.next_pick_id.get();
         self.next_pick_id.set(id + 1);
+        // Answers that will never be collected are dropped here: a caller that
+        // gives up on a picker leaves its slot behind for ever otherwise, and the
+        // sender and the future with it. Only entries whose receiver is already
+        // gone are removed, so a picker still on screen is untouched.
+        self.pending_picks
+            .borrow_mut()
+            .retain(|_, sender| !sender.is_canceled());
         self.pending_picks.borrow_mut().insert(id, sender);
         let payload = format!(
             "p{id}|{}|{}|{}",
@@ -1105,6 +1112,9 @@ impl Platform for OhosPlatform {
         let (sender, raw) = oneshot::channel();
         let id = self.next_pick_id.get();
         self.next_pick_id.set(id + 1);
+        self.pending_picks
+            .borrow_mut()
+            .retain(|_, sender| !sender.is_canceled());
         self.pending_picks.borrow_mut().insert(id, sender);
         let payload = format!(
             "n{id}|{}|{}",
