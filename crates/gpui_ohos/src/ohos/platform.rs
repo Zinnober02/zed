@@ -107,8 +107,14 @@ pub(crate) struct OhosPlatform {
     /// first window kept rendering at its old size for good. Every surface keeps
     /// its own latest size and all of them are applied together.
     pending_surface_size: RefCell<HashMap<String, (u32, u32)>>,
-    /// Window rect in physical pixels: (x, y, width, height).
-    window_rect: Cell<(f32, f32, f32, f32)>,
+    /// Window rect in physical pixels, per surface: (x, y, width, height).
+    ///
+    /// One value was not enough. The input method's candidate window is placed
+    /// against the origin of the window being typed into, and with several windows
+    /// open a single value put it over whichever window reported last.
+    window_rect: RefCell<HashMap<String, (f32, f32, f32, f32)>>,
+    /// What the host reported before any window reported a rectangle of its own.
+    primary_window_rect: Cell<(f32, f32, f32, f32)>,
 }
 
 impl OhosPlatform {
@@ -153,7 +159,8 @@ impl OhosPlatform {
             restore_delivered: Cell::new(false),
             pending_focus: RefCell::new(None),
             pending_surface_size: RefCell::new(HashMap::new()),
-            window_rect: Cell::new(window_rect),
+            window_rect: RefCell::new(HashMap::new()),
+            primary_window_rect: Cell::new(window_rect),
         })
     }
 
@@ -222,7 +229,7 @@ impl OhosPlatform {
             host::event::WINDOW_RECT => {
                 let (id, value) = split_window_event(arg);
                 if let Some(rect) = parse_rect(value) {
-                    self.window_rect.set(rect);
+                    self.window_rect.borrow_mut().insert(id.to_string(), rect);
                     // The same size change also arrives as a window rectangle, and
                     // this used to be remembered only for the caret's origin. The
                     // surface was never told, so a maximized window kept rendering
@@ -716,7 +723,7 @@ impl OhosPlatform {
     /// Text, caret and absolute caret rect (physical pixels) of the focused
     /// editor, for IME context notifications.
     pub(crate) fn ime_context(&self) -> Option<(String, usize, (f64, f64, f64, f64))> {
-        let (rect_x, rect_y, _, _) = self.window_rect.get();
+        let rects = self.window_rect.borrow();
         let scale = super::window::SCALE as f64;
         // The focused window first: with several windows open, the first one with
         // an input handler is not necessarily the one being typed into, and the
@@ -728,6 +735,11 @@ impl OhosPlatform {
             .chain(windows.iter().filter(|window| !window.is_active()));
         for window in ordered {
             if let Some((text, caret, cursor)) = window.ime_context() {
+                // This window's own origin, not whichever window reported last.
+                let (rect_x, rect_y, _, _) = rects
+                    .get(window.id())
+                    .copied()
+                    .unwrap_or_else(|| self.primary_window_rect.get());
                 let left = rect_x as f64 + cursor.origin.x.as_f32() as f64 * scale;
                 let top = rect_y as f64 + cursor.origin.y.as_f32() as f64 * scale;
                 let width = cursor.size.width.as_f32() as f64 * scale;
