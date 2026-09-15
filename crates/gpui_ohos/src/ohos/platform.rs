@@ -382,6 +382,14 @@ impl OhosPlatform {
         // the update; otherwise insert the primary at the front.
         if let Some((_, surface)) = surfaces.iter().find(|(existing, _)| existing == id) {
             let mut state = surface.borrow_mut();
+            if state.valid && !state.window.is_null() && state.window != window {
+                // Two native windows for one id. Overwriting would leave the first
+                // window drawing into the second one's surface.
+                super::vk::log(&format!(
+                    "[gpui_ohos] surface {id} already has a window; not replacing it"
+                ));
+                return;
+            }
             state.window = window;
             state.width = width;
             state.height = height;
@@ -419,6 +427,14 @@ impl OhosPlatform {
         };
         {
             let mut state = surface.borrow_mut();
+            if state.valid && !state.window.is_null() && state.window != window {
+                // Two native windows for one id; the second would take the entry
+                // over and the first window would draw into it.
+                super::vk::log(&format!(
+                    "[gpui_ohos] surface {id} already has a window; not replacing it"
+                ));
+                return;
+            }
             state.window = window;
             state.width = width;
             state.height = height;

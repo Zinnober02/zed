@@ -56,6 +56,10 @@ fn utf16_to_string(text: *const u16, length: usize) -> String {
 unsafe extern "C" fn on_insert(_proxy: *mut c_void, text: *const u16, length: usize) {
     let value = utf16_to_string(text, length);
     if !value.is_empty() {
+        super::vk::log(&format!(
+            "[gpui_ohos] ime insert: {} char(s)",
+            value.chars().count()
+        ));
         QUEUE.lock().unwrap().push(ImeCommand::Commit(value));
     }
 }
@@ -161,6 +165,10 @@ static PREVIEW: Mutex<String> = Mutex::new(String::new());
 
 unsafe extern "C" fn on_enter_key(_proxy: *mut c_void, _kind: i32) {
     let composing = std::mem::take(&mut *PREVIEW.lock().unwrap());
+    super::vk::log(&format!(
+        "[gpui_ohos] ime enter: composing {} char(s)",
+        composing.chars().count()
+    ));
     if composing.is_empty() {
         // Nothing was being composed: this is an ordinary enter, and the
         // application gets it through the ordinary key path.
