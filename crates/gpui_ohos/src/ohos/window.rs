@@ -617,6 +617,11 @@ impl Drop for OhosWindow {
         // is the only notice this side gets of it. Without marking the window
         // closed the frame loop kept asking a window the application no longer
         // had to draw, and every frame came back "window not found".
+        super::vk::log(&format!(
+            "[gpui_ohos] dropped by the application: {} (primary={})",
+            self.shared.id(),
+            self.shared.is_primary()
+        ));
         self.shared.mark_closed();
         // Never for the main window. It belongs to the entry ability, and asking
         // the host to close it takes that ability - and with it the whole user

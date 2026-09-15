@@ -683,9 +683,15 @@ impl OhosPlatform {
         // window whose surface has gone is exactly the one the application still
         // needs to be asked about - it is the application's answer that saves the
         // workspace out of the session before the window goes.
-        self.targets_for_surface(id)
+        let targets = self.targets_for_surface(id).len();
+        let allowed = self
+            .targets_for_surface(id)
             .iter()
-            .all(|window| window.should_close())
+            .all(|window| window.should_close());
+        super::vk::log(&format!(
+            "[gpui_ohos] asked to close {id}: {allowed} ({targets} window(s))"
+        ));
+        allowed
     }
 
     /// Every window bound to a surface, closed one included.

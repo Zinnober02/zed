@@ -11385,7 +11385,14 @@ pub(crate) async fn prepare_window_to_close(
         .log_err();
 
     let Some((originally_active, workspaces)) = active_and_workspaces else {
-        return Ok(true);
+        // The window could not be reached. Removing it anyway would leave its
+        // workspace in the session for ever - the removal happens in the
+        // workspaces, and they cannot be reached from here - so the close is
+        // refused instead. The window stays and the user can close it again.
+        log::error!(
+            "[gpui_ohos] window cannot be prepared (it is already gone); refusing the close"
+        );
+        return Ok(false);
     };
 
     let mut prepared = anyhow::Ok(true);
