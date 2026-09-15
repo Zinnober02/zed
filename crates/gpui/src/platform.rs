@@ -1452,6 +1452,27 @@ pub struct PlatformInputHandler {
     handler: Box<dyn InputHandler>,
 }
 
+/// Report a failed input-method call at most once every few seconds.
+///
+/// The input method keeps calling while a window is going away and every call
+/// then fails, so the point is to notice the failure without drowning the log.
+fn log_input_failure(callback: &str, error: &anyhow::Error) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const INTERVAL_MS: u64 = 5_000;
+    static LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_millis() as u64)
+        .unwrap_or_default();
+    if now.saturating_sub(LAST_REPORTED.load(Ordering::Relaxed)) < INTERVAL_MS {
+        return;
+    }
+    LAST_REPORTED.store(now, Ordering::Relaxed);
+    log::warn!("input method callback {callback} failed: {error:#}");
+}
+
 #[expect(missing_docs)]
 #[cfg_attr(
     all(
@@ -1502,12 +1523,13 @@ impl PlatformInputHandler {
     }
 
     pub fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
-        self.cx
-            .update(|window, cx| {
-                self.handler
-                    .replace_text_in_range(replacement_range, text, window, cx);
-            })
-            .ok();
+        let result = self.cx.update(|window, cx| {
+            self.handler
+                .replace_text_in_range(replacement_range, text, window, cx);
+        });
+        if let Err(error) = result {
+            log_input_failure("replace_text_in_range", &error);
+        }
     }
 
     pub fn replace_and_mark_text_in_range(
@@ -1516,24 +1538,28 @@ impl PlatformInputHandler {
         new_text: &str,
         new_selected_range: Option<Range<usize>>,
     ) {
-        self.cx
-            .update(|window, cx| {
-                self.handler.replace_and_mark_text_in_range(
-                    range_utf16,
-                    new_text,
-                    new_selected_range,
-                    window,
-                    cx,
-                )
-            })
-            .ok();
+        let result = self.cx.update(|window, cx| {
+            self.handler.replace_and_mark_text_in_range(
+                range_utf16,
+                new_text,
+                new_selected_range,
+                window,
+                cx,
+            )
+        });
+        if let Err(error) = result {
+            log_input_failure("replace_and_mark_text_in_range", &error);
+        }
     }
 
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn unmark_text(&mut self) {
-        self.cx
-            .update(|window, cx| self.handler.unmark_text(window, cx))
-            .ok();
+        let result = self
+            .cx
+            .update(|window, cx| self.handler.unmark_text(window, cx));
+        if let Err(error) = result {
+            log_input_failure("unmark_text", &error);
+        }
     }
 
     pub fn paste(&mut self, item: ClipboardItem) {
