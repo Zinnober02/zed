@@ -44,14 +44,20 @@ pub struct WorkspaceSettings {
     pub focus_follows_mouse: FocusFollowsMouse,
 }
 
-#[cfg(target_os = "macos")]
+// On OHOS this answers the same way macOS does rather than the way the other
+// platforms do, and it is not about whether the application quits: the platform
+// decides that. It decides whether closing the last window counts as quitting for
+// the session, and answering yes skipped taking the workspace out of the session
+// entirely - so every window the user closed came back the next time. The real
+// quit is still protected by the close intent.
+#[cfg(any(target_os = "macos", target_env = "ohos"))]
 pub fn closing_last_window_quits_app(cx: &App) -> bool {
     WorkspaceSettings::get_global(cx)
         .on_last_window_closed
         .is_quit_app()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_env = "ohos")))]
 pub fn closing_last_window_quits_app(_cx: &App) -> bool {
     true
 }
