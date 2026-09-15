@@ -210,6 +210,11 @@ impl Render for PlatformTitleBar {
                     gpui::MouseButton::Left,
                     cx.listener(move |this, _ev, _window, _cx| {
                         this.should_move = true;
+                        // With the system title row hidden the whole strip is ours, and
+                        // the enclosing title-bar region would take focus on this press
+                        // otherwise - which hides the focused pane's tab bar buttons.
+                        #[cfg(target_env = "ohos")]
+                        _window.prevent_default();
                     }),
                 )
                 .on_mouse_move(cx.listener(move |this, _ev, window, _| {
