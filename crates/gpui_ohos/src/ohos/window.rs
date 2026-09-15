@@ -98,6 +98,12 @@ impl Default for WindowCallbacks {
 pub(crate) struct WindowShared {
     /// Host-side window id ("gpui_surface" or "gpui_surface_N").
     id: String,
+    /// Whether this is the window bound to the primary surface.
+    ///
+    /// The main window is a state the platform tracks. It used to be a name
+    /// comparison against the host's primary id, which broke the moment anything
+    /// else carried that name.
+    is_primary: Cell<bool>,
     surface: Rc<RefCell<SurfaceState>>,
     bounds: RefCell<Bounds<Pixels>>,
     scale: Cell<f32>,
@@ -154,6 +160,7 @@ impl WindowShared {
         );
         Rc::new(Self {
             id,
+            is_primary: Cell::new(false),
             surface,
             bounds: RefCell::new(bounds),
             scale: Cell::new(scale),
@@ -189,6 +196,17 @@ impl WindowShared {
     /// The host-side id, used to route commands to this window.
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Record that this window is the one the primary surface belongs to.
+    pub(crate) fn mark_primary(&self) {
+        self.is_primary.set(true);
+    }
+
+    /// Whether this is the main window. Its close belongs to the system's own
+    /// close button, which asks the application first.
+    pub(crate) fn is_primary(&self) -> bool {
+        self.is_primary.get()
     }
 
     pub(crate) fn mark_closed(&self) {
@@ -605,9 +623,7 @@ impl Drop for OhosWindow {
         // interface - down, which is what left every other window blank. The
         // system's own close button is the only thing that should end it, and that
         // path asks the application first.
-        // The host names the first surface this, and its window is the one the
-        // entry ability's page owns.
-        let is_main = self.shared.id() == "gpui_surface";
+        let is_main = self.shared.is_primary();
         if CLOSE_WINDOW_WITH_APP && !is_main && !QUITTING.load(std::sync::atomic::Ordering::Relaxed)
         {
             host::window_op_for(self.shared.id(), host::op::CLOSE_WINDOW, "");

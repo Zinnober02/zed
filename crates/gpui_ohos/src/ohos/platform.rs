@@ -1053,6 +1053,16 @@ impl Platform for OhosPlatform {
         // invalid here and is filled in when the host reports it.
         let (id, surface) = self.surface_for_window(&options);
         let shared = WindowShared::new(id, surface, options, self.foreground_executor.clone());
+        // The window holding the primary surface is the main one. The platform
+        // tracks that; nothing compares ids by name.
+        if self
+            .surfaces
+            .borrow()
+            .first()
+            .map_or(false, |(first, _)| *first == shared.id())
+        {
+            shared.mark_primary();
+        }
         self.windows.borrow_mut().push(shared.clone());
         self.handles
             .borrow_mut()
