@@ -323,7 +323,18 @@ impl WindowShared {
         };
         match command {
             ImeCommand::Commit(text) => {
-                handler.replace_text_in_range(None, text);
+                // Not None: that means "replace the marked range", and the input
+                // method may finish the preview before it reports the confirmation -
+                // the mark is gone by then and the replacement lands nowhere, which
+                // is how a confirmed composition was lost. The marked range is used
+                // when it is still there, and the caret (an empty selection) when it
+                // is not.
+                let range = handler.marked_text_range().or_else(|| {
+                    handler
+                        .selected_text_range(false)
+                        .map(|selection| selection.range)
+                });
+                handler.replace_text_in_range(range, text);
                 handler.unmark_text();
             }
             ImeCommand::Backspace(count) => {
