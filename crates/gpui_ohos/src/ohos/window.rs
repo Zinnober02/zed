@@ -629,6 +629,7 @@ impl Drop for OhosWindow {
             self.shared.is_primary()
         ));
         self.shared.mark_closed();
+        super::inputmethod::forget(self.shared.id());
         // Never for the main window. It belongs to the entry ability, and asking
         // the host to close it takes that ability - and with it the whole user
         // interface - down, which is what left every other window blank. The
@@ -877,10 +878,13 @@ impl PlatformWindow for OhosWindow {
         if self.shared.virtual_keyboard_visible.replace(visible) == visible {
             return;
         }
+        // The request names its window: one input method client serves the whole
+        // process, and which window it belongs to decides whether the system
+        // accepts showing it at all.
         if visible {
-            super::inputmethod::show();
+            super::inputmethod::show(self.shared.id());
         } else {
-            super::inputmethod::hide();
+            super::inputmethod::hide(self.shared.id());
         }
     }
 

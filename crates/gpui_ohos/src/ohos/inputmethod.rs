@@ -6,7 +6,7 @@
 //! the input method, which is what makes it enter composing mode.
 
 use std::ffi::{CString, c_char, c_int, c_void};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 unsafe extern "C" {
@@ -27,6 +27,16 @@ pub(crate) enum ImeCommand {
 
 static QUEUE: Mutex<Vec<ImeCommand>> = Mutex::new(Vec::new());
 static ATTACHED: Mutex<bool> = Mutex::new(false);
+/// The window whose text field asked for the input method. One client serves the
+/// whole process and the system binds it to whichever window holds focus, so the
+/// request has to be remembered and replayed once that window really has focus.
+static OWNER: Mutex<Option<String>> = Mutex::new(None);
+static WANTED: AtomicBool = AtomicBool::new(false);
+static SHOWING: AtomicBool = AtomicBool::new(false);
+/// Frames left before the next attempt, so a refusal is retried without asking
+/// (and logging) on every single frame.
+static RETRY_IN: AtomicU32 = AtomicU32::new(0);
+const RETRY_FRAMES: u32 = 30;
 /// (full text, caret index in UTF-16, absolute caret rect) mirrored from the
 /// focused editor.
 static IME_CONTEXT: Mutex<(String, usize, (f64, f64, f64, f64))> =
@@ -313,9 +323,12 @@ pub(crate) fn attach() {
             PROXY.store(proxy_out as usize, Ordering::Relaxed);
             let show_code = show_text_input(proxy_out, options);
             super::vk::log(&format!("[gpui_ohos] IME showTextInput code={show_code}"));
+            // Only a client the system accepted may count as attached: it refuses
+            // while the window it would bind to is not focused yet (12800003), and
+            // remembering that refusal as success stopped every later attempt.
+            *attached = true;
         }
         let _ = on_noop as *const c_void;
-        *attached = true;
     }
 }
 
@@ -338,25 +351,29 @@ fn try_show() -> i32 {
     }
 }
 
-pub fn show() {
-    let code = try_show();
-    if code == 0 {
-        return;
-    }
-    // 12800009 IME_ERR_DETACHED: the system unbinds the client when the window
-    // loses focus, and a detached client rejects ShowTextInput. Bind again.
-    super::vk::log(&format!(
-        "[gpui_ohos] IME show failed code={code}; re-attaching"
-    ));
-    *ATTACHED.lock().unwrap() = false;
-    *IME_CONTEXT.lock().unwrap() = (String::new(), 0, (0.0, 0.0, 2.0, 20.0));
-    attach();
-    let code = try_show();
-    super::vk::log(&format!("[gpui_ohos] IME show after re-attach code={code}"));
+/// A window's text field asked for the input method.
+pub fn show(owner: &str) {
+    *OWNER.lock().unwrap() = Some(owner.to_string());
+    WANTED.store(true, Ordering::Relaxed);
+    RETRY_IN.store(0, Ordering::Relaxed);
 }
 
-/// Leave the editing state. Pairs with show().
-pub fn hide() {
+/// A window's text field gave the input method up.
+///
+/// Only the owner may end the session. A window that merely lost focus reported
+/// this as well, and hiding there ended the session of the window that had just
+/// taken focus over - the panel stayed, and everything typed went nowhere.
+pub fn hide(owner: &str) {
+    {
+        let current = OWNER.lock().unwrap();
+        if current.as_deref() != Some(owner) {
+            return;
+        }
+    }
+    WANTED.store(false, Ordering::Relaxed);
+    if !SHOWING.swap(false, Ordering::Relaxed) {
+        return;
+    }
     let proxy = PROXY.load(Ordering::Relaxed) as *mut c_void;
     if proxy.is_null() {
         return;
@@ -365,6 +382,80 @@ pub fn hide() {
         let code = unsafe { hide(proxy) };
         super::vk::log(&format!("[gpui_ohos] IME hide code={code}"));
     }
+}
+
+/// The window the input method is bound to, if one asked for it.
+pub(crate) fn owner() -> Option<String> {
+    OWNER.lock().unwrap().clone()
+}
+
+/// Forget a window that is gone: a dead owner would otherwise keep the retry
+/// below asking the system about a window that no longer exists.
+pub(crate) fn forget(id: &str) {
+    let mut owner = OWNER.lock().unwrap();
+    if owner.as_deref() == Some(id) {
+        *owner = None;
+        WANTED.store(false, Ordering::Relaxed);
+        SHOWING.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Replay a pending request once its window holds focus, and keep retrying.
+///
+/// The system binds the client to the focused window only: asking while another
+/// window has focus answers 12800003 IME_ERR_IMCLIENT ("the edit box is not
+/// focused"), and it detaches the client whenever focus moves (12800009). The
+/// application asks exactly once per focus change, so a single refusal used to
+/// leave that window without an input method for good.
+pub(crate) fn apply(active: Option<&str>) {
+    if !WANTED.load(Ordering::Relaxed) || SHOWING.load(Ordering::Relaxed) {
+        return;
+    }
+    let owner = match OWNER.lock().unwrap().clone() {
+        Some(owner) => owner,
+        None => return,
+    };
+    if active != Some(owner.as_str()) {
+        return;
+    }
+    if RETRY_IN.load(Ordering::Relaxed) > 0 {
+        RETRY_IN.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+    let code = show_now();
+    if code == 0 {
+        SHOWING.store(true, Ordering::Relaxed);
+        super::vk::log(&format!("[gpui_ohos] IME showing for {owner}"));
+    } else {
+        RETRY_IN.store(RETRY_FRAMES, Ordering::Relaxed);
+        log_refusal(code, &owner);
+    }
+}
+
+/// Ask for the input method, attaching first when the system had detached the
+/// client. Returns the code the system answered with.
+fn show_now() -> i32 {
+    let code = try_show();
+    if code == 0 {
+        return 0;
+    }
+    // 12800009 IME_ERR_DETACHED: the system unbinds the client when its window
+    // loses focus, and a detached client rejects ShowTextInput. Bind again.
+    *ATTACHED.lock().unwrap() = false;
+    *IME_CONTEXT.lock().unwrap() = (String::new(), 0, (0.0, 0.0, 2.0, 20.0));
+    attach();
+    try_show()
+}
+
+/// Report a repeating refusal once per code, the way the context notifications do.
+fn log_refusal(code: i32, owner: &str) {
+    static LAST_REFUSAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    if LAST_REFUSAL.swap(code, Ordering::Relaxed) == code {
+        return;
+    }
+    super::vk::log(&format!(
+        "[gpui_ohos] IME refused for {owner}: code={code}; retrying"
+    ));
 }
 
 pub(crate) fn drain() -> Vec<ImeCommand> {

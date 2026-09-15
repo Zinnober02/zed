@@ -788,15 +788,26 @@ impl OhosPlatform {
     /// the active one.
     pub(crate) fn handle_ime(&self, command: super::inputmethod::ImeCommand) {
         let windows = self.windows();
-        let target = windows
-            .iter()
-            .find(|window| window.is_active())
-            .or_else(|| windows.first());
+        let active = windows.iter().find(|window| window.is_active());
+        // Falling back to the first window is what sent text composed in another
+        // window into the main one. The input method's own window is the only
+        // other legitimate target, and with neither there is nowhere to put the
+        // text at all.
+        let owner = super::inputmethod::owner();
+        let target = active.or_else(|| {
+            owner
+                .as_deref()
+                .and_then(|owner| windows.iter().find(|window| window.id() == owner))
+        });
         let Some(window) = target else {
             super::vk::log("[gpui_ohos] ime command with no window to take it");
             return;
         };
-        super::vk::log(&format!("[gpui_ohos] ime -> {} (active)", window.id()));
+        super::vk::log(&format!(
+            "[gpui_ohos] ime -> {} ({})",
+            window.id(),
+            if active.is_some() { "active" } else { "owner" }
+        ));
         window.handle_ime(&command);
     }
 
@@ -851,9 +862,10 @@ fn window_kind_name(kind: &WindowKind) -> &'static str {
         WindowKind::Floating => "floating",
         WindowKind::PopUp | WindowKind::AnchoredPopup(_) => "popup",
         WindowKind::Dialog => "dialog",
-        // LayerShell only exists in builds that turn on gpui's wayland feature,
-        // which this crate does not control; it is not a window a 2in1 host opens
-        // anyway, so anything else counts as an ordinary window.
+        // LayerShell only exists when gpui is built with its wayland feature,
+        // which this crate does not turn on, so a host here never opens one. The
+        // arm is unreachable in that configuration and required in the other one.
+        #[allow(unreachable_patterns)]
         _ => "normal",
     }
 }

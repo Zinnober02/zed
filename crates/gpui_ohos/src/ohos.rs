@@ -418,6 +418,10 @@ pub fn tick() {
         if let Some((text, caret, cursor)) = platform.ime_context() {
             inputmethod::update_context(&text, caret, cursor);
         }
+        // The input method binds to a window only while that window holds focus,
+        // so a request made while another window was focused is replayed here
+        // once it does.
+        inputmethod::apply(focused_surface().as_deref());
         platform.tick();
     });
 }
@@ -503,6 +507,13 @@ thread_local! {
     /// request; the host reports every change, so this cannot go stale.
     static FOCUSED_SURFACE: std::cell::RefCell<Option<String>> =
         std::cell::RefCell::new(None);
+}
+
+/// The surface ArkUI currently focuses, if any. The input method binds to the
+/// focused window only, so this is what decides when a pending request may be
+/// replayed.
+pub(crate) fn focused_surface() -> Option<String> {
+    FOCUSED_SURFACE.with(|cell| cell.borrow().clone())
 }
 
 /// Record a focus change reported by the host.
