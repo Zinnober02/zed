@@ -60,26 +60,36 @@ fn forget_window(handles: &RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>, 
     ));
 }
 
+/// Everything the platform knows about its windows, in one table.
+///
+/// The surface each window owns, the windows themselves and which of them the
+/// host last reported as focused used to be three separate fields, so they could
+/// disagree without anything saying so.
+pub(crate) struct WindowRegistry {
+    /// The surface ArkUI currently focuses. Only a different one needs a focus
+    /// request; the host reports every change, so this cannot go stale.
+    focused_surface: RefCell<Option<String>>,
+    /// GPUI window handles paired with their platform window, in open order.
+    handles: RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>,
+    /// The windows themselves, in open order.
+    windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
+    /// Every XComponent surface, keyed by its XComponent id; index 0 is the
+    /// primary surface that launched the application.
+    surfaces: Rc<RefCell<Vec<(String, Rc<RefCell<SurfaceState>>)>>>,
+}
+
 pub(crate) struct OhosPlatform {
     dispatcher: Arc<OhosDispatcher>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
-    /// Every XComponent surface, keyed by its XComponent id; index 0 is the
-    /// primary surface that launched the application.
-    surfaces: Rc<RefCell<Vec<(String, Rc<RefCell<SurfaceState>>)>>>,
     /// How many GPUI windows have been bound to a surface.
     windows_opened: Cell<usize>,
     /// Which way round the theme is, as Zed last reported it.
     theme_appearance: Cell<&'static str>,
-    /// The surface ArkUI currently focuses. Only a different one needs a focus
-    /// request; the host reports every change, so this cannot go stale.
-    focused_surface: RefCell<Option<String>>,
+    registry: WindowRegistry,
     pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
-    windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
-    /// GPUI window handles paired with their platform window, in open order.
-    handles: RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>,
     menus: RefCell<Vec<OwnedMenu>>,
     app_menu_action: RefCell<Option<Box<dyn FnMut(&dyn Action)>>>,
     app_menu_will_open: RefCell<Option<Box<dyn FnMut()>>>,
@@ -139,12 +149,9 @@ impl OhosPlatform {
             foreground_executor,
             text_system: Arc::new(OhosTextSystem::new()),
             main_receiver,
-            surfaces: Rc::new(RefCell::new(Vec::new())),
             windows_opened: Cell::new(0),
             theme_appearance: Cell::new("system"),
             pending_launch: RefCell::new(None),
-            windows: Rc::new(RefCell::new(Vec::new())),
-            handles: RefCell::new(Vec::new()),
             menus: RefCell::new(Vec::new()),
             app_menu_action: RefCell::new(None),
             app_menu_will_open: RefCell::new(None),
@@ -154,7 +161,12 @@ impl OhosPlatform {
             on_reopen: RefCell::new(None),
             on_system_wake: RefCell::new(None),
             appearance: Cell::new(appearance),
-            focused_surface: RefCell::new(None),
+            registry: WindowRegistry {
+                focused_surface: RefCell::new(None),
+                handles: RefCell::new(Vec::new()),
+                windows: Rc::new(RefCell::new(Vec::new())),
+                surfaces: Rc::new(RefCell::new(Vec::new())),
+            },
             pending_picks: RefCell::new(HashMap::new()),
             next_pick_id: Cell::new(1),
             restore_folder: RefCell::new(None),
@@ -176,7 +188,7 @@ impl OhosPlatform {
     /// runs on the platform's own thread, and a thread local there was a second
     /// truth waiting to disagree with this one.
     pub(crate) fn note_focus(&self, id: &str, focused: bool) {
-        let mut current = self.focused_surface.borrow_mut();
+        let mut current = self.registry.focused_surface.borrow_mut();
         if focused {
             *current = Some(id.to_string());
         } else if current.as_deref() == Some(id) {
@@ -187,7 +199,7 @@ impl OhosPlatform {
     /// The surface ArkUI currently focuses, if any. The input method binds to the
     /// focused window only, so this decides when a pending request may be replayed.
     pub(crate) fn focused_surface(&self) -> Option<String> {
-        self.focused_surface.borrow().clone()
+        self.registry.focused_surface.borrow().clone()
     }
     pub(crate) fn handle_host_event(&self, kind: i32, arg: &str) {
         super::vk::log(&format!("[gpui_ohos] host event {kind}: {arg}"));
@@ -236,6 +248,7 @@ impl OhosPlatform {
                     let (width, height) = (rect.2, rect.3);
                     if width > 0.0 && height > 0.0 {
                         let current = self
+                            .registry
                             .surfaces
                             .borrow()
                             .iter()
@@ -375,7 +388,7 @@ impl OhosPlatform {
 
     /// Register the primary surface (the one that launched the application).
     pub(crate) fn set_surface(&self, id: &str, window: *mut c_void, width: u32, height: u32) {
-        let mut surfaces = self.surfaces.borrow_mut();
+        let mut surfaces = self.registry.surfaces.borrow_mut();
         // Reuse the existing entry so any window already holding this Rc sees
         // the update; otherwise insert the primary at the front.
         if let Some((_, surface)) = surfaces.iter().find(|(existing, _)| existing == id) {
@@ -414,7 +427,7 @@ impl OhosPlatform {
     /// entry in place rather than replacing it.
     pub(crate) fn add_surface(&self, id: &str, window: *mut c_void, width: u32, height: u32) {
         let surface = {
-            let mut surfaces = self.surfaces.borrow_mut();
+            let mut surfaces = self.registry.surfaces.borrow_mut();
             if let Some((_, surface)) = surfaces.iter().find(|(existing, _)| existing == id) {
                 surface.clone()
             } else {
@@ -438,7 +451,7 @@ impl OhosPlatform {
             state.height = height;
             state.valid = true;
         }
-        for window in self.windows.borrow().iter() {
+        for window in self.registry.windows.borrow().iter() {
             if window.shares_surface(&surface) {
                 window.on_surface_resized(width, height);
             }
@@ -452,10 +465,10 @@ impl OhosPlatform {
         self.windows_opened.set(index + 1);
         super::vk::log(&format!(
             "[gpui_ohos] window request index={index} surfaces={} reopened={}",
-            self.surfaces.borrow().len(),
-            index < self.surfaces.borrow().len()
+            self.registry.surfaces.borrow().len(),
+            index < self.registry.surfaces.borrow().len()
         ));
-        let mut surfaces = self.surfaces.borrow_mut();
+        let mut surfaces = self.registry.surfaces.borrow_mut();
         let (width, height) = surfaces
             .first()
             .map(|(_, surface)| {
@@ -485,7 +498,7 @@ impl OhosPlatform {
             // The window needs the theme's appearance too: the report arrived
             // before this window existed.
             host::window_op_for(&id, host::op::SET_APPEARANCE, self.theme_appearance.get());
-            surfaces = self.surfaces.borrow_mut();
+            surfaces = self.registry.surfaces.borrow_mut();
         }
         let id = surfaces[index].0.clone();
         (id, surfaces[index].1.clone())
@@ -519,7 +532,7 @@ impl OhosPlatform {
 
     fn apply_surface_resized(&self, id: &str, width: u32, height: u32) {
         let surface = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .iter()
                 .find(|(existing, _)| existing == id)
@@ -534,7 +547,7 @@ impl OhosPlatform {
             state.height = height;
             state.valid = true;
         }
-        for window in self.windows.borrow().iter() {
+        for window in self.registry.windows.borrow().iter() {
             if window.shares_surface(&surface) {
                 window.on_surface_resized(width, height);
             }
@@ -544,7 +557,7 @@ impl OhosPlatform {
 
     pub(crate) fn surface_destroyed(&self, id: &str) {
         let surface = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .iter()
                 .find(|(existing, _)| existing == id)
@@ -574,15 +587,16 @@ impl OhosPlatform {
             window.notify_closed();
             window.mark_closed();
         }
-        forget_window(&self.handles, id);
-        self.windows
+        forget_window(&self.registry.handles, id);
+        self.registry
+            .windows
             .borrow_mut()
             .retain(|window| !window.is_closed());
         // A window that closes never reports a blur, so the surface the host
         // believes is focused would keep naming it and the next focus request
         // would look redundant when it is not.
         {
-            let mut focused = self.focused_surface.borrow_mut();
+            let mut focused = self.registry.focused_surface.borrow_mut();
             if focused.as_deref() == Some(id) {
                 *focused = None;
             }
@@ -611,6 +625,7 @@ impl OhosPlatform {
         // empty one on top, so wait until a window has actually drawn.
         if !self.restore_delivered.get()
             && self
+                .registry
                 .windows
                 .borrow()
                 .iter()
@@ -680,7 +695,7 @@ impl OhosPlatform {
     }
 
     pub(crate) fn request_frames(&self) {
-        for window in self.windows.borrow().iter() {
+        for window in self.registry.windows.borrow().iter() {
             if !window.is_closed() {
                 window.request_frame();
             }
@@ -688,7 +703,8 @@ impl OhosPlatform {
     }
 
     pub(crate) fn window_count(&self) -> usize {
-        self.windows
+        self.registry
+            .windows
             .borrow()
             .iter()
             .filter(|window| !window.is_closed())
@@ -720,10 +736,10 @@ impl OhosPlatform {
     /// Every window bound to a surface, closed one included.
     fn targets_for_surface(&self, id: &str) -> Vec<Rc<WindowShared>> {
         if id.is_empty() {
-            return self.windows.borrow().clone();
+            return self.registry.windows.borrow().clone();
         }
         let surface = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .iter()
                 .find(|(existing, _)| existing == id)
@@ -732,7 +748,8 @@ impl OhosPlatform {
         let Some(surface) = surface else {
             return Vec::new();
         };
-        self.windows
+        self.registry
+            .windows
             .borrow()
             .iter()
             .filter(|window| window.shares_surface(&surface))
@@ -745,7 +762,7 @@ impl OhosPlatform {
             return self.windows();
         }
         let surface = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .iter()
                 .find(|(existing, _)| existing == id)
@@ -754,7 +771,8 @@ impl OhosPlatform {
         let Some(surface) = surface else {
             return Vec::new();
         };
-        self.windows
+        self.registry
+            .windows
             .borrow()
             .iter()
             .filter(|window| !window.is_closed() && window.shares_surface(&surface))
@@ -764,7 +782,8 @@ impl OhosPlatform {
 
     /// Snapshot of live window state, for input routing and frame ticks.
     pub(crate) fn windows(&self) -> Vec<Rc<WindowShared>> {
-        self.windows
+        self.registry
+            .windows
             .borrow()
             .iter()
             .filter(|window| !window.is_closed())
@@ -1048,7 +1067,7 @@ impl Platform for OhosPlatform {
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         let (w, h) = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .first()
                 .map(|(_, surface)| {
@@ -1069,7 +1088,8 @@ impl Platform for OhosPlatform {
             .windows()
             .into_iter()
             .find(|window| window.is_active())?;
-        self.handles
+        self.registry
+            .handles
             .borrow()
             .iter()
             .find(|(_, shared)| {
@@ -1085,7 +1105,8 @@ impl Platform for OhosPlatform {
         // stores this list, and a closed window kept here came back the next time
         // the application started - which is exactly what the user saw.
         Some(
-            self.handles
+            self.registry
+                .handles
                 .borrow()
                 .iter()
                 .filter(|(_, shared)| shared.upgrade().map_or(false, |shared| !shared.is_closed()))
@@ -1120,6 +1141,7 @@ impl Platform for OhosPlatform {
         // The window holding the primary surface is the main one. The platform
         // tracks that; nothing compares ids by name.
         if self
+            .registry
             .surfaces
             .borrow()
             .first()
@@ -1127,8 +1149,9 @@ impl Platform for OhosPlatform {
         {
             shared.mark_primary();
         }
-        self.windows.borrow_mut().push(shared.clone());
-        self.handles
+        self.registry.windows.borrow_mut().push(shared.clone());
+        self.registry
+            .handles
             .borrow_mut()
             .push((handle, Rc::downgrade(&shared)));
         Ok(Box::new(OhosWindow::new(shared)))
@@ -1147,7 +1170,7 @@ impl Platform for OhosPlatform {
         // Remembered because Zed reports this before any window exists, and each
         // window is told again when it is created.
         self.theme_appearance.set(value);
-        for window in self.windows.borrow().iter() {
+        for window in self.registry.windows.borrow().iter() {
             host::window_op_for(window.id(), host::op::SET_APPEARANCE, value);
         }
     }
