@@ -995,7 +995,12 @@ impl Platform for OhosPlatform {
         // host to close themselves: the host is ending the whole application, and
         // doing both left white windows behind.
         super::window::QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
-        host::window_op(host::op::QUIT, "");
+        // The host ends the process, but not from here: the shutdown work this
+        // returns into - the session write among it - is queued on this same
+        // thread, and leaving before it drains loses it. The loop sends the quit
+        // once the queue it was called in is empty, which is the acknowledgement
+        // the host needed a fixed delay for.
+        super::request_quit();
     }
 
     fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {}

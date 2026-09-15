@@ -218,6 +218,9 @@ static PLATFORM_STARTED: AtomicBool = AtomicBool::new(false);
 /// Whether a frame has been asked for and not drawn yet.
 static TICK_WANTED: AtomicBool = AtomicBool::new(false);
 
+/// Whether the application asked to quit and the host has not been told yet.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Start the platform's own thread. Everything that touches gpui runs there, and
 /// the host only ever hands work over: a JavaScript thread dying no longer takes
 /// the frame loop, the input method session or a window's surface with it.
@@ -250,6 +253,12 @@ where
                 // re-enter the frame loop.
                 if TICK_WANTED.swap(false, Ordering::SeqCst) {
                     tick_platform(&platform);
+                }
+                // The queue that carried the quit has drained, so everything the
+                // shutdown queued behind it has run. Now the host can end it.
+                if QUIT_REQUESTED.swap(false, Ordering::SeqCst) {
+                    vk::log("[gpui_ohos] telling the host to quit");
+                    host::window_op(host::op::QUIT, "");
                 }
             }
         });
@@ -578,6 +587,13 @@ fn tick_platform(platform: &Rc<OhosPlatform>) {
     // request made while another window was focused is replayed here once it does.
     inputmethod::apply(focused_surface().as_deref());
     platform.tick();
+}
+
+/// The application wants the process to end. Recorded rather than sent: the host
+/// may only be told once the work the announcement came from has drained.
+pub(crate) fn request_quit() {
+    QUIT_REQUESTED.store(true, Ordering::SeqCst);
+    platform_queue().wake();
 }
 
 /// A frame was asked for. Requests coalesce: the first one wakes the loop and the
