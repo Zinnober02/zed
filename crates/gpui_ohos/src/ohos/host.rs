@@ -77,10 +77,12 @@ pub(crate) mod event {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HostOps {
-    /// Run a command: returns 0 on success, negative on failure.
-    pub window_op: Option<unsafe extern "C" fn(i32, *const c_char) -> i32>,
+    /// Run a command: returns 0 on success, negative on failure. An empty id means
+    /// the command names no window.
+    pub window_op: Option<unsafe extern "C" fn(i32, *const c_char, *const c_char) -> i32>,
     /// Answer a query: returns the byte count written, or negative on failure.
-    pub query: Option<unsafe extern "C" fn(i32, *const c_char, *mut c_char, usize) -> i32>,
+    pub query:
+        Option<unsafe extern "C" fn(i32, *const c_char, *const c_char, *mut c_char, usize) -> i32>,
 }
 
 static OPS: OnceLock<HostOps> = OnceLock::new();
@@ -90,34 +92,40 @@ pub(crate) fn set_ops(ops: HostOps) {
     super::vk::log("[gpui_ohos] host ops installed");
 }
 
-/// Send a command that names the window it targets. The host strips the id
-/// prefix before handling the payload, so ids must not contain a tab.
+/// Send a command that names the window it targets.
 pub(crate) fn window_op_for(id: &str, op: i32, arg: &str) {
-    window_op(op, &format!("{id}\t{arg}"));
+    super::vk::log(&format!("[gpui_ohos] host op {op}: {id}\t{arg}"));
+    send(id, op, arg);
 }
 
 /// Send a command to the host. Silently no-ops when the host is absent.
 pub(crate) fn window_op(op: i32, arg: &str) {
     super::vk::log(&format!("[gpui_ohos] host op {op}: {arg}"));
-    send(op, arg);
+    send("", op, arg);
 }
 
 /// Send a command that fires often enough that logging it would drown the log.
 pub(crate) fn window_op_quiet(op: i32, arg: &str) {
-    send(op, arg);
+    send("", op, arg);
 }
 
-fn send(op: i32, arg: &str) {
+/// The window and the payload travel separately: the host used to split them out
+/// of one string, and a payload that happened to contain the separator was read as
+/// a different window's command.
+fn send(id: &str, op: i32, arg: &str) {
     let Some(ops) = OPS.get() else {
         return;
     };
     let Some(call) = ops.window_op else {
         return;
     };
+    let Ok(id) = CString::new(id) else {
+        return;
+    };
     let Ok(arg) = CString::new(arg) else {
         return;
     };
-    unsafe { call(op, arg.as_ptr()) };
+    unsafe { call(op, id.as_ptr(), arg.as_ptr()) };
 }
 
 /// Ask for a frame now. gpui calls this as soon as anything changes, and the
@@ -142,8 +150,9 @@ pub(crate) fn query(op: i32, arg: &str) -> anyhow::Result<String> {
     let call = ops
         .query
         .ok_or_else(|| anyhow::anyhow!("the host does not answer queries"))?;
+    let id = CString::new("").expect("an empty id has no NUL");
     let arg = CString::new(arg).map_err(|_| anyhow::anyhow!("query argument contains a NUL"))?;
-    let needed = unsafe { call(op, arg.as_ptr(), std::ptr::null_mut(), 0) };
+    let needed = unsafe { call(op, id.as_ptr(), arg.as_ptr(), std::ptr::null_mut(), 0) };
     if needed < 0 {
         anyhow::bail!("host query {op} failed while sizing its answer: {needed}");
     }
@@ -151,6 +160,7 @@ pub(crate) fn query(op: i32, arg: &str) -> anyhow::Result<String> {
     let written = unsafe {
         call(
             op,
+            id.as_ptr(),
             arg.as_ptr(),
             buffer.as_mut_ptr() as *mut c_char,
             buffer.len(),
