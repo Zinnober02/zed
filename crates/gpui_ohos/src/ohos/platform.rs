@@ -60,6 +60,17 @@ fn forget_window(handles: &RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>, 
     ));
 }
 
+/// Everything the platform knows about its windows, in one table.
+///
+/// The surface each window owns, the windows themselves and which of them the
+/// host last reported as focused used to be three separate fields, so they could
+/// disagree without anything saying so.
+pub(crate) struct WindowRegistry {
+    /// The surface ArkUI currently focuses. Only a different one needs a focus
+    /// request; the host reports every change, so this cannot go stale.
+    focused_surface: RefCell<Option<String>>,
+}
+
 pub(crate) struct OhosPlatform {
     dispatcher: Arc<OhosDispatcher>,
     background_executor: BackgroundExecutor,
@@ -73,9 +84,7 @@ pub(crate) struct OhosPlatform {
     windows_opened: Cell<usize>,
     /// Which way round the theme is, as Zed last reported it.
     theme_appearance: Cell<&'static str>,
-    /// The surface ArkUI currently focuses. Only a different one needs a focus
-    /// request; the host reports every change, so this cannot go stale.
-    focused_surface: RefCell<Option<String>>,
+    registry: WindowRegistry,
     pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
     windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
     /// GPUI window handles paired with their platform window, in open order.
@@ -154,7 +163,9 @@ impl OhosPlatform {
             on_reopen: RefCell::new(None),
             on_system_wake: RefCell::new(None),
             appearance: Cell::new(appearance),
-            focused_surface: RefCell::new(None),
+            registry: WindowRegistry {
+                focused_surface: RefCell::new(None),
+            },
             pending_picks: RefCell::new(HashMap::new()),
             next_pick_id: Cell::new(1),
             restore_folder: RefCell::new(None),
@@ -176,7 +187,7 @@ impl OhosPlatform {
     /// runs on the platform's own thread, and a thread local there was a second
     /// truth waiting to disagree with this one.
     pub(crate) fn note_focus(&self, id: &str, focused: bool) {
-        let mut current = self.focused_surface.borrow_mut();
+        let mut current = self.registry.focused_surface.borrow_mut();
         if focused {
             *current = Some(id.to_string());
         } else if current.as_deref() == Some(id) {
@@ -187,7 +198,7 @@ impl OhosPlatform {
     /// The surface ArkUI currently focuses, if any. The input method binds to the
     /// focused window only, so this decides when a pending request may be replayed.
     pub(crate) fn focused_surface(&self) -> Option<String> {
-        self.focused_surface.borrow().clone()
+        self.registry.focused_surface.borrow().clone()
     }
     pub(crate) fn handle_host_event(&self, kind: i32, arg: &str) {
         super::vk::log(&format!("[gpui_ohos] host event {kind}: {arg}"));
@@ -582,7 +593,7 @@ impl OhosPlatform {
         // believes is focused would keep naming it and the next focus request
         // would look redundant when it is not.
         {
-            let mut focused = self.focused_surface.borrow_mut();
+            let mut focused = self.registry.focused_surface.borrow_mut();
             if focused.as_deref() == Some(id) {
                 *focused = None;
             }
