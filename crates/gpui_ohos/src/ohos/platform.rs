@@ -73,6 +73,9 @@ pub(crate) struct WindowRegistry {
     handles: RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>,
     /// The windows themselves, in open order.
     windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
+    /// Every XComponent surface, keyed by its XComponent id; index 0 is the
+    /// primary surface that launched the application.
+    surfaces: Rc<RefCell<Vec<(String, Rc<RefCell<SurfaceState>>)>>>,
 }
 
 pub(crate) struct OhosPlatform {
@@ -81,9 +84,6 @@ pub(crate) struct OhosPlatform {
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
-    /// Every XComponent surface, keyed by its XComponent id; index 0 is the
-    /// primary surface that launched the application.
-    surfaces: Rc<RefCell<Vec<(String, Rc<RefCell<SurfaceState>>)>>>,
     /// How many GPUI windows have been bound to a surface.
     windows_opened: Cell<usize>,
     /// Which way round the theme is, as Zed last reported it.
@@ -149,7 +149,6 @@ impl OhosPlatform {
             foreground_executor,
             text_system: Arc::new(OhosTextSystem::new()),
             main_receiver,
-            surfaces: Rc::new(RefCell::new(Vec::new())),
             windows_opened: Cell::new(0),
             theme_appearance: Cell::new("system"),
             pending_launch: RefCell::new(None),
@@ -166,6 +165,7 @@ impl OhosPlatform {
                 focused_surface: RefCell::new(None),
                 handles: RefCell::new(Vec::new()),
                 windows: Rc::new(RefCell::new(Vec::new())),
+                surfaces: Rc::new(RefCell::new(Vec::new())),
             },
             pending_picks: RefCell::new(HashMap::new()),
             next_pick_id: Cell::new(1),
@@ -248,6 +248,7 @@ impl OhosPlatform {
                     let (width, height) = (rect.2, rect.3);
                     if width > 0.0 && height > 0.0 {
                         let current = self
+                            .registry
                             .surfaces
                             .borrow()
                             .iter()
@@ -387,7 +388,7 @@ impl OhosPlatform {
 
     /// Register the primary surface (the one that launched the application).
     pub(crate) fn set_surface(&self, id: &str, window: *mut c_void, width: u32, height: u32) {
-        let mut surfaces = self.surfaces.borrow_mut();
+        let mut surfaces = self.registry.surfaces.borrow_mut();
         // Reuse the existing entry so any window already holding this Rc sees
         // the update; otherwise insert the primary at the front.
         if let Some((_, surface)) = surfaces.iter().find(|(existing, _)| existing == id) {
@@ -426,7 +427,7 @@ impl OhosPlatform {
     /// entry in place rather than replacing it.
     pub(crate) fn add_surface(&self, id: &str, window: *mut c_void, width: u32, height: u32) {
         let surface = {
-            let mut surfaces = self.surfaces.borrow_mut();
+            let mut surfaces = self.registry.surfaces.borrow_mut();
             if let Some((_, surface)) = surfaces.iter().find(|(existing, _)| existing == id) {
                 surface.clone()
             } else {
@@ -464,10 +465,10 @@ impl OhosPlatform {
         self.windows_opened.set(index + 1);
         super::vk::log(&format!(
             "[gpui_ohos] window request index={index} surfaces={} reopened={}",
-            self.surfaces.borrow().len(),
-            index < self.surfaces.borrow().len()
+            self.registry.surfaces.borrow().len(),
+            index < self.registry.surfaces.borrow().len()
         ));
-        let mut surfaces = self.surfaces.borrow_mut();
+        let mut surfaces = self.registry.surfaces.borrow_mut();
         let (width, height) = surfaces
             .first()
             .map(|(_, surface)| {
@@ -497,7 +498,7 @@ impl OhosPlatform {
             // The window needs the theme's appearance too: the report arrived
             // before this window existed.
             host::window_op_for(&id, host::op::SET_APPEARANCE, self.theme_appearance.get());
-            surfaces = self.surfaces.borrow_mut();
+            surfaces = self.registry.surfaces.borrow_mut();
         }
         let id = surfaces[index].0.clone();
         (id, surfaces[index].1.clone())
@@ -531,7 +532,7 @@ impl OhosPlatform {
 
     fn apply_surface_resized(&self, id: &str, width: u32, height: u32) {
         let surface = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .iter()
                 .find(|(existing, _)| existing == id)
@@ -556,7 +557,7 @@ impl OhosPlatform {
 
     pub(crate) fn surface_destroyed(&self, id: &str) {
         let surface = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .iter()
                 .find(|(existing, _)| existing == id)
@@ -738,7 +739,7 @@ impl OhosPlatform {
             return self.registry.windows.borrow().clone();
         }
         let surface = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .iter()
                 .find(|(existing, _)| existing == id)
@@ -761,7 +762,7 @@ impl OhosPlatform {
             return self.windows();
         }
         let surface = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .iter()
                 .find(|(existing, _)| existing == id)
@@ -1066,7 +1067,7 @@ impl Platform for OhosPlatform {
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         let (w, h) = {
-            let surfaces = self.surfaces.borrow();
+            let surfaces = self.registry.surfaces.borrow();
             surfaces
                 .first()
                 .map(|(_, surface)| {
@@ -1140,6 +1141,7 @@ impl Platform for OhosPlatform {
         // The window holding the primary surface is the main one. The platform
         // tracks that; nothing compares ids by name.
         if self
+            .registry
             .surfaces
             .borrow()
             .first()
