@@ -565,6 +565,7 @@ impl Member {
 
                 let decoration = render_cx.decorate(pane, cx);
                 let is_active = pane == render_cx.active_pane();
+                pane.update(cx, |pane, cx| pane.set_workspace_active(is_active, cx));
 
                 let pane = div()
                     .relative()

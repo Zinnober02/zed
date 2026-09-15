@@ -407,6 +407,12 @@ pub struct Pane {
     next_activation_timestamp: Arc<AtomicUsize>,
     zoomed: bool,
     was_focused: bool,
+    /// Whether the workspace currently treats this pane as its active pane.
+    ///
+    /// Focus is a different question: a menu or the command palette takes
+    /// keyboard focus without the user leaving the pane, and the pane hides its
+    /// tab bar buttons whenever it looks unfocused.
+    workspace_active: bool,
     active_item_index: usize,
     preview_item_id: Option<EntityId>,
     last_focus_handle_by_item: HashMap<EntityId, WeakFocusHandle>,
@@ -577,6 +583,7 @@ impl Pane {
             activation_history: Vec::new(),
             next_activation_timestamp: next_timestamp.clone(),
             was_focused: false,
+            workspace_active: false,
             zoomed: false,
             active_item_index: 0,
             preview_item_id: None,
@@ -671,6 +678,19 @@ impl Pane {
             || self
                 .active_item()
                 .is_some_and(|item| item.item_focus_handle(cx).contains_focused(window, cx))
+    }
+
+    /// Records whether the workspace considers this pane its active pane.
+    ///
+    /// A pane keeps its tab bar buttons while it is the active pane even if
+    /// something else currently holds focus, because opening a menu does not
+    /// mean the user left this pane.
+    pub fn set_workspace_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.workspace_active == active {
+            return;
+        }
+        self.workspace_active = active;
+        cx.notify();
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4313,7 +4333,10 @@ fn default_render_tab_bar_buttons(
     window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
-    if !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
+    if !pane.has_focus(window, cx)
+        && !pane.context_menu_focused(window, cx)
+        && !pane.workspace_active
+    {
         return (None, None);
     }
     let (can_clone, can_split_move) = match pane.active_item() {
