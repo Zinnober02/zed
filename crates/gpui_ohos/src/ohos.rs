@@ -738,7 +738,7 @@ pub fn key_pre_ime(id: &str, action: i32, code: i32, _unicode: i32) -> bool {
     let down = action == 0;
     let modifiers = update_modifiers(code, down);
     if is_modifier_key(code) {
-        with_current(|platform| platform.dispatch_modifiers(id, modifiers));
+        dispatch_modifiers(id, modifiers);
         // The input method never sees a consumed event, and it needs the
         // modifier state to recognise its own switch shortcuts, so modifiers are
         // forwarded to it as well as to the application.
@@ -751,7 +751,7 @@ pub fn key_pre_ime(id: &str, action: i32, code: i32, _unicode: i32) -> bool {
         && !modifiers.control
         && !modifiers.alt;
     if is_switch_combo {
-        with_current(|platform| platform.dispatch_modifiers(id, modifiers));
+        dispatch_modifiers(id, modifiers);
         return false;
     }
     if !is_gpui_key(code, modifiers) {
@@ -767,11 +767,22 @@ pub fn key_event(id: &str, action: i32, code: i32, unicode: i32) {
     let down = action == 0;
     let modifiers = update_modifiers(code, down);
     if is_modifier_key(code) {
-        with_current(|platform| platform.dispatch_modifiers(id, modifiers));
+        dispatch_modifiers(id, modifiers);
         return;
     }
     let unicode = u32::try_from(unicode).ok().filter(|value| *value > 0);
     dispatch_key(id, down, code, modifiers, unicode);
+}
+
+/// Forward a modifier-state change to the surface's window.
+///
+/// The host calls this from the ArkUI thread while the application lives on the
+/// platform thread, so - like every other entry point - it is queued for that
+/// thread instead of being applied here. Doing it here reached a thread local
+/// that only the platform thread ever sets, so the change went nowhere.
+fn dispatch_modifiers(id: &str, modifiers: crate::Modifiers) {
+    let id = id.to_string();
+    post(move |platform| platform.dispatch_modifiers(&id, modifiers));
 }
 
 fn dispatch_key(
@@ -806,7 +817,8 @@ fn dispatch_key(
         if down { "down" } else { "up" },
         keystroke
     ));
-    with_current(|platform| platform.dispatch_key(id, down, keystroke));
+    let id = id.to_string();
+    post(move |platform| platform.dispatch_key(&id, down, keystroke));
 }
 
 /// Map an OHOS key code to a GPUI key name and the character it types.
