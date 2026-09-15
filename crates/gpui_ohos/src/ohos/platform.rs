@@ -69,6 +69,8 @@ pub(crate) struct WindowRegistry {
     /// The surface ArkUI currently focuses. Only a different one needs a focus
     /// request; the host reports every change, so this cannot go stale.
     focused_surface: RefCell<Option<String>>,
+    /// GPUI window handles paired with their platform window, in open order.
+    handles: RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>,
 }
 
 pub(crate) struct OhosPlatform {
@@ -87,8 +89,6 @@ pub(crate) struct OhosPlatform {
     registry: WindowRegistry,
     pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
     windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
-    /// GPUI window handles paired with their platform window, in open order.
-    handles: RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>,
     menus: RefCell<Vec<OwnedMenu>>,
     app_menu_action: RefCell<Option<Box<dyn FnMut(&dyn Action)>>>,
     app_menu_will_open: RefCell<Option<Box<dyn FnMut()>>>,
@@ -153,7 +153,6 @@ impl OhosPlatform {
             theme_appearance: Cell::new("system"),
             pending_launch: RefCell::new(None),
             windows: Rc::new(RefCell::new(Vec::new())),
-            handles: RefCell::new(Vec::new()),
             menus: RefCell::new(Vec::new()),
             app_menu_action: RefCell::new(None),
             app_menu_will_open: RefCell::new(None),
@@ -165,6 +164,7 @@ impl OhosPlatform {
             appearance: Cell::new(appearance),
             registry: WindowRegistry {
                 focused_surface: RefCell::new(None),
+                handles: RefCell::new(Vec::new()),
             },
             pending_picks: RefCell::new(HashMap::new()),
             next_pick_id: Cell::new(1),
@@ -585,7 +585,7 @@ impl OhosPlatform {
             window.notify_closed();
             window.mark_closed();
         }
-        forget_window(&self.handles, id);
+        forget_window(&self.registry.handles, id);
         self.windows
             .borrow_mut()
             .retain(|window| !window.is_closed());
@@ -1080,7 +1080,8 @@ impl Platform for OhosPlatform {
             .windows()
             .into_iter()
             .find(|window| window.is_active())?;
-        self.handles
+        self.registry
+            .handles
             .borrow()
             .iter()
             .find(|(_, shared)| {
@@ -1096,7 +1097,8 @@ impl Platform for OhosPlatform {
         // stores this list, and a closed window kept here came back the next time
         // the application started - which is exactly what the user saw.
         Some(
-            self.handles
+            self.registry
+                .handles
                 .borrow()
                 .iter()
                 .filter(|(_, shared)| shared.upgrade().map_or(false, |shared| !shared.is_closed()))
@@ -1139,7 +1141,8 @@ impl Platform for OhosPlatform {
             shared.mark_primary();
         }
         self.windows.borrow_mut().push(shared.clone());
-        self.handles
+        self.registry
+            .handles
             .borrow_mut()
             .push((handle, Rc::downgrade(&shared)));
         Ok(Box::new(OhosWindow::new(shared)))
