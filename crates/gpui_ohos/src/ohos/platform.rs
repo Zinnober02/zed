@@ -126,13 +126,14 @@ impl OhosPlatform {
         let dispatcher = Arc::new(OhosDispatcher::new(main_sender));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
-        // Both of these are pushed by the page as soon as its host ops are in
-        // place - the appearance and the window rectangle - so asking for them here
-        // only bought a query the host had to answer during start-up, and the answer
-        // was overwritten moments later. The defaults below stand for the instant
-        // before that push arrives.
-        let appearance = WindowAppearance::Light;
-        let window_rect = (0.0, 0.0, 0.0, 0.0);
+        let appearance = match host::query(host::query::COLOR_MODE, "").ok().as_deref() {
+            Some("0") => WindowAppearance::Dark,
+            _ => WindowAppearance::Light,
+        };
+        let window_rect = host::query(host::query::WINDOW_RECT, "")
+            .ok()
+            .and_then(|value| parse_rect(&value))
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
         Ok(Self {
             dispatcher,
             background_executor,
