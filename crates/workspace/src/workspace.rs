@@ -3484,6 +3484,11 @@ impl Workspace {
             let save_last_workspace = close_intent != CloseIntent::ReplaceWindow
                 && remaining_workspaces == 0
                 && closing_last_window_quits;
+            // TEMPORARY DIAGNOSTIC (revert once read): which condition decides
+            // whether a closed window leaves the session.
+            log::error!(
+                "[gpui_ohos] close decision: intent={close_intent:?} remaining={remaining_workspaces} quits={closing_last_window_quits} save_last={save_last_workspace} windows={workspace_count}"
+            );
 
             if let Some(active_call) = active_call
                 && workspace_count == 1

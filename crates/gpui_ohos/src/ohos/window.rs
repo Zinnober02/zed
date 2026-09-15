@@ -284,6 +284,10 @@ impl WindowShared {
     /// so a window closed from the system stayed in the session and came back the
     /// next time it started.
     pub(crate) fn notify_closed(&self) {
+        // A window that closes never reports a blur, so the surface the host
+        // believes is focused would keep naming it and the next focus request
+        // would look redundant when it is not.
+        super::note_focus(&self.id, false);
         let close = self.callbacks.borrow_mut().close.take();
         super::vk::log(&format!(
             "[gpui_ohos] window {} closed: callback {}",
