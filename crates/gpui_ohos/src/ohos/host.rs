@@ -41,8 +41,6 @@ pub(crate) mod op {
 
 /// Synchronous queries. The host writes a UTF-8 answer into the buffer.
 pub(crate) mod query {
-    pub const WINDOW_RECT: i32 = 100;
-    pub const COLOR_MODE: i32 = 102;
     /// Open a picked file read/write and return its descriptor.
     pub const OPEN_FILE: i32 = 105;
     /// List a picked directory: "name|isDir|uri" per line.
