@@ -155,6 +155,12 @@ impl PlatformQueue {
         self.wake.notify_all();
     }
 
+    /// Wake the loop without handing it work: the caller set state it has to look
+    /// at, such as a pending frame request.
+    pub(crate) fn wake(&self) {
+        self.wake.notify_all();
+    }
+
     /// Take everything queued so far, waiting up to `timeout` for the first one.
     /// An empty result means the wait ran out, not that there is nothing to do:
     /// frames are driven by the host, so a quiet queue is normal.
@@ -209,6 +215,9 @@ fn new_platform() -> Rc<OhosPlatform> {
 /// whether a surface belongs to a running platform.
 static PLATFORM_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// Whether a frame has been asked for and not drawn yet.
+static TICK_WANTED: AtomicBool = AtomicBool::new(false);
+
 /// Start the platform's own thread. Everything that touches gpui runs there, and
 /// the host only ever hands work over: a JavaScript thread dying no longer takes
 /// the frame loop, the input method session or a window's surface with it.
@@ -235,6 +244,12 @@ where
             loop {
                 for job in platform_queue().take(Duration::from_millis(500)) {
                     job(&platform);
+                }
+                // One frame per request however many arrived, and never from
+                // inside a job: a frame request made while drawing would otherwise
+                // re-enter the frame loop.
+                if TICK_WANTED.swap(false, Ordering::SeqCst) {
+                    tick_platform(&platform);
                 }
             }
         });
@@ -537,29 +552,44 @@ pub fn surface_resized(id: &str, width: u32, height: u32) {
 }
 
 /// XComponent surface destroyed.
+/// The host is about to destroy a native window.
+///
+/// Waiting for the platform thread is the handshake that makes that safe: that
+/// thread is the only one rendering into the window, and the host tears the window
+/// down as soon as this returns. Answering without waiting would let a frame be
+/// presented into a window that no longer exists.
 pub fn surface_destroyed(id: &str) {
     let id = id.to_string();
-    post(move |platform| {
+    on_platform(move |platform| {
         vk::log(&format!("[gpui_ohos] surface_destroyed id={id}"));
         platform.surface_destroyed(&id);
     });
 }
+/// One frame's work: the input method's queued commands and cursor context, then
+/// the frame itself.
+fn tick_platform(platform: &Rc<OhosPlatform>) {
+    for command in inputmethod::drain() {
+        platform.handle_ime(command);
+    }
+    if let Some((text, caret, cursor)) = platform.ime_context() {
+        inputmethod::update_context(&text, caret, cursor);
+    }
+    // The input method binds to a window only while that window holds focus, so a
+    // request made while another window was focused is replayed here once it does.
+    inputmethod::apply(focused_surface().as_deref());
+    platform.tick();
+}
 
-/// One frame tick, driven by the ArkTS host (DisplaySync or setInterval).
+/// A frame was asked for. Requests coalesce: the first one wakes the loop and the
+/// loop draws once for all of them, which is the backpressure the frame loop had.
+pub(crate) fn want_tick() {
+    TICK_WANTED.store(true, Ordering::SeqCst);
+    platform_queue().wake();
+}
+
+/// Called by the host once per refresh.
 pub fn tick() {
-    post(|platform| {
-        for command in inputmethod::drain() {
-            platform.handle_ime(command);
-        }
-        if let Some((text, caret, cursor)) = platform.ime_context() {
-            inputmethod::update_context(&text, caret, cursor);
-        }
-        // The input method binds to a window only while that window holds focus,
-        // so a request made while another window was focused is replayed here
-        // once it does.
-        inputmethod::apply(focused_surface().as_deref());
-        platform.tick();
-    });
+    want_tick();
 }
 
 fn map_button(button: u32) -> MouseButton {

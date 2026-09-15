@@ -26,8 +26,7 @@ pub(crate) mod op {
     pub const PICK_NEW_PATH: i32 = 13;
     pub const REQUEST_FOCUS: i32 = 15;
     /// Ask the host to draw a frame now rather than at the next refresh.
-    pub const REQUEST_FRAME: i32 = 17;
-    /// Create another OHOS window with an XComponent named by the argument.
+        /// Create another OHOS window with an XComponent named by the argument.
     pub const CREATE_WINDOW: i32 = 16;
     /// Which way round the theme is: the host draws the window buttons for it.
     pub const SET_APPEARANCE: i32 = 18;
@@ -125,10 +124,12 @@ fn send(op: i32, arg: &str) {
 }
 
 /// Ask for a frame now. gpui calls this as soon as anything changes, and the
-/// host answers by running a frame immediately instead of waiting for the next
-/// refresh, which is what keeps a keystroke from landing a period late.
+/// platform thread draws one immediately instead of waiting for the next refresh,
+/// which is what keeps a keystroke from landing a period late. Going out to the
+/// host and back for this cost a trip through the page's JavaScript before
+/// anything could be drawn at all.
 pub(crate) fn request_frame() {
-    window_op_quiet(op::REQUEST_FRAME, "");
+    super::want_tick();
 }
 
 /// Ask the host a question, returning its UTF-8 answer.
