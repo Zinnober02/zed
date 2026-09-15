@@ -71,6 +71,8 @@ pub(crate) struct WindowRegistry {
     focused_surface: RefCell<Option<String>>,
     /// GPUI window handles paired with their platform window, in open order.
     handles: RefCell<Vec<(AnyWindowHandle, Weak<WindowShared>)>>,
+    /// The windows themselves, in open order.
+    windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
 }
 
 pub(crate) struct OhosPlatform {
@@ -88,7 +90,6 @@ pub(crate) struct OhosPlatform {
     theme_appearance: Cell<&'static str>,
     registry: WindowRegistry,
     pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
-    windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
     menus: RefCell<Vec<OwnedMenu>>,
     app_menu_action: RefCell<Option<Box<dyn FnMut(&dyn Action)>>>,
     app_menu_will_open: RefCell<Option<Box<dyn FnMut()>>>,
@@ -152,7 +153,6 @@ impl OhosPlatform {
             windows_opened: Cell::new(0),
             theme_appearance: Cell::new("system"),
             pending_launch: RefCell::new(None),
-            windows: Rc::new(RefCell::new(Vec::new())),
             menus: RefCell::new(Vec::new()),
             app_menu_action: RefCell::new(None),
             app_menu_will_open: RefCell::new(None),
@@ -165,6 +165,7 @@ impl OhosPlatform {
             registry: WindowRegistry {
                 focused_surface: RefCell::new(None),
                 handles: RefCell::new(Vec::new()),
+                windows: Rc::new(RefCell::new(Vec::new())),
             },
             pending_picks: RefCell::new(HashMap::new()),
             next_pick_id: Cell::new(1),
@@ -449,7 +450,7 @@ impl OhosPlatform {
             state.height = height;
             state.valid = true;
         }
-        for window in self.windows.borrow().iter() {
+        for window in self.registry.windows.borrow().iter() {
             if window.shares_surface(&surface) {
                 window.on_surface_resized(width, height);
             }
@@ -545,7 +546,7 @@ impl OhosPlatform {
             state.height = height;
             state.valid = true;
         }
-        for window in self.windows.borrow().iter() {
+        for window in self.registry.windows.borrow().iter() {
             if window.shares_surface(&surface) {
                 window.on_surface_resized(width, height);
             }
@@ -586,7 +587,8 @@ impl OhosPlatform {
             window.mark_closed();
         }
         forget_window(&self.registry.handles, id);
-        self.windows
+        self.registry
+            .windows
             .borrow_mut()
             .retain(|window| !window.is_closed());
         // A window that closes never reports a blur, so the surface the host
@@ -622,6 +624,7 @@ impl OhosPlatform {
         // empty one on top, so wait until a window has actually drawn.
         if !self.restore_delivered.get()
             && self
+                .registry
                 .windows
                 .borrow()
                 .iter()
@@ -691,7 +694,7 @@ impl OhosPlatform {
     }
 
     pub(crate) fn request_frames(&self) {
-        for window in self.windows.borrow().iter() {
+        for window in self.registry.windows.borrow().iter() {
             if !window.is_closed() {
                 window.request_frame();
             }
@@ -699,7 +702,8 @@ impl OhosPlatform {
     }
 
     pub(crate) fn window_count(&self) -> usize {
-        self.windows
+        self.registry
+            .windows
             .borrow()
             .iter()
             .filter(|window| !window.is_closed())
@@ -731,7 +735,7 @@ impl OhosPlatform {
     /// Every window bound to a surface, closed one included.
     fn targets_for_surface(&self, id: &str) -> Vec<Rc<WindowShared>> {
         if id.is_empty() {
-            return self.windows.borrow().clone();
+            return self.registry.windows.borrow().clone();
         }
         let surface = {
             let surfaces = self.surfaces.borrow();
@@ -743,7 +747,8 @@ impl OhosPlatform {
         let Some(surface) = surface else {
             return Vec::new();
         };
-        self.windows
+        self.registry
+            .windows
             .borrow()
             .iter()
             .filter(|window| window.shares_surface(&surface))
@@ -765,7 +770,8 @@ impl OhosPlatform {
         let Some(surface) = surface else {
             return Vec::new();
         };
-        self.windows
+        self.registry
+            .windows
             .borrow()
             .iter()
             .filter(|window| !window.is_closed() && window.shares_surface(&surface))
@@ -775,7 +781,8 @@ impl OhosPlatform {
 
     /// Snapshot of live window state, for input routing and frame ticks.
     pub(crate) fn windows(&self) -> Vec<Rc<WindowShared>> {
-        self.windows
+        self.registry
+            .windows
             .borrow()
             .iter()
             .filter(|window| !window.is_closed())
@@ -1140,7 +1147,7 @@ impl Platform for OhosPlatform {
         {
             shared.mark_primary();
         }
-        self.windows.borrow_mut().push(shared.clone());
+        self.registry.windows.borrow_mut().push(shared.clone());
         self.registry
             .handles
             .borrow_mut()
@@ -1161,7 +1168,7 @@ impl Platform for OhosPlatform {
         // Remembered because Zed reports this before any window exists, and each
         // window is told again when it is created.
         self.theme_appearance.set(value);
-        for window in self.windows.borrow().iter() {
+        for window in self.registry.windows.borrow().iter() {
             host::window_op_for(window.id(), host::op::SET_APPEARANCE, value);
         }
     }
