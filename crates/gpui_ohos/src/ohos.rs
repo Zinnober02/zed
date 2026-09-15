@@ -16,7 +16,12 @@ use std::{
     ffi::c_void,
     future::Future,
     rc::{Rc, Weak},
-    sync::{Condvar, Mutex, OnceLock, mpsc},
+    sync::{
+        Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
 };
 
 use futures::{FutureExt as _, channel::oneshot, future::BoxFuture};
@@ -149,6 +154,18 @@ impl PlatformQueue {
         self.jobs.lock().unwrap().push_back(job);
         self.wake.notify_all();
     }
+
+    /// Take everything queued so far, waiting up to `timeout` for the first one.
+    /// An empty result means the wait ran out, not that there is nothing to do:
+    /// frames are driven by the host, so a quiet queue is normal.
+    pub(crate) fn take(&self, timeout: Duration) -> Vec<PlatformJob> {
+        let mut jobs = self.jobs.lock().unwrap();
+        if jobs.is_empty() {
+            let (guard, _) = self.wake.wait_timeout(jobs, timeout).unwrap();
+            jobs = guard;
+        }
+        jobs.drain(..).collect()
+    }
 }
 
 /// Run a job on the platform's thread and wait for its answer. `None` means there
@@ -187,6 +204,50 @@ fn new_platform() -> Rc<OhosPlatform> {
     platform
 }
 
+/// Whether the platform thread has been started. The boot entry is called from a
+/// JavaScript thread, which owns nothing, so this - not a thread local - decides
+/// whether a surface belongs to a running platform.
+static PLATFORM_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Start the platform's own thread. Everything that touches gpui runs there, and
+/// the host only ever hands work over: a JavaScript thread dying no longer takes
+/// the frame loop, the input method session or a window's surface with it.
+fn start_platform<F>(id: String, window: NativeWindow, width: u32, height: u32, boot: F) -> i32
+where
+    F: FnOnce(&Rc<OhosPlatform>) + Send + 'static,
+{
+    let spawned = std::thread::Builder::new()
+        .name("gpui-ohos".to_string())
+        // Zed runs deep recursion while parsing; the default stack is not enough.
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let platform = new_platform();
+            platform.set_surface(&id, window.as_ptr(), width, height);
+            boot(&platform);
+            platform.launch();
+            inputmethod::attach();
+            platform.request_frames();
+            vk::log(&format!(
+                "[gpui_ohos] platform thread {:?} running, windows={}",
+                std::thread::current().id(),
+                platform.window_count()
+            ));
+            loop {
+                for job in platform_queue().take(Duration::from_millis(500)) {
+                    job(&platform);
+                }
+            }
+        });
+    match spawned {
+        Ok(_) => 0,
+        Err(error) => {
+            vk::log(&format!(
+                "[gpui_ohos] could not start the platform thread: {error}"
+            ));
+            1
+        }
+    }
+}
 /// Entry point used by gpui_platform and gpui_ohos_demo.
 ///
 /// Reuses the platform the host already attached a surface to, so an
@@ -236,7 +297,7 @@ pub fn run_app_on_surface<F>(
     run_app: F,
 ) -> i32
 where
-    F: FnOnce(),
+    F: FnOnce() + Send + 'static,
 {
     vk::set_logger(log);
     vk::log(&format!(
@@ -245,27 +306,20 @@ where
     ));
     install_panic_hook();
 
-    // The first surface starts the application. Later surfaces are the
-    // XComponents the host created for windows the application asked for;
-    // running the application again for one of those would open yet another
-    // window, so only attach the surface and keep ticking.
-    if let Some(platform) = with_current(|platform| platform.clone()) {
-        platform.add_surface(id, window, width, height);
-        platform.request_frames();
+    let id = id.to_string();
+    let window = NativeWindow(window);
+    // The first surface starts the application, on the platform's own thread. Later
+    // surfaces are the XComponents the host created for windows the application
+    // asked for; running the application again for one of those would open yet
+    // another window, so only the surface is attached.
+    if PLATFORM_STARTED.swap(true, Ordering::SeqCst) {
+        post(move |platform| {
+            platform.add_surface(&id, window.as_ptr(), width, height);
+            platform.request_frames();
+        });
         return 0;
     }
-
-    let platform = new_platform();
-    platform.set_surface(id, window, width, height);
-    run_app();
-    platform.launch();
-    inputmethod::attach();
-    platform.request_frames();
-    vk::log(&format!(
-        "[gpui_ohos] launched, windows={}",
-        platform.window_count()
-    ));
-    0
+    start_platform(id, window, width, height, move |_platform| run_app())
 }
 
 /// Start a GPUI application on an XComponent surface and render the first frame.
@@ -282,42 +336,44 @@ pub fn run_with_surface<F>(
     app: F,
 ) -> i32
 where
-    F: FnOnce(&mut App) + 'static,
+    F: FnOnce(&mut App) + Send + 'static,
 {
     vk::set_logger(log);
     vk::log(&format!(
         "[gpui_ohos] run_with_surface id={id} window={:p} {}x{}",
         window, width, height
     ));
-    let platform = new_platform();
-    platform.set_surface(id, window, width, height);
-    {
-        let text_system = platform.text_system();
-        let names = text_system.all_font_names();
-        vk::log(&format!("[gpui_ohos] text_system fonts={}", names.len()));
-        if let Some(sample) = names.iter().find(|name| name.contains("HarmonyOS")) {
-            vk::log(&format!("[gpui_ohos] text_system sample={sample}"));
+    let id = id.to_string();
+    let window = NativeWindow(window);
+    if PLATFORM_STARTED.swap(true, Ordering::SeqCst) {
+        post(move |platform| {
+            platform.add_surface(&id, window.as_ptr(), width, height);
+            platform.request_frames();
+        });
+        return 0;
+    }
+    start_platform(id, window, width, height, move |platform| {
+        let platform: &Rc<OhosPlatform> = platform;
+        {
+            let text_system = platform.text_system();
+            let names = text_system.all_font_names();
+            vk::log(&format!("[gpui_ohos] text_system fonts={}", names.len()));
+            if let Some(sample) = names.iter().find(|name| name.contains("HarmonyOS")) {
+                vk::log(&format!("[gpui_ohos] text_system sample={sample}"));
+            }
         }
-    }
-    {
-        // Clipboard self-test: write needs no permission, read needs the
-        // READ_PASTEBOARD ACL permission.
-        let marker = "gpui_ohos clipboard test";
-        let wrote = clipboard::write_text(marker);
-        let read = clipboard::read_text();
-        vk::log(&format!(
-            "[gpui_ohos] clipboard write={wrote} read={read:?}"
-        ));
-    }
-    Application::with_platform(platform.clone() as Rc<dyn Platform>).run(app);
-    platform.launch();
-    inputmethod::attach();
-    platform.request_frames();
-    vk::log(&format!(
-        "[gpui_ohos] launched, windows={}",
-        platform.window_count()
-    ));
-    0
+        {
+            // Clipboard self-test: write needs no permission, read needs the
+            // READ_PASTEBOARD ACL permission.
+            let marker = "gpui_ohos clipboard test";
+            let wrote = clipboard::write_text(marker);
+            let read = clipboard::read_text();
+            vk::log(&format!(
+                "[gpui_ohos] clipboard write={wrote} read={read:?}"
+            ));
+        }
+        Application::with_platform(platform.clone() as Rc<dyn Platform>).run(app);
+    })
 }
 
 /// Read a file the user picked, through the descriptor the host opened.
