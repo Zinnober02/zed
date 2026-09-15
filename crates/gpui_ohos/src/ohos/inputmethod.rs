@@ -381,7 +381,7 @@ const IME_TEXT_LIMIT: usize = 8192;
 /// around the caret.
 pub(crate) fn update_context(text: &str, caret: usize, cursor: (f64, f64, f64, f64)) {
     {
-        let mut context = IME_CONTEXT.lock().unwrap();
+        let context = IME_CONTEXT.lock().unwrap();
         if context.0 == text && context.1 == caret && context.2 == cursor {
             return;
         }

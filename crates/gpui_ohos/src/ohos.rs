@@ -447,7 +447,14 @@ pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
         host::window_op_for(id, host::op::REQUEST_FOCUS, "");
     }
     with_current(|platform| {
-        for window in platform.route_targets(id) {
+        let targets = platform.route_targets(id);
+        // The one line that tells input that never arrived from input that arrived
+        // and went nowhere.
+        vk::log(&format!(
+            "[gpui_ohos] pointer_down id={id} targets={}",
+            targets.len()
+        ));
+        for window in targets {
             let position = crate::point(logical(x), logical(y));
             // Hit testing follows the last mouse position, which a synthetic
             // click never updates, so seed it before pressing.

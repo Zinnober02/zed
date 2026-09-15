@@ -341,6 +341,12 @@ impl WindowShared {
         }
         let mut guard = self.input_handler.borrow_mut();
         let Some(handler) = guard.as_mut() else {
+            // Silent before, which left "the composition showed and nothing
+            // happened" with no trace at all.
+            super::vk::log(&format!(
+                "[gpui_ohos] ime dropped for {}: no input handler",
+                self.id
+            ));
             return;
         };
         match command {

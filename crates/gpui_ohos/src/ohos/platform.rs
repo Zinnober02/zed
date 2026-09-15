@@ -779,11 +779,25 @@ impl OhosPlatform {
         None
     }
 
-    /// Forward an IME command to every window's input handler.
+    /// Forward an IME command to the window being typed into.
+    ///
+    /// Every window used to be offered it in turn and the first one with an input
+    /// handler took it, which was usually the main window's editor: text composed
+    /// in another window's field went into the main window instead, and the field
+    /// the user was looking at stayed empty. The window the user is typing into is
+    /// the active one.
     pub(crate) fn handle_ime(&self, command: super::inputmethod::ImeCommand) {
-        for window in self.windows() {
-            window.handle_ime(&command);
-        }
+        let windows = self.windows();
+        let target = windows
+            .iter()
+            .find(|window| window.is_active())
+            .or_else(|| windows.first());
+        let Some(window) = target else {
+            super::vk::log("[gpui_ohos] ime command with no window to take it");
+            return;
+        };
+        super::vk::log(&format!("[gpui_ohos] ime -> {} (active)", window.id()));
+        window.handle_ime(&command);
     }
 
     /// Forward a modifier-state change to the surface's window.
