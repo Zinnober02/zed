@@ -6,7 +6,7 @@
 //! the input method, which is what makes it enter composing mode.
 
 use std::ffi::{CString, c_char, c_int, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 unsafe extern "C" {
@@ -27,12 +27,32 @@ pub(crate) enum ImeCommand {
 
 static QUEUE: Mutex<Vec<ImeCommand>> = Mutex::new(Vec::new());
 static ATTACHED: Mutex<bool> = Mutex::new(false);
-/// The window whose text field asked for the input method. One client serves the
-/// whole process and the system binds it to whichever window holds focus, so the
-/// request has to be remembered and replayed once that window really has focus.
-static OWNER: Mutex<Option<String>> = Mutex::new(None);
-static WANTED: AtomicBool = AtomicBool::new(false);
-static SHOWING: AtomicBool = AtomicBool::new(false);
+/// What the input method is doing, and for which window.
+///
+/// One client serves the whole process and the system binds it to whichever window
+/// holds focus, so "asked for" and "showing" are genuinely different states: a
+/// request made while another window had focus cannot be served until its own
+/// window is focused, which is what the retry below waits for.
+#[derive(Clone, PartialEq)]
+enum ImeSession {
+    /// Nobody asked, or the window that had is gone.
+    Idle,
+    /// A window's field asked; the input method is not showing for it yet.
+    Wanted { owner: String },
+    /// Showing for this window.
+    Showing { owner: String },
+}
+
+static SESSION: Mutex<ImeSession> = Mutex::new(ImeSession::Idle);
+
+impl ImeSession {
+    fn owner(&self) -> Option<&str> {
+        match self {
+            ImeSession::Idle => None,
+            ImeSession::Wanted { owner } | ImeSession::Showing { owner } => Some(owner),
+        }
+    }
+}
 /// Frames left before the next attempt, so a refusal is retried without asking
 /// (and logging) on every single frame.
 static RETRY_IN: AtomicU32 = AtomicU32::new(0);
@@ -351,10 +371,39 @@ fn try_show() -> i32 {
     }
 }
 
+/// Move to a new state and say so.
+///
+/// The transitions are the whole story of a session, and the ones that go wrong
+/// are the ones worth reading: a window that stays "wanted" is one the system has
+/// not accepted yet.
+fn set_session(next: ImeSession) {
+    let mut session = SESSION.lock().unwrap();
+    if *session == next {
+        return;
+    }
+    let described = match &next {
+        ImeSession::Idle => "idle".to_string(),
+        ImeSession::Wanted { owner } => format!("wanted for {owner}"),
+        ImeSession::Showing { owner } => format!("showing for {owner}"),
+    };
+    let showing = matches!(next, ImeSession::Showing { .. });
+    *session = next;
+    if showing {
+        super::vk::log(&format!("[gpui_ohos] IME showing for {described}"));
+    } else {
+        super::vk::log(&format!("[gpui_ohos] IME session: {described}"));
+    }
+}
+
+fn session() -> ImeSession {
+    SESSION.lock().unwrap().clone()
+}
+
 /// A window's text field asked for the input method.
 pub fn show(owner: &str) {
-    *OWNER.lock().unwrap() = Some(owner.to_string());
-    WANTED.store(true, Ordering::Relaxed);
+    set_session(ImeSession::Wanted {
+        owner: owner.to_string(),
+    });
     RETRY_IN.store(0, Ordering::Relaxed);
 }
 
@@ -364,14 +413,13 @@ pub fn show(owner: &str) {
 /// this as well, and hiding there ended the session of the window that had just
 /// taken focus over - the panel stayed, and everything typed went nowhere.
 pub fn hide(owner: &str) {
-    {
-        let current = OWNER.lock().unwrap();
-        if current.as_deref() != Some(owner) {
-            return;
-        }
+    let current = session();
+    if current.owner() != Some(owner) {
+        return;
     }
-    WANTED.store(false, Ordering::Relaxed);
-    if !SHOWING.swap(false, Ordering::Relaxed) {
+    let was_showing = matches!(current, ImeSession::Showing { .. });
+    set_session(ImeSession::Idle);
+    if !was_showing {
         return;
     }
     let proxy = PROXY.load(Ordering::Relaxed) as *mut c_void;
@@ -386,18 +434,22 @@ pub fn hide(owner: &str) {
 
 /// The window the input method is bound to, if one asked for it.
 pub(crate) fn owner() -> Option<String> {
-    OWNER.lock().unwrap().clone()
+    session().owner().map(|owner| owner.to_string())
 }
 
 /// Forget a window that is gone: a dead owner would otherwise keep the retry
 /// below asking the system about a window that no longer exists.
 pub(crate) fn forget(id: &str) {
-    let mut owner = OWNER.lock().unwrap();
-    if owner.as_deref() == Some(id) {
-        *owner = None;
-        WANTED.store(false, Ordering::Relaxed);
-        SHOWING.store(false, Ordering::Relaxed);
+    {
+        let session = SESSION.lock().unwrap();
+        if session.owner() != Some(id) {
+            return;
+        }
     }
+    super::vk::log(&format!(
+        "[gpui_ohos] IME session: idle, window {id} is gone"
+    ));
+    *SESSION.lock().unwrap() = ImeSession::Idle;
 }
 
 /// Replay a pending request once its window holds focus, and keep retrying.
@@ -408,12 +460,11 @@ pub(crate) fn forget(id: &str) {
 /// application asks exactly once per focus change, so a single refusal used to
 /// leave that window without an input method for good.
 pub(crate) fn apply(active: Option<&str>) {
-    if !WANTED.load(Ordering::Relaxed) || SHOWING.load(Ordering::Relaxed) {
-        return;
-    }
-    let owner = match OWNER.lock().unwrap().clone() {
-        Some(owner) => owner,
-        None => return,
+    let owner = match session() {
+        ImeSession::Wanted { owner } => owner,
+        // A session that is idle has nothing to replay, and one that is already
+        // showing must not be asked again: repeating show resets a composition.
+        _ => return,
     };
     if active != Some(owner.as_str()) {
         return;
@@ -424,8 +475,7 @@ pub(crate) fn apply(active: Option<&str>) {
     }
     let code = show_now();
     if code == 0 {
-        SHOWING.store(true, Ordering::Relaxed);
-        super::vk::log(&format!("[gpui_ohos] IME showing for {owner}"));
+        set_session(ImeSession::Showing { owner });
     } else {
         RETRY_IN.store(RETRY_FRAMES, Ordering::Relaxed);
         log_refusal(code, &owner);
