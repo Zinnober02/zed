@@ -26,7 +26,7 @@ pub(crate) mod op {
     pub const PICK_NEW_PATH: i32 = 13;
     pub const REQUEST_FOCUS: i32 = 15;
     /// Ask the host to draw a frame now rather than at the next refresh.
-        /// Create another OHOS window with an XComponent named by the argument.
+    /// Create another OHOS window with an XComponent named by the argument.
     pub const CREATE_WINDOW: i32 = 16;
     /// Which way round the theme is: the host draws the window buttons for it.
     pub const SET_APPEARANCE: i32 = 18;
