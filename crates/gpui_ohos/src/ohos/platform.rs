@@ -73,6 +73,9 @@ pub(crate) struct OhosPlatform {
     windows_opened: Cell<usize>,
     /// Which way round the theme is, as Zed last reported it.
     theme_appearance: Cell<&'static str>,
+    /// The surface ArkUI currently focuses. Only a different one needs a focus
+    /// request; the host reports every change, so this cannot go stale.
+    focused_surface: RefCell<Option<String>>,
     pending_launch: RefCell<Option<Box<dyn 'static + FnOnce()>>>,
     windows: Rc<RefCell<Vec<Rc<WindowShared>>>>,
     /// GPUI window handles paired with their platform window, in open order.
@@ -152,6 +155,7 @@ impl OhosPlatform {
             on_reopen: RefCell::new(None),
             on_system_wake: RefCell::new(None),
             appearance: Cell::new(appearance),
+            focused_surface: RefCell::new(None),
             pending_picks: RefCell::new(HashMap::new()),
             next_pick_id: Cell::new(1),
             restore_folder: RefCell::new(None),
@@ -166,6 +170,26 @@ impl OhosPlatform {
 
     /// Host-pushed events: focus, window status, color mode, lifecycle, picker
     /// results. Everything arrives on the ArkUI UI thread.
+
+    /// Record a focus change reported by the host.
+    ///
+    /// The platform keeps this rather than a thread local: everything that reads it
+    /// runs on the platform's own thread, and a thread local there was a second
+    /// truth waiting to disagree with this one.
+    pub(crate) fn note_focus(&self, id: &str, focused: bool) {
+        let mut current = self.focused_surface.borrow_mut();
+        if focused {
+            *current = Some(id.to_string());
+        } else if current.as_deref() == Some(id) {
+            *current = None;
+        }
+    }
+
+    /// The surface ArkUI currently focuses, if any. The input method binds to the
+    /// focused window only, so this decides when a pending request may be replayed.
+    pub(crate) fn focused_surface(&self) -> Option<String> {
+        self.focused_surface.borrow().clone()
+    }
     pub(crate) fn handle_host_event(&self, kind: i32, arg: &str) {
         super::vk::log(&format!("[gpui_ohos] host event {kind}: {arg}"));
         match kind {
@@ -188,7 +212,7 @@ impl OhosPlatform {
                 // same update ("RefCell already borrowed"). Queue it for the frame
                 // loop instead, which runs outside any update.
                 let (id, value) = split_window_event(arg);
-                super::note_focus(id, value != "0");
+                self.note_focus(id, value != "0");
                 *self.pending_focus.borrow_mut() = Some((id.to_string(), value != "0"));
             }
             host::event::WINDOW_STATUS => {
@@ -441,7 +465,12 @@ impl OhosPlatform {
             })
             .unwrap_or((2200, 1430));
         while surfaces.len() <= index {
-            let id = format!("gpui_surface_{}", surfaces.len());
+            // Names are handed out once and never reused: a name that came back
+            // would meet whatever the tables still hold for the window that had it.
+            let id = format!(
+                "gpui_surface_{}",
+                NEXT_SURFACE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
             surfaces.push((
                 id.clone(),
                 Rc::new(RefCell::new(SurfaceState {
@@ -550,6 +579,15 @@ impl OhosPlatform {
         self.windows
             .borrow_mut()
             .retain(|window| !window.is_closed());
+        // A window that closes never reports a blur, so the surface the host
+        // believes is focused would keep naming it and the next focus request
+        // would look redundant when it is not.
+        {
+            let mut focused = self.focused_surface.borrow_mut();
+            if focused.as_deref() == Some(id) {
+                *focused = None;
+            }
+        }
     }
 
     /// Invoke the GPUI launch callback recorded by Platform::run.
@@ -842,6 +880,10 @@ fn split_window_event(arg: &str) -> (&str, &str) {
 /// settings, notifications - are marked with their own kinds, and they belong to
 /// the window that opened them: they float above it and can be closed on their
 /// own, which a window of a whole ability instance cannot be.
+/// Surface names, handed out once and never reused: a name that came back would
+/// meet whatever the tables still hold for the window that had it.
+static NEXT_SURFACE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
 fn window_kind_name(kind: &WindowKind) -> &'static str {
     match kind {
         WindowKind::Normal => "normal",

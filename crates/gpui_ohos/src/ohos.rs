@@ -585,7 +585,7 @@ fn tick_platform(platform: &Rc<OhosPlatform>) {
     }
     // The input method binds to a window only while that window holds focus, so a
     // request made while another window was focused is replayed here once it does.
-    inputmethod::apply(focused_surface().as_deref());
+    inputmethod::apply(platform.focused_surface().as_deref());
     platform.tick();
 }
 
@@ -630,8 +630,7 @@ pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
         // has to name the surface, or focus lands on the main window instead. A
         // surface that already holds focus needs no request, and skipping it keeps
         // the common case free of a synchronous call into JS.
-        let needs_focus =
-            FOCUSED_SURFACE.with(|cell| cell.borrow().as_deref() != Some(id.as_str()));
+        let needs_focus = platform.focused_surface().as_deref() != Some(id.as_str());
         if needs_focus {
             host::window_op_for(&id, host::op::REQUEST_FOCUS, "");
         }
@@ -689,31 +688,9 @@ pub fn scroll(id: &str, x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) 
     });
 }
 
-thread_local! {
-    /// The surface ArkUI currently focuses. Only a different one needs a focus
-    /// request; the host reports every change, so this cannot go stale.
-    static FOCUSED_SURFACE: std::cell::RefCell<Option<String>> =
-        std::cell::RefCell::new(None);
-}
-
-/// The surface ArkUI currently focuses, if any. The input method binds to the
-/// focused window only, so this is what decides when a pending request may be
-/// replayed.
-pub(crate) fn focused_surface() -> Option<String> {
-    FOCUSED_SURFACE.with(|cell| cell.borrow().clone())
-}
-
-/// Record a focus change reported by the host.
-pub(crate) fn note_focus(id: &str, focused: bool) {
-    FOCUSED_SURFACE.with(|cell| {
-        let mut current = cell.borrow_mut();
-        if focused {
-            *current = Some(id.to_string());
-        } else if current.as_deref() == Some(id) {
-            *current = None;
-        }
-    });
-}
+// Focus is the platform's own state now: everything that reads it runs on the
+// platform's thread, so a thread local here was a second truth waiting to
+// disagree with the one in OhosPlatform.
 
 thread_local! {
     /// Keyboard modifier state, tracked from NDK key events.

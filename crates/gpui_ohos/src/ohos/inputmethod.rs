@@ -384,7 +384,8 @@ fn set_session(next: ImeSession) {
     let described = match &next {
         ImeSession::Idle => "idle".to_string(),
         ImeSession::Wanted { owner } => format!("wanted for {owner}"),
-        ImeSession::Showing { owner } => format!("showing for {owner}"),
+        // Only the owner: the line below already says what happened to it.
+        ImeSession::Showing { owner } => owner.clone(),
     };
     let showing = matches!(next, ImeSession::Showing { .. });
     *session = next;
