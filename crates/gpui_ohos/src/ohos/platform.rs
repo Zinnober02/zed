@@ -191,31 +191,6 @@ impl OhosPlatform {
                 super::note_focus(id, value != "0");
                 *self.pending_focus.borrow_mut() = Some((id.to_string(), value != "0"));
             }
-            host::event::WINDOW_CLOSED => {
-                // The system closed this window. gpui has to be told, because the
-                // application is what removes the window and drops its workspace
-                // from the session.
-                // Unlike the other window events this argument is the surface id
-                // on its own, with no "\t" and value after it; parsing it as one
-                // of those produced an empty id, which routes to every window.
-                let id = arg.trim();
-                if id.is_empty() {
-                    // An empty id routes to every window, and this event means the
-                    // application dropped one: acting on it closed windows that
-                    // were still open.
-                    super::vk::log("[gpui_ohos] window closed with no id: ignored");
-                } else {
-                    forget_window(&self.handles, id);
-                    let targets = self.route_targets(id);
-                    super::vk::log(&format!(
-                        "[gpui_ohos] window closed {id}: {} window(s) matched",
-                        targets.len()
-                    ));
-                    for window in targets {
-                        window.notify_closed();
-                    }
-                }
-            }
             host::event::WINDOW_STATUS => {
                 // 1 full screen, 2 maximize, 3 minimize, 4 floating, 5 split.
                 // On 2in1 the system reports MAXIMIZE for a screen-filling
@@ -548,6 +523,9 @@ impl OhosPlatform {
                 .map(|(_, surface)| surface.clone())
         };
         let Some(surface) = surface else {
+            // A second report about one window. The physical destruction is what
+            // this stands for, and saying so twice must change nothing.
+            super::vk::log(&format!("[gpui_ohos] surface destroyed again: {id}"));
             return;
         };
         {
@@ -555,15 +533,23 @@ impl OhosPlatform {
             state.valid = false;
             state.window = std::ptr::null_mut();
         }
-        // The host closed that window: stop ticking it and drop the platform's
-        // reference so it is recycled.
-        let mut windows = self.windows.borrow_mut();
-        for window in windows.iter() {
-            if window.shares_surface(&surface) {
-                window.mark_closed();
-            }
+        // The window is physically gone, and this is the only report the
+        // application gets of it. It has to run its own close handling - taking
+        // the workspace out of the session among it - or the window comes back on
+        // the next start.
+        let targets = self.route_targets(id);
+        super::vk::log(&format!(
+            "[gpui_ohos] surface gone {id}: {} window(s) matched",
+            targets.len()
+        ));
+        for window in targets {
+            window.notify_closed();
+            window.mark_closed();
         }
-        windows.retain(|window| !window.is_closed());
+        forget_window(&self.handles, id);
+        self.windows
+            .borrow_mut()
+            .retain(|window| !window.is_closed());
     }
 
     /// Invoke the GPUI launch callback recorded by Platform::run.
