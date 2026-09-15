@@ -12,10 +12,11 @@ mod window;
 
 use std::{
     cell::RefCell,
+    collections::VecDeque,
     ffi::c_void,
     future::Future,
     rc::{Rc, Weak},
-    sync::Mutex,
+    sync::{Condvar, Mutex, OnceLock, mpsc},
 };
 
 use futures::{FutureExt as _, channel::oneshot, future::BoxFuture};
@@ -110,6 +111,73 @@ fn with_current<R>(f: impl FnOnce(&Rc<OhosPlatform>) -> R) -> Option<R> {
     CURRENT.with(|current| current.borrow().upgrade().map(|platform| f(&platform)))
 }
 
+/// Work the host asks for is handed to the thread that owns the platform. When the
+/// caller already is that thread it runs inline, which keeps the common path free
+/// of a queue and a wakeup; from any other thread it is queued and the owner is
+/// woken. The owner is whichever thread the platform was created on.
+type PlatformJob = Box<dyn FnOnce(&Rc<OhosPlatform>) + Send>;
+
+pub(crate) struct PlatformQueue {
+    jobs: Mutex<VecDeque<PlatformJob>>,
+    wake: Condvar,
+}
+
+static PLATFORM_QUEUE: OnceLock<PlatformQueue> = OnceLock::new();
+
+/// A native window handle the host owns. The handle names a process-wide surface
+/// and the platform thread is the only thing that renders with it, so carrying it
+/// across the queue is sound. The pointer is never dereferenced here.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeWindow(*mut c_void);
+
+unsafe impl Send for NativeWindow {}
+
+impl NativeWindow {
+    pub(crate) fn as_ptr(self) -> *mut c_void {
+        self.0
+    }
+}
+pub(crate) fn platform_queue() -> &'static PlatformQueue {
+    PLATFORM_QUEUE.get_or_init(|| PlatformQueue {
+        jobs: Mutex::new(VecDeque::new()),
+        wake: Condvar::new(),
+    })
+}
+
+impl PlatformQueue {
+    fn push(&self, job: PlatformJob) {
+        self.jobs.lock().unwrap().push_back(job);
+        self.wake.notify_all();
+    }
+}
+
+/// Run a job on the platform's thread and wait for its answer. `None` means there
+/// is no platform to run it on.
+pub(crate) fn on_platform<R: Send + 'static>(
+    job: impl FnOnce(&Rc<OhosPlatform>) -> R + Send + 'static,
+) -> Option<R> {
+    if let Some(platform) = with_current(|platform| platform.clone()) {
+        return Some(job(&platform));
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    platform_queue().push(Box::new(move |platform| {
+        // The caller may have given up waiting; the answer has nowhere to go then,
+        // which is not an error worth reporting.
+        if sender.send(job(platform)).is_err() {
+            return;
+        }
+    }));
+    receiver.recv().ok()
+}
+
+/// Hand a job to the platform's thread without waiting for it.
+pub(crate) fn post(job: impl FnOnce(&Rc<OhosPlatform>) + Send + 'static) {
+    if let Some(platform) = with_current(|platform| platform.clone()) {
+        job(&platform);
+        return;
+    }
+    platform_queue().push(Box::new(job));
+}
 fn new_platform() -> Rc<OhosPlatform> {
     let platform = Rc::new(
         OhosPlatform::new()
@@ -372,46 +440,58 @@ pub fn set_host_ops(ops: HostOps) {
 
 /// Handle an event pushed from the ArkTS host.
 pub fn host_event(kind: i32, arg: &str) {
-    with_current(|platform| platform.handle_host_event(kind, arg));
+    let arg = arg.to_string();
+    post(move |platform| platform.handle_host_event(kind, &arg));
 }
 
 /// Whether the application lets this window close. Asked by the host before it
 /// closes a window on its own.
 pub fn should_close_window(id: &str) -> bool {
+    let id = id.to_string();
     // No platform at all means nothing to ask, which allows the close.
-    with_current(|platform| platform.should_close_window(id)).unwrap_or(true)
+    on_platform(move |platform| platform.should_close_window(&id)).unwrap_or(true)
 }
 
 /// An additional XComponent surface was created for another window.
 pub fn surface_created(id: &str, window: *mut c_void, width: u32, height: u32) {
-    vk::log(&format!(
-        "[gpui_ohos] surface_created id={id} window={:p} {}x{}",
-        window, width, height
-    ));
-    with_current(|platform| {
-        platform.add_surface(id, window, width, height);
+    let id = id.to_string();
+    let window = NativeWindow(window);
+    post(move |platform| {
+        vk::log(&format!(
+            "[gpui_ohos] surface_created id={id} window={:p} {}x{}",
+            window.as_ptr(),
+            width,
+            height
+        ));
+        platform.add_surface(&id, window.as_ptr(), width, height);
         platform.request_frames();
     });
 }
 
 /// XComponent surface changed size (rotation / resize).
 pub fn surface_resized(id: &str, width: u32, height: u32) {
-    vk::log(&format!(
-        "[gpui_ohos] surface_resized id={id} {}x{}",
-        width, height
-    ));
-    with_current(|platform| platform.surface_resized(id, width, height));
+    let id = id.to_string();
+    post(move |platform| {
+        vk::log(&format!(
+            "[gpui_ohos] surface_resized id={id} {}x{}",
+            width, height
+        ));
+        platform.surface_resized(&id, width, height);
+    });
 }
 
 /// XComponent surface destroyed.
 pub fn surface_destroyed(id: &str) {
-    vk::log(&format!("[gpui_ohos] surface_destroyed id={id}"));
-    with_current(|platform| platform.surface_destroyed(id));
+    let id = id.to_string();
+    post(move |platform| {
+        vk::log(&format!("[gpui_ohos] surface_destroyed id={id}"));
+        platform.surface_destroyed(&id);
+    });
 }
 
 /// One frame tick, driven by the ArkTS host (DisplaySync or setInterval).
 pub fn tick() {
-    with_current(|platform| {
+    post(|platform| {
         for command in inputmethod::drain() {
             platform.handle_ime(command);
         }
@@ -441,17 +521,19 @@ fn logical(value: f32) -> crate::Pixels {
 }
 
 pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
-    // Clicking the surface must give the XComponent ArkUI focus, otherwise its
-    // onKeyEvent never fires and non-text keys (arrows) are dropped. The request
-    // has to name the surface, or focus lands on the main window instead. A
-    // surface that already holds focus needs no request, and skipping it keeps
-    // the common case free of a synchronous call into JS.
-    let needs_focus = FOCUSED_SURFACE.with(|cell| cell.borrow().as_deref() != Some(id));
-    if needs_focus {
-        host::window_op_for(id, host::op::REQUEST_FOCUS, "");
-    }
-    with_current(|platform| {
-        let targets = platform.route_targets(id);
+    let id = id.to_string();
+    post(move |platform| {
+        // Clicking the surface must give the XComponent ArkUI focus, otherwise its
+        // onKeyEvent never fires and non-text keys (arrows) are dropped. The request
+        // has to name the surface, or focus lands on the main window instead. A
+        // surface that already holds focus needs no request, and skipping it keeps
+        // the common case free of a synchronous call into JS.
+        let needs_focus =
+            FOCUSED_SURFACE.with(|cell| cell.borrow().as_deref() != Some(id.as_str()));
+        if needs_focus {
+            host::window_op_for(&id, host::op::REQUEST_FOCUS, "");
+        }
+        let targets = platform.route_targets(&id);
         // The one line that tells input that never arrived from input that arrived
         // and went nowhere.
         vk::log(&format!(
@@ -469,16 +551,18 @@ pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
 }
 
 pub fn pointer_up(id: &str, x: f32, y: f32, button: u32) {
-    with_current(|platform| {
-        for window in platform.route_targets(id) {
+    let id = id.to_string();
+    post(move |platform| {
+        for window in platform.route_targets(&id) {
             window.pointer_up(map_button(button), crate::point(logical(x), logical(y)));
         }
     });
 }
 
 pub fn pointer_move(id: &str, x: f32, y: f32) {
-    with_current(|platform| {
-        for window in platform.route_targets(id) {
+    let id = id.to_string();
+    post(move |platform| {
+        for window in platform.route_targets(&id) {
             window.pointer_move(crate::point(logical(x), logical(y)));
         }
     });
@@ -491,8 +575,9 @@ pub fn scroll(id: &str, x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) 
         2 => crate::TouchPhase::Ended,
         _ => crate::TouchPhase::Moved,
     };
-    with_current(|platform| {
-        for window in platform.route_targets(id) {
+    let id = id.to_string();
+    post(move |platform| {
+        for window in platform.route_targets(&id) {
             window.scroll(
                 crate::point(crate::px(x), crate::px(y)),
                 crate::point(crate::px(delta_x), crate::px(delta_y)),
