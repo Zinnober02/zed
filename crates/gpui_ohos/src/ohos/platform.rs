@@ -306,19 +306,35 @@ impl OhosPlatform {
             }
             host::event::PICK_RESULT => {
                 let (token, rest) = arg.split_once('\t').unwrap_or((arg, ""));
-                // Not token[1..]: an argument that starts with a tab leaves the
-                // token empty, and slicing past the end of a string panics.
+                // The token is "p<id>" for a path pick and "n<id>" for a new
+                // path, and the host echoes it back exactly as it was sent. Only
+                // the digits are wanted, so a token that names nothing lands on
+                // id 0 and finds no waiter instead of panicking on a slice.
                 let id: u64 = token
-                    .strip_prefix('#')
-                    .and_then(|number| number.parse().ok())
+                    .trim_start_matches(|character: char| !character.is_ascii_digit())
+                    .parse()
                     .unwrap_or(0);
-                if let Some(sender) = self.pending_picks.borrow_mut().remove(&id) {
-                    let lines: Vec<String> = rest
-                        .lines()
-                        .filter(|line| !line.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                    let _ = sender.send(lines);
+                let waiter = self.pending_picks.borrow_mut().remove(&id);
+                match waiter {
+                    Some(sender) => {
+                        let lines: Vec<String> = rest
+                            .lines()
+                            .filter(|line| !line.is_empty())
+                            .map(str::to_string)
+                            .collect();
+                        super::vk::log(&format!(
+                            "[gpui_ohos] picker answer for {token}: {} item(s)",
+                            lines.len()
+                        ));
+                        if sender.send(lines).is_err() {
+                            super::vk::log(&format!(
+                                "[gpui_ohos] picker answer for {token}: nobody is waiting"
+                            ));
+                        }
+                    }
+                    None => super::vk::log(&format!(
+                        "[gpui_ohos] picker answer for {token} dropped: no waiter"
+                    )),
                 }
             }
             _ => {}
