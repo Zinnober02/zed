@@ -1048,6 +1048,21 @@ wasmtime-environ = { opt-level = 3 }
 wasmtime-internal-cranelift = { opt-level = 3 }
 minidumper = { opt-level = 3 }
 serde_json = { opt-level = 3 }
+# Text shaping and glyph rasterisation run once per line and once per new glyph,
+# on the frame path and in the first layout of a markdown preview.
+cosmic-text = { opt-level = 3 }
+swash = { opt-level = 3 }
+gpui_ohos = { opt-level = 3 }
+# Opening a project and a preview walks through these before anything appears.
+zed = { opt-level = 2 }
+workspace = { opt-level = 2 }
+project = { opt-level = 2 }
+worktree = { opt-level = 2 }
+fs = { opt-level = 2 }
+markdown = { opt-level = 2 }
+markdown_preview = { opt-level = 2 }
+pulldown-cmark = { opt-level = 3 }
+html5ever = { opt-level = 3 }
 # Build single-source-file crates with cg=1 as it helps make `cargo build` of a whole workspace a bit faster
 activity_indicator = { codegen-units = 1 }
 assets = { codegen-units = 1 }
