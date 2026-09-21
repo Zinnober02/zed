@@ -69,6 +69,8 @@ pub(crate) mod event {
     /// Enable the forced-redraw frame-rate benchmark; the argument is the
     /// number of frames to present.
     pub const BENCHMARK: i32 = 8;
+    /// The pointer entered or left a window: "<surface id>\t1" or "...\t0".
+    pub const HOVER: i32 = 9;
 }
 
 /// Function pointers implemented by the ArkTS host.

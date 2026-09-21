@@ -532,6 +532,8 @@ pub struct VkRenderer {
     instance: *mut c_void,
     surface: u64,
     physical_device: u64,
+    /// Largest side the device allows in one 2D image, from its properties.
+    max_image_dimension_2d: u32,
     device: *mut c_void,
     queue: *mut c_void,
     queue_family: u32,
@@ -811,6 +813,7 @@ impl VkRenderer {
             instance,
             surface,
             physical_device,
+            max_image_dimension_2d: 0,
             device,
             queue,
             queue_family,
@@ -839,6 +842,7 @@ impl VkRenderer {
             paths: None,
         };
 
+        renderer.max_image_dimension_2d = renderer.read_max_image_dimension_2d();
         renderer.create_render_pass()?;
         renderer.create_command_pool()?;
         renderer.create_sync_objects()?;
@@ -890,6 +894,32 @@ impl VkRenderer {
 
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.read_gpu_specs().ok()
+    }
+
+    /// Largest side the device allows in one 2D image, or zero when the driver
+    /// does not answer, which leaves the caller its own limit.
+    ///
+    /// The properties are read through a raw buffer the way `read_gpu_specs` reads
+    /// the same struct: it is far larger than the one field wanted here, and the
+    /// offsets up to the limits are the ones the specification lays down.
+    fn read_max_image_dimension_2d(&self) -> u32 {
+        type PFN_vkGetPhysicalDeviceProperties = unsafe extern "C" fn(u64, *mut c_void);
+        let proc = self.inst_proc("vkGetPhysicalDeviceProperties");
+        if proc.is_null() {
+            return 0;
+        }
+        let get_props: PFN_vkGetPhysicalDeviceProperties = unsafe { std::mem::transmute(proc) };
+        let mut raw = [0u8; 2048];
+        unsafe { get_props(self.physical_device, raw.as_mut_ptr() as *mut c_void) };
+        // apiVersion, driverVersion, vendorID and deviceID (16 bytes), deviceName
+        // (256), pipelineCacheUUID (16), which puts VkPhysicalDeviceLimits at 288;
+        // its first field is maxImageDimension1D and maxImageDimension2D follows it.
+        u32::from_ne_bytes(raw[292..296].try_into().unwrap())
+    }
+
+    /// See the field of the same name: what the atlas may grow to.
+    pub fn max_image_dimension_2d(&self) -> u32 {
+        self.max_image_dimension_2d
     }
 
     fn create_render_pass(&mut self) -> anyhow::Result<()> {
@@ -2151,6 +2181,8 @@ struct TextPipeline {
     descriptor_set: u64,
     pipeline_layout: u64,
     pipeline: u64,
+    /// Format of the atlas image; the one thing a rebuild at a new size needs.
+    format: u32,
     image: u64,
     #[allow(dead_code)]
     image_memory: u64,
@@ -2161,10 +2193,94 @@ struct TextPipeline {
     vertex_memory: u64,
     vertex_mapped: *mut u8,
     vertex_size: u64,
+    /// Side of the atlas image this pipeline samples. The atlas grows its two
+    /// sides together, so the image is square.
     atlas_extent: (u32, u32),
 }
 
+/// Size each atlas has on the CPU side when a frame is drawn. The renderer keeps
+/// its own textures at the same size and rebuilds them when one has grown.
+#[derive(Clone, Copy)]
+pub(crate) struct AtlasExtents {
+    pub text: (u32, u32),
+    pub sprites: (u32, u32),
+}
+
 impl TextPipeline {
+    /// Rebuild the atlas image, the view over it and the descriptor set that names
+    /// it, at a new size.
+    ///
+    /// Only the image depends on the size: the sampler, the descriptor set layout
+    /// and the pipeline stay, and the descriptor set is rewritten to point at the
+    /// new view. The new image is empty, so the caller uploads the atlas into it
+    /// afterwards.
+    fn resize(&mut self, renderer: &VkRenderer, extent: u32) -> anyhow::Result<()> {
+        // A frame that was already submitted may still be sampling the view that is
+        // about to go. An atlas grows a handful of times in a session, so waiting
+        // for the device costs nothing worth avoiding.
+        unsafe { (renderer.fns.wait_idle)(renderer.device) };
+        if self.view != 0 {
+            if let Some(destroy) =
+                renderer.try_dev_proc::<PFN_vkDestroyImageView>("vkDestroyImageView")
+            {
+                unsafe { destroy(renderer.device, self.view, std::ptr::null()) };
+            }
+            self.view = 0;
+        }
+        if self.image != 0 {
+            if let Some(destroy) = renderer.try_dev_proc::<PFN_vkDestroyImage>("vkDestroyImage") {
+                unsafe { destroy(renderer.device, self.image, std::ptr::null()) };
+            }
+            self.image = 0;
+        }
+        if self.image_memory != 0 {
+            if let Some(free) = renderer.try_dev_proc::<PFN_vkFreeMemory>("vkFreeMemory") {
+                unsafe { free(renderer.device, self.image_memory, std::ptr::null()) };
+            }
+            self.image_memory = 0;
+        }
+
+        let (image, image_memory, view) = renderer.create_atlas_image(self.format, extent)?;
+        self.image = image;
+        self.image_memory = image_memory;
+        self.view = view;
+        self.atlas_extent = (extent, extent);
+
+        let update_sets: PFN_vkUpdateDescriptorSets = dev_fn!(
+            renderer,
+            "vkUpdateDescriptorSets",
+            PFN_vkUpdateDescriptorSets
+        );
+        let image_info = VkDescriptorImageInfo {
+            sampler: self.sampler,
+            image_view: view,
+            image_layout: LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        let write = VkWriteDescriptorSet {
+            s_type: ST_WRITE_DESCRIPTOR_SET,
+            p_next: std::ptr::null(),
+            dst_set: self.descriptor_set,
+            dst_binding: 0,
+            dst_array_element: 0,
+            descriptor_count: 1,
+            descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            p_image_info: &image_info,
+            p_buffer_info: std::ptr::null(),
+            p_texel_buffer_view: std::ptr::null(),
+        };
+        unsafe { update_sets(renderer.device, 1, &write, 0, std::ptr::null()) };
+        Ok(())
+    }
+
+    /// Rebuild the atlas image when the atlas has grown past it.
+    fn resize_if_needed(&mut self, renderer: &VkRenderer, size: (u32, u32)) -> anyhow::Result<()> {
+        let extent = size.0.max(size.1);
+        if extent <= self.atlas_extent.0 {
+            return Ok(());
+        }
+        self.resize(renderer, extent)
+    }
+
     /// Releases what this pipeline owns, in the order the references require:
     /// descriptor sets belong to their pool, a pipeline to its layout, a view to
     /// its image.
@@ -2315,14 +2431,13 @@ fn load_path_spirv() -> Vec<u32> {
 }
 
 impl VkRenderer {
-    /// Build one textured-quad pipeline over its own atlas image. Glyphs sample
-    /// an R8 coverage mask, colour images sample RGBA, but the vertex layout and
-    /// the rest of the state are identical, so both share this builder.
-    fn create_image_pipeline(
-        &mut self,
-        format: u32,
-        spirv: Vec<u32>,
-    ) -> anyhow::Result<TextPipeline> {
+    /// Create one sampled image of `extent` square, in `format`, with its memory
+    /// bound and a view over the whole of it.
+    ///
+    /// The atlas image is recreated on its own when the atlas grows, so it is
+    /// built here instead of inline in the pipeline: everything else a pipeline
+    /// owns does not depend on the size.
+    fn create_atlas_image(&self, format: u32, extent: u32) -> anyhow::Result<(u64, u64, u64)> {
         let create_image: PFN_vkCreateImage = dev_fn!(self, "vkCreateImage", PFN_vkCreateImage);
         let image_reqs: PFN_vkGetImageMemoryRequirements = dev_fn!(
             self,
@@ -2333,35 +2448,9 @@ impl VkRenderer {
             dev_fn!(self, "vkBindImageMemory", PFN_vkBindImageMemory);
         let create_view: PFN_vkCreateImageView =
             dev_fn!(self, "vkCreateImageView", PFN_vkCreateImageView);
-        let create_sampler: PFN_vkCreateSampler =
-            dev_fn!(self, "vkCreateSampler", PFN_vkCreateSampler);
         let alloc_mem: PFN_vkAllocateMemory =
             inst_fn!(self, "vkAllocateMemory", PFN_vkAllocateMemory);
-        let create_set_layout: PFN_vkCreateDescriptorSetLayout = dev_fn!(
-            self,
-            "vkCreateDescriptorSetLayout",
-            PFN_vkCreateDescriptorSetLayout
-        );
-        let create_pool: PFN_vkCreateDescriptorPool =
-            dev_fn!(self, "vkCreateDescriptorPool", PFN_vkCreateDescriptorPool);
-        let alloc_sets: PFN_vkAllocateDescriptorSets = dev_fn!(
-            self,
-            "vkAllocateDescriptorSets",
-            PFN_vkAllocateDescriptorSets
-        );
-        let update_sets: PFN_vkUpdateDescriptorSets =
-            dev_fn!(self, "vkUpdateDescriptorSets", PFN_vkUpdateDescriptorSets);
-        let create_layout: PFN_vkCreatePipelineLayout =
-            dev_fn!(self, "vkCreatePipelineLayout", PFN_vkCreatePipelineLayout);
-        let create_shader: PFN_vkCreateShaderModule =
-            dev_fn!(self, "vkCreateShaderModule", PFN_vkCreateShaderModule);
-        let create_pipelines: PFN_vkCreateGraphicsPipelines = dev_fn!(
-            self,
-            "vkCreateGraphicsPipelines",
-            PFN_vkCreateGraphicsPipelines
-        );
 
-        const ATLAS: u32 = 2048;
         let ici = VkImageCreateInfo {
             s_type: ST_IMAGE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -2369,8 +2458,8 @@ impl VkRenderer {
             image_type: IMAGE_TYPE_2D,
             format,
             extent: VkExtent3D {
-                width: ATLAS,
-                height: ATLAS,
+                width: extent,
+                height: extent,
                 depth: 1,
             },
             mip_levels: 1,
@@ -2385,7 +2474,7 @@ impl VkRenderer {
         };
         let mut image: u64 = 0;
         if unsafe { create_image(self.device, &ici, std::ptr::null(), &mut image) } != VK_SUCCESS {
-            anyhow::bail!("vkCreateImage failed");
+            anyhow::bail!("vkCreateImage ({extent}x{extent}) failed");
         }
         let mut reqs = VkMemoryRequirements {
             size: 0,
@@ -2433,6 +2522,45 @@ impl VkRenderer {
         if unsafe { create_view(self.device, &ivci, std::ptr::null(), &mut view) } != VK_SUCCESS {
             anyhow::bail!("vkCreateImageView (atlas) failed");
         }
+        Ok((image, image_memory, view))
+    }
+
+    /// Build one textured-quad pipeline over its own atlas image. Glyphs sample
+    /// an R8 coverage mask, colour images sample RGBA, but the vertex layout and
+    /// the rest of the state are identical, so both share this builder.
+    fn create_image_pipeline(
+        &mut self,
+        format: u32,
+        extent: u32,
+        spirv: Vec<u32>,
+    ) -> anyhow::Result<TextPipeline> {
+        let create_sampler: PFN_vkCreateSampler =
+            dev_fn!(self, "vkCreateSampler", PFN_vkCreateSampler);
+        let create_set_layout: PFN_vkCreateDescriptorSetLayout = dev_fn!(
+            self,
+            "vkCreateDescriptorSetLayout",
+            PFN_vkCreateDescriptorSetLayout
+        );
+        let create_pool: PFN_vkCreateDescriptorPool =
+            dev_fn!(self, "vkCreateDescriptorPool", PFN_vkCreateDescriptorPool);
+        let alloc_sets: PFN_vkAllocateDescriptorSets = dev_fn!(
+            self,
+            "vkAllocateDescriptorSets",
+            PFN_vkAllocateDescriptorSets
+        );
+        let update_sets: PFN_vkUpdateDescriptorSets =
+            dev_fn!(self, "vkUpdateDescriptorSets", PFN_vkUpdateDescriptorSets);
+        let create_layout: PFN_vkCreatePipelineLayout =
+            dev_fn!(self, "vkCreatePipelineLayout", PFN_vkCreatePipelineLayout);
+        let create_shader: PFN_vkCreateShaderModule =
+            dev_fn!(self, "vkCreateShaderModule", PFN_vkCreateShaderModule);
+        let create_pipelines: PFN_vkCreateGraphicsPipelines = dev_fn!(
+            self,
+            "vkCreateGraphicsPipelines",
+            PFN_vkCreateGraphicsPipelines
+        );
+
+        let (image, image_memory, view) = self.create_atlas_image(format, extent)?;
         let sci = VkSamplerCreateInfo {
             s_type: ST_SAMPLER_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -2741,6 +2869,7 @@ impl VkRenderer {
             descriptor_set,
             pipeline_layout,
             pipeline,
+            format,
             image,
             image_memory,
             view,
@@ -2749,20 +2878,21 @@ impl VkRenderer {
             vertex_memory,
             vertex_mapped,
             vertex_size,
-            atlas_extent: (ATLAS, ATLAS),
+            atlas_extent: (extent, extent),
         })
     }
 
-    fn create_text_pipeline(&mut self) -> anyhow::Result<()> {
-        let pipeline = self.create_image_pipeline(FORMAT_R8_UNORM, load_spirv())?;
+    fn create_text_pipeline(&mut self, extent: u32) -> anyhow::Result<()> {
+        let pipeline = self.create_image_pipeline(FORMAT_R8_UNORM, extent, load_spirv())?;
         self.text = Some(pipeline);
         Ok(())
     }
 
     /// Colour images live in their own RGBA atlas; they used to be uploaded into
     /// the glyph mask atlas, which scribbled over glyphs.
-    fn create_sprite_pipeline(&mut self) -> anyhow::Result<()> {
-        let pipeline = self.create_image_pipeline(FORMAT_R8G8B8A8_UNORM, load_sprite_spirv())?;
+    fn create_sprite_pipeline(&mut self, extent: u32) -> anyhow::Result<()> {
+        let pipeline =
+            self.create_image_pipeline(FORMAT_R8G8B8A8_UNORM, extent, load_sprite_spirv())?;
         self.sprites = Some(pipeline);
         Ok(())
     }
@@ -3110,9 +3240,10 @@ impl VkRenderer {
         sprites: &[GlyphVertex],
         batches: &[DrawBatch],
         uploads: &[super::atlas::AtlasUpload],
+        extents: AtlasExtents,
     ) -> anyhow::Result<bool> {
         if self.text.is_none() {
-            self.create_text_pipeline()?;
+            self.create_text_pipeline(extents.text.0.max(extents.text.1))?;
         }
         if self.quads.is_none() {
             self.create_quad_pipeline()?;
@@ -3121,7 +3252,7 @@ impl VkRenderer {
             self.create_path_pipeline()?;
         }
         if self.sprites.is_none() {
-            self.create_sprite_pipeline()?;
+            self.create_sprite_pipeline(extents.sprites.0.max(extents.sprites.1))?;
         }
         // The four pipelines were created just above, so their absence is a bug;
         // noticing it here rather than where they are used keeps that bug from
@@ -3134,6 +3265,21 @@ impl VkRenderer {
         {
             super::vk::log("[gpui_ohos] a pipeline is missing, skipping the frame");
             return Ok(false);
+        }
+        // An atlas that grew leaves this frame's texture too small, and the frame
+        // would sample content the texture never received. The size only changes
+        // between frames, on the insert path, so this is a comparison and not a
+        // lock. The pixels come back through `uploads`: the atlas reports what it
+        // already held as dirty when it grows.
+        if let Some(mut pipeline) = self.text.take() {
+            let resized = pipeline.resize_if_needed(self, extents.text);
+            self.text = Some(pipeline);
+            resized?;
+        }
+        if let Some(mut pipeline) = self.sprites.take() {
+            let resized = pipeline.resize_if_needed(self, extents.sprites);
+            self.sprites = Some(pipeline);
+            resized?;
         }
         // Clamp the incoming geometry to what this frame's ring slot holds, and
         // do it before the fence is touched: returning after the fence was reset

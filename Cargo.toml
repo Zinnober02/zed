@@ -1072,6 +1072,27 @@ rangemap = { opt-level = 3 }
 rustc-hash = { opt-level = 3 }
 linebender_resource_handle = { opt-level = 3 }
 zerocopy = { opt-level = 3 }
+# Opening an image decodes it on the way to the frame, and the build that runs on
+# device is the debug one, so the decoder for each format and the decompressors and
+# colour conversions it calls are optimised as well.
+image = { opt-level = 3 }
+zune-jpeg = { opt-level = 3 }
+zune-core = { opt-level = 3 }
+zune-inflate = { opt-level = 3 }
+png = { opt-level = 3 }
+gif = { opt-level = 3 }
+image-webp = { opt-level = 3 }
+tiff = { opt-level = 3 }
+exr = { opt-level = 3 }
+qoi = { opt-level = 3 }
+moxcms = { opt-level = 3 }
+miniz_oxide = { opt-level = 3 }
+flate2 = { opt-level = 3 }
+fdeflate = { opt-level = 3 }
+crc32fast = { opt-level = 3 }
+color_quant = { opt-level = 3 }
+byteorder-lite = { opt-level = 3 }
+bytemuck = { opt-level = 3 }
 # Opening a project and a preview walks through these before anything appears.
 zed = { opt-level = 2 }
 workspace = { opt-level = 2 }

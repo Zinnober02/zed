@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::{FutureExt as _, channel::oneshot, future::BoxFuture};
@@ -41,7 +41,7 @@ pub fn log_line(message: &str) {
     vk::log(message);
 }
 
-use crate::{App, Application, MouseButton, Platform};
+use crate::{App, Application, MouseButton, NavigationDirection, Platform};
 
 use platform::OhosPlatform;
 
@@ -174,8 +174,17 @@ impl PlatformQueue {
     }
 }
 
+/// How long a caller waits for the platform's thread to answer.
+const PLATFORM_ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Run a job on the platform's thread and wait for its answer. `None` means there
-/// is no platform to run it on.
+/// is no platform to run it on, or that the platform did not answer within
+/// `PLATFORM_ANSWER_TIMEOUT`.
+///
+/// The host calls this from the ArkUI thread, which has to keep running the
+/// application's windows. Waiting without an end there meant a platform thread
+/// that stopped serving its queue froze the window with it, and the user's close
+/// request never came back.
 pub(crate) fn on_platform<R: Send + 'static>(
     job: impl FnOnce(&Rc<OhosPlatform>) -> R + Send + 'static,
 ) -> Option<R> {
@@ -190,7 +199,18 @@ pub(crate) fn on_platform<R: Send + 'static>(
             return;
         }
     }));
-    receiver.recv().ok()
+    match receiver.recv_timeout(PLATFORM_ANSWER_TIMEOUT) {
+        Ok(answer) => Some(answer),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The job stays in the queue, so the platform still performs it once it
+            // serves the queue again; only the answer is lost.
+            vk::log(&format!(
+                "[gpui_ohos] the platform thread did not answer within {PLATFORM_ANSWER_TIMEOUT:?}"
+            ));
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+    }
 }
 
 /// Hand a job to the platform's thread without waiting for it.
@@ -221,6 +241,68 @@ static TICK_WANTED: AtomicBool = AtomicBool::new(false);
 /// Whether the application asked to quit and the host has not been told yet.
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Panics recovered from in the platform loop since the last reported one, and the
+/// time of that report.
+///
+/// A frame that panics on every request would otherwise write a line per frame,
+/// which buries the report that says where the trouble started.
+static RECOVERED_PANICS: Mutex<(u64, Option<Instant>)> = Mutex::new((0, None));
+
+/// Run one step of the platform loop so that a panic inside it cannot end the
+/// thread.
+///
+/// The thread answers every request the host makes of the platform, so letting it
+/// end takes input, window closes and frame requests with it, and the host waits
+/// for answers nobody produces. After a panic the thread only promises to keep
+/// serving the queue: the platform's state may have been left partway through an
+/// update, so the next frame can draw something that no longer matches it.
+///
+/// The step is not `UnwindSafe` - it holds `Rc` handles and `RefCell`s whose
+/// borrow flags a panic may have left marked - and `AssertUnwindSafe` accepts
+/// that, on the grounds that continuing with possibly stale state beats a window
+/// that can no longer be used or closed. The panic hook installed in
+/// `install_panic_hook` has already written the message and backtrace; this adds
+/// the step it came from.
+fn run_platform_step(stage: &str, step: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)).is_err() {
+        report_recovered_panic(stage);
+    }
+}
+
+fn report_recovered_panic(stage: &str) {
+    const REPORT_INTERVAL: Duration = Duration::from_secs(5);
+    let now = Instant::now();
+    let report = {
+        let mut recovered = RECOVERED_PANICS.lock().unwrap();
+        recovered.0 += 1;
+        let due = match recovered.1 {
+            Some(last) => now.duration_since(last) >= REPORT_INTERVAL,
+            None => true,
+        };
+        if due {
+            let suppressed = recovered.0 - 1;
+            recovered.0 = 0;
+            recovered.1 = Some(now);
+            Some(suppressed)
+        } else {
+            None
+        }
+    };
+    let Some(suppressed) = report else {
+        return;
+    };
+    // Written after the lock is released: a panic inside the logger would poison
+    // the mutex, and every later report would end the thread this keeps alive.
+    let message = if suppressed == 0 {
+        format!("[gpui_ohos] recovered from a panic in {stage}")
+    } else {
+        format!(
+            "[gpui_ohos] recovered from a panic in {stage}; {suppressed} more were left unreported"
+        )
+    };
+    vk::log(&message);
+}
+
 /// Start the platform's own thread. Everything that touches gpui runs there, and
 /// the host only ever hands work over: a JavaScript thread dying no longer takes
 /// the frame loop, the input method session or a window's surface with it.
@@ -246,19 +328,21 @@ where
             ));
             loop {
                 for job in platform_queue().take(Duration::from_millis(500)) {
-                    job(&platform);
+                    run_platform_step("a queued job", || job(&platform));
                 }
                 // One frame per request however many arrived, and never from
                 // inside a job: a frame request made while drawing would otherwise
                 // re-enter the frame loop.
                 if TICK_WANTED.swap(false, Ordering::SeqCst) {
-                    tick_platform(&platform);
+                    run_platform_step("a frame", || tick_platform(&platform));
                 }
                 // The queue that carried the quit has drained, so everything the
                 // shutdown queued behind it has run. Now the host can end it.
                 if QUIT_REQUESTED.swap(false, Ordering::SeqCst) {
                     vk::log("[gpui_ohos] telling the host to quit");
-                    host::window_op(host::op::QUIT, "");
+                    run_platform_step("the quit announcement", || {
+                        host::window_op(host::op::QUIT, "")
+                    });
                 }
             }
         });
@@ -528,7 +612,10 @@ pub fn host_event(kind: i32, arg: &str) {
 /// closes a window on its own.
 pub fn should_close_window(id: &str) -> bool {
     let id = id.to_string();
-    // No platform at all means nothing to ask, which allows the close.
+    // No answer means nothing to ask: there is no platform, or it did not answer
+    // within `PLATFORM_ANSWER_TIMEOUT`. Both allow the close, because the host asked
+    // on behalf of a user who wants the window gone, and refusing leaves a window
+    // that can never be closed.
     on_platform(move |platform| platform.should_close_window(&id)).unwrap_or(true)
 }
 
@@ -569,6 +656,12 @@ pub fn surface_resized(id: &str, width: u32, height: u32) {
 /// presented into a window that no longer exists.
 pub fn surface_destroyed(id: &str) {
     let id = id.to_string();
+    // A timeout has no value to fall back on: this call answers with nothing, and
+    // the close is the host's to make. The job stays queued and removes the surface
+    // whenever the platform serves its queue again, so only the handshake above is
+    // lost, and the host tears the window down with the platform thread possibly
+    // still pointing at it. That risk is smaller than holding the ArkUI thread for
+    // as long as the platform thread stays stuck.
     on_platform(move |platform| {
         vk::log(&format!("[gpui_ohos] surface_destroyed id={id}"));
         platform.surface_destroyed(&id);
@@ -608,10 +701,13 @@ pub fn tick() {
     want_tick();
 }
 
+/// The NDK's own button numbers: left 1, right 2, middle 3, back 4, forward 5.
 fn map_button(button: u32) -> MouseButton {
     match button {
         2 => MouseButton::Right,
-        4 => MouseButton::Middle,
+        3 => MouseButton::Middle,
+        4 => MouseButton::Navigate(NavigationDirection::Back),
+        5 => MouseButton::Navigate(NavigationDirection::Forward),
         _ => MouseButton::Left,
     }
 }
@@ -632,7 +728,10 @@ pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
         // the common case free of a synchronous call into JS.
         let needs_focus = platform.focused_surface().as_deref() != Some(id.as_str());
         if needs_focus {
-            host::window_op_for(&id, host::op::REQUEST_FOCUS, "");
+            // The request has to name the node it means: a page asks its own
+            // window for focus by the component id, and the pages that are not the
+            // main one take that name from the payload rather than from the id.
+            host::window_op_for(&id, host::op::REQUEST_FOCUS, &id);
         }
         let targets = platform.route_targets(&id);
         // The one line that tells input that never arrived from input that arrived
@@ -654,8 +753,17 @@ pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
 pub fn pointer_up(id: &str, x: f32, y: f32, button: u32) {
     let id = id.to_string();
     post(move |platform| {
+        let button = map_button(button);
         for window in platform.route_targets(&id) {
-            window.pointer_up(map_button(button), crate::point(logical(x), logical(y)));
+            // A release with no press behind it never belonged to this window. The
+            // host hands the node events of windows the pointer is not over as
+            // well, and an unpaired release moved the editor out of a drag it had
+            // never started.
+            if window.pressed_button().is_none() {
+                vk::log(&format!("[gpui_ohos] pointer up id={id} without-press"));
+                continue;
+            }
+            window.pointer_up(button, crate::point(logical(x), logical(y)));
         }
     });
 }
@@ -663,6 +771,10 @@ pub fn pointer_up(id: &str, x: f32, y: f32, button: u32) {
 pub fn pointer_move(id: &str, x: f32, y: f32) {
     let id = id.to_string();
     post(move |platform| {
+        // Which window a pointer event belongs to is decided in the host, where the
+        // hover reports arrive: it knows both the window the pointer is over and
+        // whether a button is still held. A second copy of that rule here could
+        // only disagree with the first.
         for window in platform.route_targets(&id) {
             window.pointer_move(crate::point(logical(x), logical(y)));
         }

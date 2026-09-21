@@ -111,6 +111,10 @@ pub(crate) struct OhosPlatform {
     restore_delivered: Cell<bool>,
     /// Focus change reported by the host, applied from the frame loop.
     pending_focus: RefCell<Option<(String, bool)>>,
+    /// Hover changes reported by the host, applied from the frame loop for the
+    /// same reason as the focus change: the callback updates the window, and gpui
+    /// must not be holding the application borrow when it runs.
+    pending_hover: RefCell<Vec<(String, bool)>>,
     /// The size each surface last reported, applied once per tick.
     ///
     /// Rebuilding the swapchain blocks this thread until the GPU is idle, and one
@@ -173,14 +177,15 @@ impl OhosPlatform {
             restore_pulled: Cell::new(false),
             restore_delivered: Cell::new(false),
             pending_focus: RefCell::new(None),
+            pending_hover: RefCell::new(Vec::new()),
             pending_surface_size: RefCell::new(HashMap::new()),
             window_rect: RefCell::new(HashMap::new()),
             primary_window_rect: Cell::new(window_rect),
         })
     }
 
-    /// Host-pushed events: focus, window status, color mode, lifecycle, picker
-    /// results. Everything arrives on the ArkUI UI thread.
+    /// Host-pushed events: focus, hover, window status, color mode, lifecycle,
+    /// picker results. Everything arrives on the ArkUI UI thread.
 
     /// Record a focus change reported by the host.
     ///
@@ -225,6 +230,12 @@ impl OhosPlatform {
                 let (id, value) = split_window_event(arg);
                 self.note_focus(id, value != "0");
                 *self.pending_focus.borrow_mut() = Some((id.to_string(), value != "0"));
+            }
+            host::event::HOVER => {
+                let (id, value) = split_window_event(arg);
+                self.pending_hover
+                    .borrow_mut()
+                    .push((id.to_string(), value != "0"));
             }
             host::event::WINDOW_STATUS => {
                 // 1 full screen, 2 maximize, 3 minimize, 4 floating, 5 split.
@@ -672,6 +683,7 @@ impl OhosPlatform {
         self.dispatcher.run_due_timers();
         self.request_frames();
         self.apply_pending_focus();
+        self.apply_pending_hover();
         // The benchmark measures how fast frames can be produced, not how often
         // the display asks for one, so keep drawing until its budget runs out.
         // The cap keeps a frame that never consumes budget from hanging here.
@@ -709,6 +721,17 @@ impl OhosPlatform {
         } else {
             for window in self.route_targets(&id) {
                 window.set_active(active);
+            }
+        }
+    }
+
+    /// Apply the hover changes queued by `handle_host_event`, in the order they
+    /// arrived: several windows can report within one frame, and the application
+    /// sees each of them.
+    fn apply_pending_hover(&self) {
+        for (id, hovered) in self.pending_hover.borrow_mut().drain(..) {
+            for window in self.route_targets(&id) {
+                window.set_hovered(hovered);
             }
         }
     }

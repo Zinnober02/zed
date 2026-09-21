@@ -26,7 +26,7 @@ use crate::{
     WindowBounds, WindowControlArea, WindowControls, WindowParams, point, px,
 };
 
-use super::atlas::OhosAtlas;
+use super::atlas::{AtlasUpload, OhosAtlas};
 use super::display::OhosDisplay;
 use super::host;
 use super::platform::SurfaceState;
@@ -121,6 +121,8 @@ pub(crate) struct WindowShared {
     pressed_button: Cell<Option<MouseButton>>,
     modifiers: Cell<Modifiers>,
     active: Cell<bool>,
+    /// Whether the pointer is over this window, reported by the host's hover
+    /// events. Nothing has entered a window before its first one.
     hovered: Cell<bool>,
     fullscreen: Cell<bool>,
     appearance: Cell<WindowAppearance>,
@@ -134,6 +136,10 @@ pub(crate) struct WindowShared {
     /// The last visibility GPUI asked for, so repeated requests are a no-op.
     virtual_keyboard_visible: Cell<bool>,
     atlas: Arc<OhosAtlas>,
+    /// Atlas regions that were taken but not yet copied into a texture: a frame
+    /// can be dropped before its command buffer runs, and the atlas has already
+    /// forgotten those regions by then.
+    pending_uploads: RefCell<Vec<AtlasUpload>>,
     last_scene_hash: Cell<Option<u64>>,
     #[allow(dead_code)]
     foreground_executor: ForegroundExecutor,
@@ -173,7 +179,7 @@ impl WindowShared {
             pressed_button: Cell::new(None),
             modifiers: Cell::new(Modifiers::default()),
             active: Cell::new(true),
-            hovered: Cell::new(true),
+            hovered: Cell::new(false),
             fullscreen: Cell::new(false),
             appearance: Cell::new(WindowAppearance::Light),
             ime_cursor: Cell::new(Bounds::new(
@@ -188,6 +194,7 @@ impl WindowShared {
             closed: Cell::new(false),
             virtual_keyboard_visible: Cell::new(false),
             atlas: Arc::new(OhosAtlas::new()),
+            pending_uploads: RefCell::new(Vec::new()),
             last_scene_hash: Cell::new(None),
             foreground_executor,
         })
@@ -246,6 +253,25 @@ impl WindowShared {
 
     pub(crate) fn is_active(&self) -> bool {
         self.active.get()
+    }
+
+    /// The button a press left held, if one did.
+    pub(crate) fn pressed_button(&self) -> Option<MouseButton> {
+        self.pressed_button.get()
+    }
+
+    /// Record a hover change reported by the host, so the application sees the
+    /// window the pointer is really over.
+    pub(crate) fn set_hovered(&self, hovered: bool) {
+        if self.hovered.get() == hovered {
+            return;
+        }
+        self.hovered.set(hovered);
+        let mut callback = self.callbacks.borrow_mut().hover_status_change.take();
+        if let Some(callback) = callback.as_mut() {
+            callback(hovered);
+        }
+        self.callbacks.borrow_mut().hover_status_change = callback;
     }
 
     /// Whether this window has drawn at least one frame.
@@ -460,6 +486,10 @@ impl WindowShared {
                         specs.device_name, specs.driver_name, specs.driver_info
                     ));
                 }
+                // The first frame can paint before a renderer exists, so the atlas
+                // learns the device's image limit here rather than at construction.
+                self.atlas
+                    .set_device_limit(renderer.max_image_dimension_2d());
                 *self.renderer.borrow_mut() = Some(renderer);
                 self.renderer_window.set(window as usize);
                 true
@@ -486,6 +516,7 @@ impl WindowShared {
         if !benchmark
             && self.last_scene_hash.get() == Some(hash)
             && !self.atlas.has_pending_uploads()
+            && self.pending_uploads.borrow().is_empty()
         {
             return;
         }
@@ -499,7 +530,11 @@ impl WindowShared {
             ));
         }
         let work_started = std::time::Instant::now();
-        let uploads = self.atlas.take_uploads();
+        // Regions that a dropped frame never copied stay in front of this batch, so
+        // nothing the atlas handed over is lost when a frame does not reach the
+        // display.
+        let mut uploads = self.pending_uploads.borrow_mut();
+        uploads.extend(self.atlas.take_uploads());
         let (atlas_w, atlas_h) = self.atlas.texture_size(AtlasTextureKind::Monochrome);
         let (sprite_w, sprite_h) = self.atlas.texture_size(AtlasTextureKind::Polychrome);
         let presented = if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
@@ -514,8 +549,19 @@ impl WindowShared {
                 &sprites,
                 &batches,
                 &uploads,
+                super::vk::AtlasExtents {
+                    text: (atlas_w, atlas_h),
+                    sprites: (sprite_w, sprite_h),
+                },
             ) {
-                Ok(presented) => presented,
+                Ok(presented) => {
+                    // Only a frame that reached the display ran its copies; one that
+                    // was dropped keeps them for the next attempt.
+                    if presented {
+                        uploads.clear();
+                    }
+                    presented
+                }
                 Err(error) => {
                     super::vk::log(&format!("[gpui_ohos] render failed: {error}"));
                     true
