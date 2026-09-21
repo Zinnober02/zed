@@ -2062,6 +2062,16 @@ fn init_app_appearance(cx: &mut App) {
     // `System` follows the OS (no override); any other theme forces its appearance, so a
     // dark theme doesn't render a light window border when the system is in light mode.
     let apply = |cx: &mut App| {
+        // OHOS lets the system draw the window buttons and asks it to adapt them to
+        // an appearance. Following the OS there means a dark theme picked for light
+        // mode gets dark buttons on a dark title bar, so report the appearance that
+        // is actually on screen whichever mode selected it.
+        #[cfg(target_env = "ohos")]
+        let appearance = Some(match cx.theme().appearance() {
+            theme::Appearance::Light => gpui::WindowAppearance::Light,
+            theme::Appearance::Dark => gpui::WindowAppearance::Dark,
+        });
+        #[cfg(not(target_env = "ohos"))]
         let appearance = match ThemeSettings::get_global(cx).theme.mode() {
             Some(theme_settings::ThemeAppearanceMode::System) => None,
             _ => Some(match cx.theme().appearance() {
@@ -2072,6 +2082,11 @@ fn init_app_appearance(cx: &mut App) {
         cx.set_window_appearance(appearance);
     };
     apply(cx);
+    // On OHOS a theme change can also arrive from the system switching light and
+    // dark, which a settings observer alone would miss.
+    #[cfg(target_env = "ohos")]
+    cx.observe_global::<theme::GlobalTheme>(apply).detach();
+    #[cfg(not(target_env = "ohos"))]
     cx.observe_global::<SettingsStore>(apply).detach();
 }
 

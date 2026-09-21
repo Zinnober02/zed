@@ -467,6 +467,9 @@ impl OhosPlatform {
             state.height = height;
             state.valid = true;
         }
+        // The page registered its host callbacks just before handing the surface
+        // over, so this is where an earlier report reaches its own window.
+        host::window_op_for(id, host::op::SET_APPEARANCE, self.theme_appearance.get());
         for window in self.registry.windows.borrow().iter() {
             if window.shares_surface(&surface) {
                 window.on_surface_resized(width, height);
@@ -1153,6 +1156,7 @@ impl Platform for OhosPlatform {
         // XComponent, created by the host on demand. Its surface may still be
         // invalid here and is filled in when the host reports it.
         let (id, surface) = self.surface_for_window(&options);
+        let surface_valid = surface.borrow().valid;
         let shared = WindowShared::new(id, surface, options, self.foreground_executor.clone());
         // The window holding the primary surface is the main one. The platform
         // tracks that; nothing compares ids by name.
@@ -1166,6 +1170,16 @@ impl Platform for OhosPlatform {
             shared.mark_primary();
         }
         self.registry.windows.borrow_mut().push(shared.clone());
+        // The theme was reported before this window existed, and an op the host
+        // has no page for is dropped, so a window with a live surface is told
+        // again now that it is registered.
+        if surface_valid {
+            host::window_op_for(
+                shared.id(),
+                host::op::SET_APPEARANCE,
+                self.theme_appearance.get(),
+            );
+        }
         self.registry
             .handles
             .borrow_mut()
