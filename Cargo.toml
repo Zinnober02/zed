@@ -1053,6 +1053,25 @@ serde_json = { opt-level = 3 }
 cosmic-text = { opt-level = 3 }
 swash = { opt-level = 3 }
 gpui_ohos = { opt-level = 3 }
+# The rest of cosmic-text's stack: font parsing, shaping, bidi and line breaking
+# all sit in the per-line path that a layout pass walks once for every line.
+fontdb = { opt-level = 3 }
+harfrust = { opt-level = 3 }
+skrifa = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+read-fonts = { opt-level = 3 }
+font-types = { opt-level = 3 }
+unicode-bidi = { opt-level = 3 }
+unicode-linebreak = { opt-level = 3 }
+unicode-script = { opt-level = 3 }
+unicode-segmentation = { opt-level = 3 }
+unicode-properties = { opt-level = 3 }
+self_cell = { opt-level = 3 }
+smol_str = { opt-level = 3 }
+rangemap = { opt-level = 3 }
+rustc-hash = { opt-level = 3 }
+linebender_resource_handle = { opt-level = 3 }
+zerocopy = { opt-level = 3 }
 # Opening a project and a preview walks through these before anything appears.
 zed = { opt-level = 2 }
 workspace = { opt-level = 2 }

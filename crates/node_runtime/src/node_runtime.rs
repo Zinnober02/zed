@@ -147,7 +147,13 @@ impl NodeRuntime {
             None
         };
 
-        let instance = if options.allow_binary_download {
+        // OHOS: the archive carries symbolic links for npm, npx and corepack and a
+        // third-party application may not create one, so the managed runtime can
+        // never be installed here. Every start otherwise downloads it again and
+        // holds the installation mutex for the length of the attempt, which is
+        // what made the editor stall for a second at a time while prettier
+        // retried. An explicitly configured node.path still wins above this point.
+        let instance = if options.allow_binary_download && !cfg!(target_env = "ohos") {
             let (log_level, why_using_managed) = match system_node_error {
                 Some(err @ DetectError::Other(_)) => (Level::Warn, err.to_string()),
                 Some(err @ DetectError::NotInPath(_)) => (Level::Info, err.to_string()),
