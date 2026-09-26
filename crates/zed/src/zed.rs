@@ -1648,7 +1648,12 @@ fn open_about_window(cx: &mut App) {
                                     .color(Color::Muted)
                                     .size(LabelSize::XSmall),
                             )
-                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small)),
+                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small))
+                            .child(
+                                Label::new("Based on Zed, GPL-3.0")
+                                    .color(Color::Muted)
+                                    .size(LabelSize::XSmall),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -1729,7 +1734,7 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some("About Inkstone".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),
