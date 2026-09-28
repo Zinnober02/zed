@@ -1,4 +1,4 @@
-//! C ABI expected by the HAP host (see vulkan_shell/entry/src/main/cpp/napi_init.cpp).
+//! C ABI expected by the HAP host (see inkstone/entry/src/main/cpp/napi_init.cpp).
 //!
 //! These are thin wrappers over gpui_ohos; they live here rather than in
 //! gpui_ohos so the linker keeps them in the cdylib.
