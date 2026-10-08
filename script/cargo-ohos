@@ -11,7 +11,8 @@
 set -e
 here=$(dirname "$0")
 export PKG_CONFIG="${PKG_CONFIG:-$PWD/$here/fake-pkg-config}"
-sdk=${OHOS_NDK:-/storage/Users/currentUser/deveco_tools/sdk/default/openharmony/native}
+clt=${COMMAND_LINE_TOOL_PATH:-/data/service/hnp/hmos-clt.org/hmos-clt_1.0.0}
+sdk=${OHOS_NDK:-$clt/sdk/default/openharmony/native}
 export AWS_LC_SYS_CMAKE_BUILDER=1
 # aws-lc's CPU jitter entropy source aborts the process without any log when its
 # health check fails, which is what killed the app as soon as a TLS handshake
