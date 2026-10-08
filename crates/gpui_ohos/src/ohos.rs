@@ -808,10 +808,22 @@ thread_local! {
     /// Keyboard modifier state, tracked from NDK key events.
     static MODIFIERS: std::cell::Cell<crate::Modifiers> =
         std::cell::Cell::new(crate::Modifiers::default());
+    /// Code of the key whose down event reached the application, or 0 when none did. The input
+    /// method takes the down of the keys it handles itself and lets the up through, so an up
+    /// without a down is that case rather than a stray event.
+    static PRESSED_KEY: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
 fn is_modifier_key(code: i32) -> bool {
     matches!(code, 2072 | 2073 | 2047 | 2048 | 2045 | 2046 | 2076 | 2077)
+}
+
+/// Keys the application acts on when they go down, and which the input method also uses while
+/// it composes: it takes their down (enter accepts a candidate, backspace edits the pinyin,
+/// the arrows pick one) and the application is left with the up, which on its own types
+/// nothing.
+fn is_press_key(code: i32) -> bool {
+    matches!(code, 2012..=2015 | 2049 | 2054 | 2055 | 2068..=2071 | 2081..=2083)
 }
 
 fn update_modifiers(code: i32, down: bool) -> crate::Modifiers {
@@ -883,6 +895,18 @@ pub fn key_event(id: &str, action: i32, code: i32, unicode: i32) {
         return;
     }
     let unicode = u32::try_from(unicode).ok().filter(|value| *value > 0);
+    if down {
+        PRESSED_KEY.with(|cell| cell.set(code));
+    } else {
+        let had_down = PRESSED_KEY.with(|cell| cell.replace(0)) == code;
+        if !had_down && is_press_key(code) {
+            // Nothing was composing by the time an unconsumed up arrived, so the press is
+            // rebuilt here: without the down the application never sees this key at all, and
+            // the terminal and the editor both act on the down.
+            vk::log(&format!("[gpui_ohos] press rebuilt for key up code={code}"));
+            dispatch_key(id, true, code, modifiers, unicode);
+        }
+    }
     dispatch_key(id, down, code, modifiers, unicode);
 }
 
