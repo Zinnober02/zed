@@ -900,10 +900,50 @@ impl SystemNodeRuntime {
     }
 
     async fn detect() -> std::result::Result<Self, DetectError> {
+        // On this platform the copy other native packages link into /data/service/hnp/bin
+        // cannot run a script: it is executed as its own process, which does not inherit the
+        // application's kernel permission, and it aborts inside V8's OS::SetPermissions check
+        // before the first line of JavaScript runs. The Node.js inside the command line tools
+        // DevEco installs was measured to run a JIT-heavy script here, so it comes first and
+        // PATH stays the fallback for a device whose package layout differs.
+        #[cfg(target_env = "ohos")]
+        if let Some((node, npm)) = ohos_command_line_tools_node() {
+            let reported = node.clone();
+            match Self::new(node, npm).await {
+                Ok(runtime) => {
+                    log::info!("using the Node.js of the command line tools: {reported:?}");
+                    return Ok(runtime);
+                }
+                Err(error) => {
+                    log::warn!("the Node.js of the command line tools cannot be used: {error}");
+                }
+            }
+        }
+
         let node = which::which("node").map_err(DetectError::NotInPath)?;
         let npm = which::which("npm").map_err(DetectError::NotInPath)?;
         Self::new(node, npm).await.map_err(DetectError::Other)
     }
+}
+
+/// The Node.js that ships with the DevEco command line tools, as (node, npm).
+///
+/// The package carries one directory per version, so the version directory is discovered
+/// rather than written down: a machine that updates the tools keeps working.
+#[cfg(target_env = "ohos")]
+fn ohos_command_line_tools_node() -> Option<(PathBuf, PathBuf)> {
+    const PACKAGE: &str = "/data/service/hnp/hmos-clt.org";
+    for entry in std::fs::read_dir(PACKAGE).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let bin = entry.path().join("node").join("bin");
+        let node = bin.join("node");
+        if node.is_file() {
+            return Some((node, bin.join("npm")));
+        }
+    }
+    None
 }
 
 enum DetectError {
