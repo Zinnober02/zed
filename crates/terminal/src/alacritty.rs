@@ -2,6 +2,8 @@
 use std::num::NonZeroU32;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(target_env = "ohos")]
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::{borrow::Cow, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
 
 mod hyperlinks;
@@ -28,6 +30,8 @@ use alacritty_terminal::{
         NamedPrivateMode, PrivateMode,
     },
 };
+#[cfg(target_env = "ohos")]
+use alacritty_terminal::tty::ToWinsize;
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use util::paths::PathStyle;
@@ -177,12 +181,61 @@ pub(super) fn pty_options(
     }
 }
 
+#[cfg(not(target_env = "ohos"))]
 pub(super) fn open_pty(
     options: &tty::Options,
     bounds: TerminalBounds,
     window_id: u64,
 ) -> io::Result<AlacrittyPty> {
     tty::new(options, window_size_from_terminal_bounds(bounds), window_id)
+}
+
+/// Build the pair through the C library rather than the terminal backend's own
+/// `tty::new`, which asks the kernel for the peer descriptor with TIOCGPTPEER
+/// first and opens the /dev/pts/N node by name only when that call answers
+/// ENOSYS or EPERM. This platform answers EACCES there while opening the same
+/// path succeeds, so the backend would refuse every terminal.
+#[cfg(target_env = "ohos")]
+pub(super) fn open_pty(
+    options: &tty::Options,
+    bounds: TerminalBounds,
+    window_id: u64,
+) -> io::Result<AlacrittyPty> {
+    let window_size = window_size_from_terminal_bounds(bounds).to_winsize();
+    let winsize = libc::winsize {
+        ws_row: window_size.ws_row,
+        ws_col: window_size.ws_col,
+        ws_xpixel: window_size.ws_xpixel,
+        ws_ypixel: window_size.ws_ypixel,
+    };
+
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: both out-parameters are valid for the call, and openpty reports
+    // failure by return value instead of leaving half-filled descriptors.
+    let opened = unsafe {
+        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &winsize)
+    };
+    if opened != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openpty returned two descriptors that this process owns.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+
+    // openpty leaves both descriptors inheritable, and every child this editor
+    // starts would otherwise hold the master open for as long as it runs.
+    for descriptor in [master.as_raw_fd(), slave.as_raw_fd()] {
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    tty::from_fd(options, window_id, master, slave)
 }
 
 pub(super) fn new_term(

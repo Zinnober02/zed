@@ -33,6 +33,17 @@ pub extern "C" fn ohos_gpui_app_main(
     // SAFETY: called before any other thread exists.
     unsafe {
         std::env::set_var("HOME", "/data/storage/el2/base/haps/entry/files");
+        // The terminal backend takes the shell and the user name from the
+        // environment and falls back to the passwd database, which holds no
+        // entry for an application uid (getpwuid_r answers "not found"), and
+        // which names /bin/false as the shell of every account it does hold;
+        // without a shell in the environment no terminal can be started.
+        std::env::set_var("SHELL", "/system/bin/sh");
+        // The backend reads the user name with env::var, which fails on a value
+        // that is not valid UTF-8 as well as on an absent one.
+        if std::env::var("USER").is_err() {
+            std::env::set_var("USER", libc::getuid().to_string());
+        }
     }
 
     install_filesystem_bridge();
