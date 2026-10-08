@@ -900,12 +900,25 @@ impl SystemNodeRuntime {
     }
 
     async fn detect() -> std::result::Result<Self, DetectError> {
-        // On this platform the copy other native packages link into /data/service/hnp/bin
-        // cannot run a script: it is executed as its own process, which does not inherit the
-        // application's kernel permission, and it aborts inside V8's OS::SetPermissions check
-        // before the first line of JavaScript runs. The Node.js inside the command line tools
-        // DevEco installs was measured to run a JIT-heavy script here, so it comes first and
-        // PATH stays the fallback for a device whose package layout differs.
+        // Whatever PATH points at comes first, and on this platform that is the Node.js the
+        // application installs as a native package: that copy carries the inherited kernel
+        // permission to map writable code memory, without which its V8 aborts on the first
+        // script it runs. Running `node --version` is what decides whether a candidate is
+        // usable, so a broken copy on PATH falls through instead of being handed out.
+        if let (Ok(node), Ok(npm)) = (which::which("node"), which::which("npm")) {
+            match Self::new(node, npm).await {
+                Ok(runtime) => {
+                    log::info!("using the Node.js found on PATH: {runtime:?}");
+                    return Ok(runtime);
+                }
+                Err(error) => {
+                    log::warn!("the Node.js found on PATH cannot be used: {error}");
+                }
+            }
+        }
+
+        // The Node.js inside the DevEco command line tools is the fallback for a device
+        // where no native package provides one.
         #[cfg(target_env = "ohos")]
         if let Some((node, npm)) = ohos_command_line_tools_node() {
             let reported = node.clone();
