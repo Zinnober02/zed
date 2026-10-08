@@ -23287,6 +23287,7 @@ dependencies = [
  "cc",
  "fs",
  "gpui_ohos",
+ "libc",
  "zed",
 ]
 
