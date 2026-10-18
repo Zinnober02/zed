@@ -9,8 +9,22 @@
 mod host_abi;
 
 use std::ffi::{CStr, c_char, c_void};
+use std::path::Path;
 
 use gpui_ohos::LogFn;
+
+/// The interactive shell to hand to the terminal, as an absolute path.
+///
+/// /system/usr/bin/zsh is the shell the system terminal itself runs; /system/bin/sh
+/// is toybox's POSIX shell and only serves as the fallback for a device that ships
+/// no zsh.
+fn system_shell() -> &'static str {
+    if Path::new("/system/usr/bin/zsh").is_file() {
+        "/system/usr/bin/zsh"
+    } else {
+        "/system/bin/sh"
+    }
+}
 
 /// Called by the host from OnSurfaceCreated.
 #[unsafe(no_mangle)]
@@ -38,7 +52,19 @@ pub extern "C" fn ohos_gpui_app_main(
         // entry for an application uid (getpwuid_r answers "not found"), and
         // which names /bin/false as the shell of every account it does hold;
         // without a shell in the environment no terminal can be started.
-        std::env::set_var("SHELL", "/system/bin/sh");
+        //
+        // The device ships a full zsh at /system/usr/bin/zsh - it is what the system
+        // terminal runs and carries the same sh_exec label as /system/bin/sh, while
+        // that sh is toybox's stripped down POSIX shell that reads no rc file at all.
+        std::env::set_var("SHELL", system_shell());
+        // HOME stays inside the sandbox so zed keeps its own configuration there, and
+        // the shell is told where to read the user's startup files instead: zsh looks
+        // at ZDOTDIR before HOME, so the .zshrc they configured in the system terminal
+        // applies to the terminal in this editor as well.
+        let user_home = Path::new("/storage/Users/currentUser");
+        if user_home.is_dir() {
+            std::env::set_var("ZDOTDIR", user_home);
+        }
         // The backend reads the user name with env::var, which fails on a value
         // that is not valid UTF-8 as well as on an absent one.
         if std::env::var("USER").is_err() {
