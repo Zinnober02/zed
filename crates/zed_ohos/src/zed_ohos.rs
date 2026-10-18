@@ -65,6 +65,15 @@ pub extern "C" fn ohos_gpui_app_main(
         if user_home.is_dir() {
             std::env::set_var("ZDOTDIR", user_home);
         }
+        // Settings belong where the user can reach them: the configuration directory
+        // moves to their home, so settings.json, keymap.json, tasks and themes are the
+        // same files the terminal shows. Data, cache and state stay in the sandbox -
+        // language servers install there, and nothing under the home directory can be
+        // executed by this application.
+        let user_config = user_home.join(".config");
+        if user_config.is_dir() {
+            std::env::set_var("XDG_CONFIG_HOME", user_config);
+        }
         // The backend reads the user name with env::var, which fails on a value
         // that is not valid UTF-8 as well as on an absent one.
         if std::env::var("USER").is_err() {
