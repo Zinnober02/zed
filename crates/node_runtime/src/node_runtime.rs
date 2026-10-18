@@ -900,11 +900,30 @@ impl SystemNodeRuntime {
     }
 
     async fn detect() -> std::result::Result<Self, DetectError> {
-        // Whatever PATH points at comes first, and on this platform that is the Node.js the
-        // application installs as a native package: that copy carries the inherited kernel
-        // permission to map writable code memory, without which its V8 aborts on the first
-        // script it runs. Running `node --version` is what decides whether a candidate is
-        // usable, so a broken copy on PATH falls through instead of being handed out.
+        // The copy the user installed under the home directory comes first: it is the one
+        // they keep up to date. It only runs once the home directory has been granted to the
+        // application (the picker writes a persistent grant), and the version check below is
+        // what catches the case where it has not been: exec then fails and the next candidate
+        // is tried.
+        #[cfg(target_env = "ohos")]
+        if let Some((node, npm)) = ohos_home_node() {
+            let reported = node.clone();
+            match Self::new(node, npm).await {
+                Ok(runtime) => {
+                    log::info!("using the Node.js under the home directory: {reported:?}");
+                    return Ok(runtime);
+                }
+                Err(error) => {
+                    log::warn!("the Node.js under the home directory cannot be used: {error}");
+                }
+            }
+        }
+
+        // Then PATH, which on this platform is the Node.js the application installs as a
+        // native package: that copy carries the inherited kernel permission to map writable
+        // code memory, without which its V8 aborts on the first script it runs. Running
+        // `node --version` decides whether a candidate is usable, so a broken copy falls
+        // through instead of being handed out.
         if let (Ok(node), Ok(npm)) = (which::which("node"), which::which("npm")) {
             match Self::new(node, npm).await {
                 Ok(runtime) => {
@@ -939,6 +958,21 @@ impl SystemNodeRuntime {
     }
 }
 
+/// The Node.js the user installed under their home directory, as (node, npm).
+///
+/// This is the copy the user maintains themselves; it is only executable while the
+/// application holds the persistent grant the folder picker produces, so a missing grant
+/// shows up as a failed version check rather than a hard error.
+#[cfg(target_env = "ohos")]
+fn ohos_home_node() -> Option<(PathBuf, PathBuf)> {
+    let bin = Path::new("/storage/Users/currentUser/.harmonybrew/opt/node/bin");
+    let node = bin.join("node");
+    if node.is_file() {
+        Some((node, bin.join("npm")))
+    } else {
+        None
+    }
+}
 /// The Node.js that ships with the DevEco command line tools, as (node, npm).
 ///
 /// The package carries one directory per version, so the version directory is discovered
