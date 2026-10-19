@@ -128,8 +128,8 @@ fn scale_bgra_down(
 }
 
 pub(crate) struct AtlasTexture {
-    /// Part of the atlas identity; only one texture kind is used today.
-    #[allow(dead_code)]
+    /// Which atlas this texture backs. Each kind has its own allocator, image and
+    /// pixel size, so every later operation here is routed by this field.
     pub kind: AtlasTextureKind,
     pub width: u32,
     pub height: u32,
@@ -138,8 +138,8 @@ pub(crate) struct AtlasTexture {
 
 /// A dirty region to upload into the GPU atlas texture.
 pub(crate) struct AtlasUpload {
-    /// See AtlasTexture::kind.
-    #[allow(dead_code)]
+    /// Which atlas the region belongs to: the uploader picks the image and the
+    /// byte format to write by it.
     pub kind: AtlasTextureKind,
     pub x: u32,
     pub y: u32,

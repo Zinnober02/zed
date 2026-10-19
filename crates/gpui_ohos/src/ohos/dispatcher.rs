@@ -36,21 +36,18 @@ impl PartialEq for TimerAfter {
 
 impl Eq for TimerAfter {}
 
-type Waker = Box<dyn Fn() + Send + Sync + 'static>;
-
 /// Main-thread task dispatcher for OHOS.
 ///
 /// OHOS owns the UI thread, so we never block it. Foreground tasks are queued
 /// and drained from OhosPlatform::tick, which the ArkTS host calls once per
 /// frame. Timers run on a dedicated thread that pushes due runnables into a
-/// ready queue and (optionally) nudges the host through the waker.
+/// ready queue, which that same tick drains.
 pub(crate) struct OhosDispatcher {
     main_thread_id: thread::ThreadId,
     main_sender: PriorityQueueSender<RunnableVariant>,
     background_sender: PriorityQueueSender<RunnableVariant>,
     timer_queue: Arc<(Mutex<BinaryHeap<TimerAfter>>, Condvar)>,
     ready_timers: Arc<Mutex<VecDeque<RunnableVariant>>>,
-    waker: Arc<Mutex<Option<Waker>>>,
     _timer_thread: thread::JoinHandle<()>,
 }
 
@@ -59,7 +56,6 @@ impl OhosDispatcher {
         let timer_queue: Arc<(Mutex<BinaryHeap<TimerAfter>>, Condvar)> =
             Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new()));
         let ready_timers = Arc::new(Mutex::new(VecDeque::new()));
-        let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
 
         // A fixed pool rather than a thread per runnable: gpui reschedules a
         // background future after every poll, so one thread per dispatch is one
@@ -90,7 +86,6 @@ impl OhosDispatcher {
 
         let timer_queue_thread = timer_queue.clone();
         let ready_timers_thread = ready_timers.clone();
-        let waker_thread = waker.clone();
         let timer_thread = thread::Builder::new()
             .name("OhosTimer".to_owned())
             .spawn(move || {
@@ -119,14 +114,7 @@ impl OhosDispatcher {
                     }
                     drop(heap);
 
-                    let queued_any = !due.is_empty();
                     ready_timers_thread.lock().unwrap().append(&mut due);
-
-                    if queued_any {
-                        if let Some(waker) = waker_thread.lock().unwrap().as_ref() {
-                            waker();
-                        }
-                    }
                 }
             })
             .expect("Failed to start OHOS timer thread");
@@ -137,15 +125,8 @@ impl OhosDispatcher {
             background_sender,
             timer_queue,
             ready_timers,
-            waker,
             _timer_thread: timer_thread,
         }
-    }
-
-    /// Install a host waker that nudges the ArkTS frame loop.
-    #[allow(dead_code)]
-    pub(crate) fn set_waker(&self, waker: Waker) {
-        *self.waker.lock().unwrap() = Some(waker);
     }
 
     /// Run timers that are already due. Called from the main thread.
