@@ -99,7 +99,8 @@ pub(crate) struct OhosPlatform {
     on_reopen: RefCell<Option<Box<dyn FnMut()>>>,
     on_system_wake: RefCell<Option<Box<dyn FnMut()>>>,
     appearance: Cell<WindowAppearance>,
-    /// Raw host picker answers: "f|fd|name" for files, "d|uri" for folders.
+    /// Raw host picker answers: "f|fd|name|path" for files, "d|path|uri" for
+    /// folders, every field escaped by `host::encode_field`.
     pending_picks: RefCell<HashMap<u64, oneshot::Sender<Vec<String>>>>,
     next_pick_id: Cell<u64>,
     /// Folder URI the host restored from its persisted authorization.
@@ -387,7 +388,8 @@ impl OhosPlatform {
     }
 
     /// Pick files/folders, returning the host's raw answer lines
-    /// ("f|fd|name" for files, "d|uri" for folders).
+    /// ("f|fd|name|path" for files, "d|path|uri" for folders, every field
+    /// escaped by `host::encode_field`).
     pub(crate) fn pick_raw(
         &self,
         files: bool,
@@ -969,6 +971,9 @@ fn window_kind_name(kind: &WindowKind) -> &'static str {
 
 /// Payload for CREATE_WINDOW:
 /// "<id>\t<left>,<top>,<width>,<height>\t<title>\t<resizable>\t<kind>".
+///
+/// 标题是这条通道里唯一的自由文本，制表符、竖线与换行都要先转义，否则整条
+/// 请求的字段跟着错位。
 fn create_window_payload(
     id: &str,
     params: &WindowParams,
@@ -990,7 +995,7 @@ fn create_window_payload(
         .titlebar
         .as_ref()
         .and_then(|titlebar| titlebar.title.as_ref())
-        .map(|title| title.to_string())
+        .map(|title| host::encode_field(title))
         .unwrap_or_default();
     let resizable = if params.is_resizable { "1" } else { "0" };
     let kind = window_kind_name(&params.kind);
@@ -1024,32 +1029,43 @@ fn cursor_style_name(style: CursorStyle) -> &'static str {
     }
 }
 
-/// Encode a raw picker answer as the handle GPUI passes around: "f|fd|name"
+/// Encode a raw picker answer as the handle GPUI passes around: "f|fd|name|path"
 /// becomes "fd:<fd>" and "d|path|uri" becomes the plain sandbox path, because a
 /// project opened from a tagged handle would otherwise show that tag as its
 /// location in the UI.
-fn picked_handle(line: &str) -> PathBuf {
-    if let Some(rest) = line.strip_prefix("f|") {
-        let mut parts = rest.split('|');
-        let fd = parts.next().unwrap_or_default();
-        let _name = parts.next();
-        // The host sends the sandbox path after the name, because a path of the
-        // form "fd:8" is relative as far as the editor is concerned and it
-        // refuses to trust a project containing one.
-        if let Some(path) = parts.next().filter(|path| path.starts_with('/')) {
-            return PathBuf::from(path);
+///
+/// 各字段按本文件的字段编码还原，所以名字或路径里有竖线、制表符、换行时，
+/// 它仍然是同一个字段。还原失败按错误返回：这条应答已经被改过，拿它的一半
+/// 去打开文件就是打开用户没有点过的文件。
+fn picked_handle(line: &str) -> anyhow::Result<PathBuf> {
+    let mut parts = line.split('|');
+    match parts.next().unwrap_or_default() {
+        "f" => {
+            let fd = parts.next().unwrap_or_default();
+            // 名字不参与寻址，还原它是为了让改过的应答在这里就报错。
+            if let Some(name) = parts.next() {
+                host::decode_field(name)?;
+            }
+            // The host sends the sandbox path after the name, because a path of the
+            // form "fd:8" is relative as far as the editor is concerned and it
+            // refuses to trust a project containing one.
+            if let Some(path) = parts.next() {
+                let path = host::decode_field(path)?;
+                if path.starts_with('/') {
+                    return Ok(PathBuf::from(path));
+                }
+            }
+            if !fd.is_empty() {
+                return Ok(PathBuf::from(format!("fd:{fd}")));
+            }
+            Ok(PathBuf::from(host::decode_field(line)?))
         }
-        if !fd.is_empty() {
-            return PathBuf::from(format!("fd:{fd}"));
-        }
+        "d" => match parts.next() {
+            Some(path) => Ok(PathBuf::from(host::decode_field(path)?)),
+            None => Ok(PathBuf::new()),
+        },
+        _ => Ok(PathBuf::from(host::decode_field(line)?)),
     }
-    if let Some(rest) = line.strip_prefix("d|") {
-        if let Some((path, _uri)) = rest.split_once('|') {
-            return PathBuf::from(path);
-        }
-        return PathBuf::from(rest);
-    }
-    PathBuf::from(line)
 }
 
 /// Parse a host rect string of the form "x,y,w,h" (physical pixels).
@@ -1266,18 +1282,20 @@ impl Platform for OhosPlatform {
         self.foreground_executor
             .spawn(async move {
                 let answer = match raw.await {
-                    Ok(lines) => {
-                        let paths: Vec<PathBuf> =
-                            lines.iter().map(|line| picked_handle(line)).collect();
-                        if paths.is_empty() {
-                            Ok(None)
-                        } else {
-                            Ok(Some(paths))
-                        }
-                    }
+                    Ok(lines) => lines
+                        .iter()
+                        .map(|line| picked_handle(line))
+                        .collect::<anyhow::Result<Vec<PathBuf>>>()
+                        .map(|paths| if paths.is_empty() { None } else { Some(paths) }),
                     Err(_) => Ok(None),
                 };
-                let _ = sender.send(answer);
+                // 应答被拒的原因必须出现在日志里：否则界面上只表现为没反应。
+                if let Err(error) = &answer {
+                    super::vk::log(&format!("[gpui_ohos] picker answer rejected: {error}"));
+                }
+                if sender.send(answer).is_err() {
+                    super::vk::log("[gpui_ohos] nobody is waiting for the picker answer");
+                }
             })
             .detach();
         receiver
@@ -1297,18 +1315,23 @@ impl Platform for OhosPlatform {
         self.pending_picks.borrow_mut().insert(id, sender);
         let payload = format!(
             "n{id}|{}|{}",
-            directory.display(),
-            suggested_name.unwrap_or("")
+            host::encode_field(&directory.display().to_string()),
+            host::encode_field(suggested_name.unwrap_or(""))
         );
         host::window_op(host::op::PICK_NEW_PATH, &payload);
         let (tx, rx) = oneshot::channel();
         self.foreground_executor
             .spawn(async move {
                 let answer = match raw.await {
-                    Ok(lines) => Ok(lines.first().map(|line| picked_handle(line))),
+                    Ok(lines) => lines.first().map(|line| picked_handle(line)).transpose(),
                     Err(_) => Ok(None),
                 };
-                let _ = tx.send(answer);
+                if let Err(error) = &answer {
+                    super::vk::log(&format!("[gpui_ohos] picker answer rejected: {error}"));
+                }
+                if tx.send(answer).is_err() {
+                    super::vk::log("[gpui_ohos] nobody is waiting for the picker answer");
+                }
             })
             .detach();
         rx

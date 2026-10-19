@@ -43,7 +43,8 @@ pub(crate) mod op {
 pub(crate) mod query {
     /// Open a picked file read/write and return its descriptor.
     pub const OPEN_FILE: i32 = 105;
-    /// List a picked directory: "name|isDir|uri" per line.
+    /// List a picked directory: "name|isDir|uri" per line, name and uri escaped
+    /// by `encode_field`.
     pub const LIST_DIR: i32 = 106;
     /// The folder to restore, if the host has one. Pulled instead of pushed so
     /// the backend cannot miss it by starting a moment late.
@@ -73,6 +74,51 @@ pub(crate) mod event {
     pub const BENCHMARK: i32 = 8;
     /// The pointer entered or left a window: "<surface id>\t1" or "...\t0".
     pub const HOVER: i32 = 9;
+}
+
+/// 把字段里的分隔符换成转义序列，分隔符本身只在字段之间起作用。
+///
+/// 标题、路径和目录项名字里都可能出现竖线与制表符，旧协议把它们当成了字段
+/// 边界：标题含制表符时整条建窗请求的字段全部错位，路径含竖线时会打开另一个
+/// 真实文件，目录项名字含竖线时这个文件是目录还是文件会被判反。
+/// 调用方只对单个字段调用它，不要对拼好的整条应答调用。
+pub(crate) fn encode_field(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '%' => encoded.push_str("%25"),
+            '|' => encoded.push_str("%7C"),
+            '\t' => encoded.push_str("%09"),
+            '\n' => encoded.push_str("%0A"),
+            other => encoded.push(other),
+        }
+    }
+    encoded
+}
+
+/// 把字段还原成原来的文本。
+///
+/// 认不出的转义按错误上报，不猜也不截断：应答在传输中被改过的时候，任何猜测
+/// 都等于让后续操作作用在用户没有点过的文件上。
+pub(crate) fn decode_field(value: &str) -> anyhow::Result<String> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            decoded.push(character);
+            continue;
+        }
+        let code: String = characters.by_ref().take(2).collect();
+        let replacement = match code.as_str() {
+            "25" => '%',
+            "7C" => '|',
+            "09" => '\t',
+            "0A" => '\n',
+            other => anyhow::bail!("undeclared escape %{other} in field {value:?}"),
+        };
+        decoded.push(replacement);
+    }
+    Ok(decoded)
 }
 
 /// Function pointers implemented by the ArkTS host.
@@ -283,13 +329,16 @@ pub(crate) fn create_dir(uri: &str) -> std::io::Result<()> {
 pub(crate) fn remove(uri: &str, is_dir: bool) -> std::io::Result<()> {
     status(
         query::REMOVE,
-        &format!("{}	{uri}", if is_dir { 1 } else { 0 }),
+        &format!("{}	{}", if is_dir { 1 } else { 0 }, encode_field(uri)),
     )
 }
 
 /// Rename an entry inside a picked root.
 pub(crate) fn rename(from: &str, to: &str) -> std::io::Result<()> {
-    status(query::RENAME, &format!("{from}	{to}"))
+    status(
+        query::RENAME,
+        &format!("{}	{}", encode_field(from), encode_field(to)),
+    )
 }
 
 /// The folder the host wants restored, if any.
@@ -321,7 +370,13 @@ pub(crate) fn list_dir(uri: &str) -> std::io::Result<Vec<(String, bool, String)>
                 "malformed listing line for {uri}: {line}"
             )));
         };
-        entries.push((name.to_string(), is_dir == "1", child_uri.to_string()));
+        let name = decode_field(name).map_err(|error| {
+            std::io::Error::other(format!("listing {uri} has a damaged name: {error}"))
+        })?;
+        let child_uri = decode_field(child_uri).map_err(|error| {
+            std::io::Error::other(format!("listing {uri} has a damaged path: {error}"))
+        })?;
+        entries.push((name, is_dir == "1", child_uri));
     }
     Ok(entries)
 }
