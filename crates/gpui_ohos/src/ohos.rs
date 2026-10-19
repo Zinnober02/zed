@@ -812,7 +812,20 @@ thread_local! {
     /// method takes the down of the keys it handles itself and lets the up through, so an up
     /// without a down is that case rather than a stray event.
     static PRESSED_KEY: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// When that down arrived. A release never follows a press that the input method took,
+    /// and one is dropped as well when focus leaves the window mid-press, so a code left
+    /// behind would make the next release of the same key look paired up and be dropped.
+    /// The age is what tells the two apart.
+    static PRESSED_AT: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
 }
+
+/// How long a press may stay unanswered before its release counts as a press of its own.
+///
+/// The pair only ever distinguishes "this release had its own press" from "the input method
+/// took the press", so the number wants to be longer than any deliberate single press and
+/// shorter than the time between two separate ones.
+const PRESS_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn is_modifier_key(code: i32) -> bool {
     matches!(code, 2072 | 2073 | 2047 | 2048 | 2045 | 2046 | 2076 | 2077)
@@ -897,8 +910,12 @@ pub fn key_event(id: &str, action: i32, code: i32, unicode: i32) {
     let unicode = u32::try_from(unicode).ok().filter(|value| *value > 0);
     if down {
         PRESSED_KEY.with(|cell| cell.set(code));
+        PRESSED_AT.with(|cell| cell.set(Some(std::time::Instant::now())));
     } else {
-        let had_down = PRESSED_KEY.with(|cell| cell.replace(0)) == code;
+        let previous = PRESSED_KEY.with(|cell| cell.replace(0));
+        let pressed_at = PRESSED_AT.with(|cell| cell.take());
+        let had_down =
+            previous == code && pressed_at.is_some_and(|at| at.elapsed() < PRESS_STALE_AFTER);
         if !had_down && is_press_key(code) {
             // Nothing was composing by the time an unconsumed up arrived, so the press is
             // rebuilt here: without the down the application never sees this key at all, and
