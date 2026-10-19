@@ -371,6 +371,12 @@ impl WindowShared {
             ));
             return;
         };
+        // A handler that keeps no text of its own - the terminal is one - reports an
+        // empty range, and replacing that range with nothing swallowed the key: the
+        // input method takes the press, hands back "delete this empty span", and the
+        // terminal never saw a backspace at all. There is nothing to delete there, so
+        // the key is dispatched once the handler is released and the view decides.
+        let mut keys_to_dispatch: Option<(&'static str, usize)> = None;
         match command {
             ImeCommand::Commit(text) => {
                 // Not None: that means "replace the marked range", and the input
@@ -388,17 +394,27 @@ impl WindowShared {
                 handler.unmark_text();
             }
             ImeCommand::Backspace(count) => {
-                if let Some(selection) = handler.selected_text_range(true) {
+                let range = handler.selected_text_range(true).map(|selection| {
                     let end = selection.range.end;
-                    let start = end.saturating_sub(*count);
-                    handler.replace_text_in_range(Some(start..end), "");
+                    end.saturating_sub(*count)..end
+                });
+                match range {
+                    Some(range) if !range.is_empty() => {
+                        handler.replace_text_in_range(Some(range), "");
+                    }
+                    _ => keys_to_dispatch = Some(("backspace", (*count).max(1))),
                 }
             }
             ImeCommand::DeleteForward(count) => {
-                if let Some(selection) = handler.selected_text_range(true) {
+                let range = handler.selected_text_range(true).map(|selection| {
                     let start = selection.range.end;
-                    let end = start + *count;
-                    handler.replace_text_in_range(Some(start..end), "");
+                    start..start + *count
+                });
+                match range {
+                    Some(range) if !range.is_empty() => {
+                        handler.replace_text_in_range(Some(range), "");
+                    }
+                    _ => keys_to_dispatch = Some(("delete", (*count).max(1))),
                 }
             }
             ImeCommand::Preview { text, start, end } => {
@@ -414,6 +430,20 @@ impl WindowShared {
                 handler.unmark_text();
             }
             ImeCommand::MoveCursor(_) => {}
+        }
+        drop(guard);
+        if let Some((key, count)) = keys_to_dispatch {
+            for _ in 0..count {
+                self.dispatch_input(PlatformInput::KeyDown(crate::KeyDownEvent {
+                    keystroke: crate::Keystroke {
+                        modifiers: Default::default(),
+                        key: key.to_string(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }));
+            }
         }
     }
 
