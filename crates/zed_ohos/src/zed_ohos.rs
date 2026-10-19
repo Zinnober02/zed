@@ -74,6 +74,21 @@ pub extern "C" fn ohos_gpui_app_main(
         if user_config.is_dir() {
             std::env::set_var("XDG_CONFIG_HOME", user_config);
         }
+        // Everything the editor spawns looks for its tools on PATH, and the one the
+        // ability starts with carries no package manager: the git panel then asks for
+        // "git" and gets ENOENT. The user's installs live in their home, which the
+        // application may execute once that directory is granted.
+        let user_bin = user_home.join(".harmonybrew/bin");
+        if user_bin.is_dir() {
+            let path = std::env::var("PATH").unwrap_or_default();
+            std::env::set_var("PATH", format!("{}:{path}", user_bin.display()));
+        }
+        // This git reads no home configuration file, so the only way to tell it that
+        // the repositories under the user's home are fine to touch is the environment,
+        // which every child the editor spawns inherits.
+        std::env::set_var("GIT_CONFIG_COUNT", "1");
+        std::env::set_var("GIT_CONFIG_KEY_0", "safe.directory");
+        std::env::set_var("GIT_CONFIG_VALUE_0", "*");
         // The backend reads the user name with env::var, which fails on a value
         // that is not valid UTF-8 as well as on an absent one.
         if std::env::var("USER").is_err() {
