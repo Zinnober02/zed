@@ -923,6 +923,13 @@ impl OhosPlatform {
             }
         }
     }
+
+    /// Type text the input method left to the key path.
+    pub(crate) fn dispatch_text(&self, id: &str, text: &str) {
+        for window in self.route_targets(id) {
+            window.dispatch_text(text);
+        }
+    }
 }
 
 /// Split a per-window host event into its surface id and payload.

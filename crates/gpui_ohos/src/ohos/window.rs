@@ -378,21 +378,7 @@ impl WindowShared {
         // the key is dispatched once the handler is released and the view decides.
         let mut keys_to_dispatch: Option<(&'static str, usize)> = None;
         match command {
-            ImeCommand::Commit(text) => {
-                // Not None: that means "replace the marked range", and the input
-                // method may finish the preview before it reports the confirmation -
-                // the mark is gone by then and the replacement lands nowhere, which
-                // is how a confirmed composition was lost. The marked range is used
-                // when it is still there, and the caret (an empty selection) when it
-                // is not.
-                let range = handler.marked_text_range().or_else(|| {
-                    handler
-                        .selected_text_range(false)
-                        .map(|selection| selection.range)
-                });
-                handler.replace_text_in_range(range, text);
-                handler.unmark_text();
-            }
+            ImeCommand::Commit(text) => insert_text(handler, text),
             ImeCommand::Backspace(count) => {
                 let range = handler.selected_text_range(true).map(|selection| {
                     let end = selection.range.end;
@@ -457,6 +443,23 @@ impl WindowShared {
         }
         self.callbacks.borrow_mut().input = callback;
         result
+    }
+
+    /// Type text that arrives outside the input method.
+    ///
+    /// The input method only hands over the keys it composes with, so digits and punctuation
+    /// reach the key path instead, and text enters the application through the input handler
+    /// alone.
+    pub(crate) fn dispatch_text(&self, text: &str) {
+        let mut guard = self.input_handler.borrow_mut();
+        let Some(handler) = guard.as_mut() else {
+            super::vk::log(&format!(
+                "[gpui_ohos] text dropped for {}: no input handler",
+                self.id
+            ));
+            return;
+        };
+        insert_text(handler, text);
     }
 
     /// Called by the platform when the XComponent surface changes size.
@@ -1712,4 +1715,19 @@ fn scene_hash(scene: &Scene) -> u64 {
         sprite.order.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Put text into the focused field of the window.
+///
+/// The marked range is used whenever it is still there: the input method may finish its
+/// preview before it reports the confirmation, and by then the mark is gone, so replacing it
+/// would land nowhere and the confirmed composition would be lost.
+fn insert_text(handler: &mut PlatformInputHandler, text: &str) {
+    let range = handler.marked_text_range().or_else(|| {
+        handler
+            .selected_text_range(false)
+            .map(|selection| selection.range)
+    });
+    handler.replace_text_in_range(range, text);
+    handler.unmark_text();
 }

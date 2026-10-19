@@ -894,7 +894,7 @@ pub fn key_pre_ime(id: &str, action: i32, code: i32, _unicode: i32) -> bool {
     if !is_gpui_key(code, modifiers) {
         return false;
     }
-    dispatch_key(id, down, code, modifiers, None);
+    dispatch_key(id, down, code, modifiers);
     true
 }
 
@@ -907,7 +907,16 @@ pub fn key_event(id: &str, action: i32, code: i32, unicode: i32) {
         dispatch_modifiers(id, modifiers);
         return;
     }
-    let unicode = u32::try_from(unicode).ok().filter(|value| *value > 0);
+    // A key that types a character is text, and text enters the application the same way the
+    // input method's own commits do. The input method hands over the keys it composes with and
+    // leaves the rest - digits, punctuation - to this callback, and a key event by itself types
+    // nothing: the editor takes text through its input handler alone.
+    if let Some(text) = typed_text(code, unicode, modifiers) {
+        if down {
+            dispatch_text(id, &text);
+        }
+        return;
+    }
     if down {
         PRESSED_KEY.with(|cell| cell.set(code));
         PRESSED_AT.with(|cell| cell.set(Some(std::time::Instant::now())));
@@ -921,10 +930,41 @@ pub fn key_event(id: &str, action: i32, code: i32, unicode: i32) {
             // rebuilt here: without the down the application never sees this key at all, and
             // the terminal and the editor both act on the down.
             vk::log(&format!("[gpui_ohos] press rebuilt for key up code={code}"));
-            dispatch_key(id, true, code, modifiers, unicode);
+            dispatch_key(id, true, code, modifiers);
         }
     }
-    dispatch_key(id, down, code, modifiers, unicode);
+    dispatch_key(id, down, code, modifiers);
+}
+
+/// The character a key types, for the keys that type anything at all.
+///
+/// Shift shapes the character; the modifiers that turn a keystroke into a command do not.
+fn typed_text(code: i32, unicode: i32, modifiers: crate::Modifiers) -> Option<String> {
+    if modifiers.control || modifiers.alt || modifiers.platform {
+        return None;
+    }
+    let character = u32::try_from(unicode)
+        .ok()
+        .filter(|value| *value > 0)
+        .and_then(char::from_u32)
+        .or_else(|| ohos_key(code).and_then(|(_, character)| character))?;
+    // Enter, tab and escape carry a Unicode value on this platform and stay on the key path,
+    // where the bindings that act on them live.
+    if character.is_control() {
+        return None;
+    }
+    Some(if modifiers.shift {
+        character.to_uppercase().to_string()
+    } else {
+        character.to_string()
+    })
+}
+
+/// Hand text to the focused input handler of the surface's window.
+fn dispatch_text(id: &str, text: &str) {
+    let id = id.to_string();
+    let text = text.to_string();
+    post(move |platform| platform.dispatch_text(&id, &text));
 }
 
 /// Forward a modifier-state change to the surface's window.
@@ -938,28 +978,14 @@ fn dispatch_modifiers(id: &str, modifiers: crate::Modifiers) {
     post(move |platform| platform.dispatch_modifiers(&id, modifiers));
 }
 
-fn dispatch_key(
-    id: &str,
-    down: bool,
-    code: i32,
-    modifiers: crate::Modifiers,
-    unicode: Option<u32>,
-) {
+fn dispatch_key(id: &str, down: bool, code: i32, modifiers: crate::Modifiers) {
     let Some((key, character)) = ohos_key(code) else {
         vk::log(&format!("[gpui_ohos] unmapped key code={code}"));
         return;
     };
-    let key_char = if modifiers.control || modifiers.platform {
-        None
-    } else {
-        unicode.and_then(char::from_u32).or(character).map(|ch| {
-            if modifiers.shift {
-                ch.to_uppercase().to_string()
-            } else {
-                ch.to_string()
-            }
-        })
-    };
+    let key_char = character
+        .filter(|_| !modifiers.control && !modifiers.platform)
+        .map(|character| character.to_string());
     let keystroke = crate::Keystroke {
         modifiers,
         key,
