@@ -46,12 +46,15 @@ const FD_PREFIX: &str = "fd:";
 /// Host entry points the wrapper needs, registered by the OHOS entry point.
 #[derive(Clone, Copy)]
 pub struct OhosFsBridge {
-    pub list_dir: fn(String) -> BoxFuture<'static, Vec<(String, bool, String)>>,
+    pub list_dir: fn(String) -> BoxFuture<'static, io::Result<Vec<(String, bool, String)>>>,
     pub open_file: fn(String) -> BoxFuture<'static, Option<i32>>,
     pub read_fd: fn(i32) -> BoxFuture<'static, io::Result<Vec<u8>>>,
     pub write_fd: fn(i32, Vec<u8>) -> BoxFuture<'static, io::Result<()>>,
     /// Release a descriptor opened for one operation, success or failure alike.
-    pub close_fd: fn(i32),
+    ///
+    /// The host releases it, because it is also the side that holds the handle the
+    /// descriptor came from: only that side can give up both together.
+    pub close_fd: fn(i32) -> BoxFuture<'static, io::Result<()>>,
     /// Create a directory under a picked root.
     pub create_dir: fn(String) -> BoxFuture<'static, io::Result<()>>,
     /// Remove a file or, when the flag is set, a directory.
@@ -190,7 +193,7 @@ impl OhosFs {
             .await
             .ok_or_else(|| anyhow!("could not open {uri}"))?;
         let bytes = (bridge()?.read_fd)(fd).await;
-        (bridge()?.close_fd)(fd);
+        (bridge()?.close_fd)(fd).await?;
         Ok(bytes?)
     }
 
@@ -205,7 +208,7 @@ impl OhosFs {
             .await
             .ok_or_else(|| anyhow!("could not open {uri}"))?;
         let written = (bridge()?.write_fd)(fd, bytes.to_vec()).await;
-        (bridge()?.close_fd)(fd);
+        (bridge()?.close_fd)(fd).await?;
         Ok(written?)
     }
 }
@@ -408,7 +411,7 @@ impl Fs for OhosFs {
         let Some(uri) = self.picked_uri(path) else {
             return self.inner.read_dir(path).await;
         };
-        let entries = (bridge()?.list_dir)(uri.clone()).await;
+        let entries = (bridge()?.list_dir)(uri.clone()).await?;
         let base = path.to_path_buf();
         {
             let mut picked = self.picked.lock().unwrap();
@@ -447,13 +450,37 @@ impl Fs for OhosFs {
         let interval = latency.max(std::time::Duration::from_millis(800));
         std::thread::spawn(move || {
             let mut known: Option<std::collections::HashSet<PathBuf>> = None;
+            // The message of the failure that is still going on, so that a listing
+            // which stays broken reports itself once instead of every interval.
+            let mut failing: Option<String> = None;
             loop {
                 if sender.is_closed() {
                     return;
                 }
-                let entries = match bridge() {
+                let listed = match bridge() {
                     Ok(bridge) => smol::block_on((bridge.list_dir)(uri.clone())),
-                    Err(_) => Vec::new(),
+                    Err(error) => Err(io::Error::other(error.to_string())),
+                };
+                let entries = match listed {
+                    Ok(entries) => {
+                        failing = None;
+                        entries
+                    }
+                    Err(error) => {
+                        // A failed listing says nothing about which entries went
+                        // away; diffing it as an empty directory told the workspace
+                        // that every file in the picked folder had been deleted.
+                        let message = error.to_string();
+                        if failing.as_deref() != Some(message.as_str()) {
+                            debug(format!(
+                                "ohosfs watcher for {} cannot list: {message}",
+                                root.display()
+                            ));
+                            failing = Some(message);
+                        }
+                        std::thread::sleep(interval);
+                        continue;
+                    }
                 };
                 let current: std::collections::HashSet<PathBuf> = entries
                     .into_iter()

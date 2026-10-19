@@ -4,7 +4,7 @@ mod ohos;
 
 pub use gpui::*;
 pub use ohos::{
-    HostOps, LogFn, close_picked_file, create_picked_dir_async, current_platform, host_event,
+    HostOps, LogFn, close_picked_file_async, create_picked_dir_async, current_platform, host_event,
     ime_commit_text, ime_delete_backward, ime_delete_forward, ime_finish_preview, ime_hide,
     ime_preview_text, ime_show, key_event, key_pre_ime, list_picked_dir, list_picked_dir_async,
     log_line, open_picked_file, open_picked_file_async, pick_items, pointer_down, pointer_move,

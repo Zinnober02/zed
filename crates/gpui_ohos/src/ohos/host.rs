@@ -54,6 +54,8 @@ pub(crate) mod query {
     pub const REMOVE: i32 = 110;
     /// Rename an entry inside a picked root.
     pub const RENAME: i32 = 111;
+    /// Release a descriptor the host opened for one operation.
+    pub const CLOSE_FILE: i32 = 112;
 }
 
 /// Events the host pushes into the backend.
@@ -181,7 +183,6 @@ pub(crate) fn query(op: i32, arg: &str) -> anyhow::Result<String> {
 const SEEK_SET: i32 = 0;
 
 unsafe extern "C" {
-    fn close(fd: i32) -> i32;
     fn read(fd: i32, buffer: *mut c_void, count: usize) -> isize;
     fn write(fd: i32, buffer: *const c_void, count: usize) -> isize;
     fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
@@ -217,16 +218,11 @@ pub(crate) fn read_fd_bytes(fd: i32) -> std::io::Result<Vec<u8>> {
 
 /// Release a descriptor the host opened for a single operation.
 ///
-/// Nothing else closes these: leaking one per read or write exhausts the
-/// process descriptor table after a few hundred operations.
-pub(crate) fn close_fd(fd: i32) {
-    let closed = unsafe { close(fd) };
-    if closed != 0 {
-        crate::log_line(&format!(
-            "close_fd {fd} failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+/// The host closes it, because the page holds the `fs.File` that opened it: a
+/// raw `close` here released the number while that object stayed alive, and the
+/// object closed whatever the process had handed the same number to afterwards.
+pub(crate) fn close_fd(fd: i32) -> std::io::Result<()> {
+    status(query::CLOSE_FILE, &fd.to_string())
 }
 
 /// Read a picked public file as UTF-8 text.
@@ -306,24 +302,26 @@ pub(crate) fn restore_folder() -> Option<String> {
 }
 
 /// Ask the host to list a picked directory as (name, is_dir, uri).
-pub(crate) fn list_dir(uri: &str) -> Vec<(String, bool, String)> {
-    let answer = match query(query::LIST_DIR, uri) {
-        Ok(answer) => answer,
-        Err(error) => {
-            // An empty list and a failed query used to look identical to the
-            // caller, which turned a broken listing into an empty directory.
-            crate::log_line(&format!("list_dir failed: {error}"));
-            return Vec::new();
-        }
-    };
-    answer
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, '|');
-            let name = parts.next()?.to_string();
-            let is_dir = parts.next()? == "1";
-            let child_uri = parts.next()?.to_string();
-            Some((name, is_dir, child_uri))
-        })
-        .collect()
+///
+/// A failed listing is an error and not an empty one: the caller compares
+/// listings to decide what appeared and what disappeared, so an empty answer
+/// reads as every file in the directory having been deleted.
+pub(crate) fn list_dir(uri: &str) -> std::io::Result<Vec<(String, bool, String)>> {
+    let answer = query(query::LIST_DIR, uri)
+        .map_err(|error| std::io::Error::other(format!("listing {uri} failed: {error}")))?;
+    let mut entries = Vec::new();
+    for line in answer.lines() {
+        // A line the host could not have produced means the answer is damaged, and
+        // guessing which entry it was meant to be would act on the wrong file.
+        let mut parts = line.splitn(3, '|');
+        let (Some(name), Some(is_dir), Some(child_uri)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(std::io::Error::other(format!(
+                "malformed listing line for {uri}: {line}"
+            )));
+        };
+        entries.push((name.to_string(), is_dir == "1", child_uri.to_string()));
+    }
+    Ok(entries)
 }

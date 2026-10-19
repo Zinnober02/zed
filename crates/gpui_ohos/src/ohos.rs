@@ -18,7 +18,7 @@ use std::{
     rc::{Rc, Weak},
     sync::{
         Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -49,18 +49,31 @@ thread_local! {
     /// The live platform for this (UI) thread. XComponent callbacks, ArkTS
     /// frame ticks and input all arrive on the ArkUI UI thread.
     static CURRENT: RefCell<Weak<OhosPlatform>> = RefCell::new(Weak::new());
-    /// Writable directory the app should browse, set from ArkTS filesDir.
-    static ROOT_DIR: RefCell<Option<String>> = const { RefCell::new(None) };
 }
+
+/// 应用可写入的目录，来自 ArkTS 的 filesDir。
+///
+/// panic hook 在发生崩溃的那个线程上写 panic 记录，而这个值由 ArkUI 线程设置，
+/// 所以它必须是进程级共享的：线程局部变量在这一边写入、在另一边读出空值，
+/// 记录文件永远不会出现。
+static ROOT_DIR: OnceLock<String> = OnceLock::new();
 
 /// Set the directory the application should browse (from ArkTS context.filesDir).
 pub fn set_root_dir(path: &str) {
-    ROOT_DIR.with(|root| *root.borrow_mut() = Some(path.to_string()));
+    match ROOT_DIR.set(path.to_string()) {
+        Ok(()) => vk::log(&format!("[gpui_ohos] root directory {path}")),
+        // 每个页面都会调一次，同一进程里重复到达同一个目录属于正常情况；
+        // 目录不同则说明两个页面认为的沙箱位置不一致，必须留下记录。
+        Err(existing) if existing.as_str() == path => {}
+        Err(existing) => vk::log(&format!(
+            "[gpui_ohos] root directory stays {existing}, ignoring {path}"
+        )),
+    }
 }
 
 /// The directory set by set_root_dir, if any.
 pub fn root_dir() -> Option<String> {
-    ROOT_DIR.with(|root| root.borrow().clone())
+    ROOT_DIR.get().cloned()
 }
 
 /// Closures waiting for the ArkUI UI thread, drained from platform::tick.
@@ -322,9 +335,10 @@ where
             inputmethod::attach();
             platform.request_frames();
             vk::log(&format!(
-                "[gpui_ohos] platform thread {:?} running, windows={}",
+                "[gpui_ohos] platform thread {:?} running, windows={}, root dir {:?}",
                 std::thread::current().id(),
-                platform.window_count()
+                platform.window_count(),
+                root_dir()
             ));
             loop {
                 for job in platform_queue().take(Duration::from_millis(500)) {
@@ -381,16 +395,27 @@ pub fn install_panic_hook() {
         vk::log(&message);
         // The next launch mirrors this file into hilog, which survives a crash
         // that kills the process mid log flush.
-        if let Some(root) = root_dir() {
-            let path = format!("{root}/panics.log");
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                use std::io::Write;
-                let _ = writeln!(file, "{message}");
+        //
+        // 写不进去必须留下记录：记录文件不存在与写入失败看起来完全一样，
+        // 只凭文件为空无法断定有没有崩溃。
+        match root_dir() {
+            Some(root) => {
+                let path = format!("{root}/panics.log");
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    Ok(mut file) => {
+                        use std::io::Write;
+                        if let Err(error) = writeln!(file, "{message}") {
+                            vk::log(&format!("[gpui_ohos] could not write {path}: {error}"));
+                        }
+                    }
+                    Err(error) => vk::log(&format!("[gpui_ohos] could not open {path}: {error}")),
+                }
             }
+            None => vk::log("[gpui_ohos] no root directory, the panic is not in panics.log"),
         }
         previous_hook(info);
     }));
@@ -510,7 +535,9 @@ pub fn open_picked_file(uri: &str) -> Option<i32> {
 }
 
 /// List a picked directory, on the UI thread.
-pub fn list_picked_dir_async(uri: String) -> BoxFuture<'static, Vec<(String, bool, String)>> {
+pub fn list_picked_dir_async(
+    uri: String,
+) -> BoxFuture<'static, std::io::Result<Vec<(String, bool, String)>>> {
     Box::pin(run_on_ui(move || host::list_dir(&uri)))
 }
 
@@ -519,9 +546,9 @@ pub fn open_picked_file_async(uri: String) -> BoxFuture<'static, Option<i32>> {
     Box::pin(run_on_ui(move || host::open_file(&uri)))
 }
 
-/// Release a descriptor opened for a single picked-file operation.
-pub fn close_picked_file(fd: i32) {
-    host::close_fd(fd);
+/// Release a descriptor opened for a single picked-file operation, on the UI thread.
+pub fn close_picked_file_async(fd: i32) -> BoxFuture<'static, std::io::Result<()>> {
+    Box::pin(run_on_ui(move || host::close_fd(fd)))
 }
 
 /// Read a picked file's bytes, on the UI thread.
@@ -559,7 +586,7 @@ pub fn rename_picked_path_async(
 }
 
 /// List a picked directory as (name, is_directory, uri).
-pub fn list_picked_dir(uri: &str) -> Vec<(String, bool, String)> {
+pub fn list_picked_dir(uri: &str) -> std::io::Result<Vec<(String, bool, String)>> {
     host::list_dir(uri)
 }
 
@@ -604,6 +631,12 @@ pub fn set_host_ops(ops: HostOps) {
 
 /// Handle an event pushed from the ArkTS host.
 pub fn host_event(kind: i32, arg: &str) {
+    // 焦点离开时最后按下的修饰键不会再等来抬起事件，累积的状态只能在这里复位；
+    // 应用侧保留的修饰键状态同样要收一次复位后的事件，否则它也会停在按下。
+    if kind == host::event::FOCUS && arg.rsplit('\t').next() == Some("0") {
+        forget_modifiers();
+        post(|platform| platform.dispatch_modifiers("", crate::Modifiers::default()));
+    }
     let arg = arg.to_string();
     post(move |platform| platform.handle_host_event(kind, &arg));
 }
@@ -800,14 +833,42 @@ pub fn scroll(id: &str, x: f32, y: f32, delta_x: f32, delta_y: f32, phase: i32) 
     });
 }
 
-// Focus is the platform's own state now: everything that reads it runs on the
-// platform's thread, so a thread local here was a second truth waiting to
-// disagree with the one in OhosPlatform.
+/// 键盘修饰键的状态，由 NDK 的按键事件累积出来。
+///
+/// 按键事件到达的是 ArkUI 线程，窗口事件在平台线程上分派，所以这里必须是进程级
+/// 共享的状态：任意一侧改用线程局部变量，另一侧读到的就是自己的默认值，
+/// Ctrl/Shift/Alt + 点击会丢掉修饰键。
+static MODIFIERS: AtomicU8 = AtomicU8::new(0);
+
+const MODIFIER_CONTROL: u8 = 1 << 0;
+const MODIFIER_ALT: u8 = 1 << 1;
+const MODIFIER_SHIFT: u8 = 1 << 2;
+const MODIFIER_PLATFORM: u8 = 1 << 3;
+
+/// 当前的修饰键状态。
+pub(crate) fn modifiers() -> crate::Modifiers {
+    let bits = MODIFIERS.load(Ordering::SeqCst);
+    crate::Modifiers {
+        control: bits & MODIFIER_CONTROL != 0,
+        alt: bits & MODIFIER_ALT != 0,
+        shift: bits & MODIFIER_SHIFT != 0,
+        platform: bits & MODIFIER_PLATFORM != 0,
+        // 这个平台没有把功能键当成修饰键上报。
+        function: false,
+    }
+}
+
+/// 丢掉累积的修饰键状态。
+///
+/// 焦点离开之后，按下的修饰键不会再有抬起事件送达，状态卡在按下会让此后的输入
+/// 全部被当成快捷键，所以焦点丢失时要复位。
+fn forget_modifiers() {
+    if MODIFIERS.swap(0, Ordering::SeqCst) != 0 {
+        vk::log("[gpui_ohos] modifiers reset after focus loss");
+    }
+}
 
 thread_local! {
-    /// Keyboard modifier state, tracked from NDK key events.
-    static MODIFIERS: std::cell::Cell<crate::Modifiers> =
-        std::cell::Cell::new(crate::Modifiers::default());
     /// Code of the key whose down event reached the application, or 0 when none did. The input
     /// method takes the down of the keys it handles itself and lets the up through, so an up
     /// without a down is that case rather than a stray event.
@@ -840,18 +901,19 @@ fn is_press_key(code: i32) -> bool {
 }
 
 fn update_modifiers(code: i32, down: bool) -> crate::Modifiers {
-    MODIFIERS.with(|cell| {
-        let mut modifiers = cell.get();
-        match code {
-            2072 | 2073 => modifiers.control = down,
-            2047 | 2048 => modifiers.shift = down,
-            2045 | 2046 => modifiers.alt = down,
-            2076 | 2077 => modifiers.platform = down,
-            _ => {}
-        }
-        cell.set(modifiers);
-        modifiers
-    })
+    let bit = match code {
+        2072 | 2073 => MODIFIER_CONTROL,
+        2047 | 2048 => MODIFIER_SHIFT,
+        2045 | 2046 => MODIFIER_ALT,
+        2076 | 2077 => MODIFIER_PLATFORM,
+        _ => return modifiers(),
+    };
+    if down {
+        MODIFIERS.fetch_or(bit, Ordering::SeqCst);
+    } else {
+        MODIFIERS.fetch_and(!bit, Ordering::SeqCst);
+    }
+    modifiers()
 }
 
 /// Keys GPUI must see before the input method: modifiers, navigation and any

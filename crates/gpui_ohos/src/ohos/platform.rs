@@ -896,6 +896,8 @@ impl OhosPlatform {
     }
 
     /// Forward a modifier-state change to the surface's window.
+    ///
+    /// 焦点丢失时的复位用空 id 调用，把复位之后的修饰键状态送到每个窗口。
     pub(crate) fn dispatch_modifiers(&self, id: &str, modifiers: Modifiers) {
         for window in self.route_targets(id) {
             window.dispatch_input(PlatformInput::ModifiersChanged(

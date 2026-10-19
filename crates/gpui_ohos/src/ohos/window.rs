@@ -119,7 +119,6 @@ pub(crate) struct WindowShared {
     renderer_window: Cell<usize>,
     pointer_position: Cell<Point<Pixels>>,
     pressed_button: Cell<Option<MouseButton>>,
-    modifiers: Cell<Modifiers>,
     active: Cell<bool>,
     /// Whether the pointer is over this window, reported by the host's hover
     /// events. Nothing has entered a window before its first one.
@@ -177,7 +176,6 @@ impl WindowShared {
             renderer_window: Cell::new(0),
             pointer_position: Cell::new(point(px(0.0), px(0.0))),
             pressed_button: Cell::new(None),
-            modifiers: Cell::new(Modifiers::default()),
             active: Cell::new(true),
             hovered: Cell::new(false),
             fullscreen: Cell::new(false),
@@ -632,7 +630,8 @@ impl WindowShared {
         self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
             button,
             position,
-            modifiers: self.modifiers.get(),
+            // 修饰键只有一份真相，由按键路径累积，这里读的是同一处。
+            modifiers: super::modifiers(),
             click_count: 1,
             first_mouse: false,
         }));
@@ -644,7 +643,7 @@ impl WindowShared {
         self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
             button,
             position,
-            modifiers: self.modifiers.get(),
+            modifiers: super::modifiers(),
             click_count: 1,
         }));
     }
@@ -654,7 +653,7 @@ impl WindowShared {
         self.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
             position,
             pressed_button: self.pressed_button.get(),
-            modifiers: self.modifiers.get(),
+            modifiers: super::modifiers(),
         }));
     }
 
@@ -663,7 +662,7 @@ impl WindowShared {
         self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
             position,
             delta: ScrollDelta::Pixels(delta),
-            modifiers: self.modifiers.get(),
+            modifiers: super::modifiers(),
             touch_phase: phase,
         }));
     }
@@ -779,7 +778,7 @@ impl PlatformWindow for OhosWindow {
     }
 
     fn modifiers(&self) -> Modifiers {
-        self.shared.modifiers.get()
+        super::modifiers()
     }
 
     fn capslock(&self) -> Capslock {
