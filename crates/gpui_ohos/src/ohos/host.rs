@@ -16,7 +16,6 @@ pub(crate) mod op {
     pub const MAXIMIZE: i32 = 3;
     pub const SET_FULLSCREEN: i32 = 4;
     pub const START_MOVE: i32 = 5;
-    pub const START_RESIZE: i32 = 6;
     pub const SET_DECOR: i32 = 7;
     pub const OPEN_URL: i32 = 8;
     pub const REVEAL_PATH: i32 = 9;

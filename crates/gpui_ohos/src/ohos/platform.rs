@@ -78,6 +78,18 @@ pub(crate) struct WindowRegistry {
     surfaces: Rc<RefCell<Vec<(String, Rc<RefCell<SurfaceState>>)>>>,
 }
 
+/// 宿主在一次选择里最多给出的记录条数，与它的 `maxSelectNumber` 一致。
+const PICK_MAX_RECORDS: usize = 500;
+
+/// 一个还没回来的选择器应答：发送端，加上这次请求向宿主声明的记录上限。
+///
+/// 宿主回显的 token 里只有编号、没有条数，所以上限跟发送端存在一起，
+/// 解析应答时才有一份可以对得上的声明。
+struct PickWaiter {
+    sender: oneshot::Sender<Vec<String>>,
+    max_records: usize,
+}
+
 pub(crate) struct OhosPlatform {
     dispatcher: Arc<OhosDispatcher>,
     background_executor: BackgroundExecutor,
@@ -101,7 +113,7 @@ pub(crate) struct OhosPlatform {
     appearance: Cell<WindowAppearance>,
     /// Raw host picker answers: "f|fd|name|path" for files, "d|path|uri" for
     /// folders, every field escaped by `host::encode_field`.
-    pending_picks: RefCell<HashMap<u64, oneshot::Sender<Vec<String>>>>,
+    pending_picks: RefCell<HashMap<u64, PickWaiter>>,
     next_pick_id: Cell<u64>,
     /// Folder URI the host restored from its persisted authorization.
     restore_folder: RefCell<Option<String>>,
@@ -318,27 +330,37 @@ impl OhosPlatform {
             }
             host::event::PICK_RESULT => {
                 let (token, rest) = arg.split_once('\t').unwrap_or((arg, ""));
-                // The token is "p<id>" for a path pick and "n<id>" for a new
-                // path, and the host echoes it back exactly as it was sent. Only
-                // the digits are wanted, so a token that names nothing lands on
-                // id 0 and finds no waiter instead of panicking on a slice.
-                let id: u64 = token
-                    .trim_start_matches(|character: char| !character.is_ascii_digit())
-                    .parse()
-                    .unwrap_or(0);
-                let waiter = self.pending_picks.borrow_mut().remove(&id);
-                match waiter {
-                    Some(sender) => {
+                let id = match pick_token_id(token) {
+                    Ok(id) => id,
+                    // 按编号 0 去取等待者会领走别人的那一条应答，所以坏 token 到此为止。
+                    Err(error) => {
+                        super::vk::log(&format!("[gpui_ohos] picker answer rejected: {error}"));
+                        return;
+                    }
+                };
+                match self.pending_picks.borrow_mut().remove(&id) {
+                    Some(waiter) => {
                         let lines: Vec<String> = rest
                             .lines()
                             .filter(|line| !line.is_empty())
                             .map(str::to_string)
                             .collect();
+                        // 记录之间只靠换行分隔，字段里的换行由宿主逐字段转义。多出上限
+                        // 的条数只可能来自被改过的应答，多出来的那条指向用户没有点过的文件。
+                        if lines.len() > waiter.max_records {
+                            super::vk::log(&format!(
+                                "[gpui_ohos] picker answer for {token} rejected: {} record(s), \
+                                 the request asked for at most {}",
+                                lines.len(),
+                                waiter.max_records
+                            ));
+                            return;
+                        }
                         super::vk::log(&format!(
                             "[gpui_ohos] picker answer for {token}: {} item(s)",
                             lines.len()
                         ));
-                        if sender.send(lines).is_err() {
+                        if waiter.sender.send(lines).is_err() {
                             super::vk::log(&format!(
                                 "[gpui_ohos] picker answer for {token}: nobody is waiting"
                             ));
@@ -405,8 +427,15 @@ impl OhosPlatform {
         // gone are removed, so a picker still on screen is untouched.
         self.pending_picks
             .borrow_mut()
-            .retain(|_, sender| !sender.is_canceled());
-        self.pending_picks.borrow_mut().insert(id, sender);
+            .retain(|_, waiter| !waiter.sender.is_canceled());
+        self.pending_picks.borrow_mut().insert(
+            id,
+            PickWaiter {
+                sender,
+                // 宿主按 multiple 决定选择器给几个位置，超过它的条数这次请求拿不到。
+                max_records: if multiple { PICK_MAX_RECORDS } else { 1 },
+            },
+        );
         let payload = format!(
             "p{id}|{}|{}|{}",
             files as u8, directories as u8, multiple as u8
@@ -944,6 +973,21 @@ fn split_window_event(arg: &str) -> (&str, &str) {
     }
 }
 
+/// 把选择器应答的 token 还原成编号。
+///
+/// token 是 "p<id>"（路径选择）或 "n<id>"（新建路径），宿主原样回显。别的形状说明
+/// 这条应答不是本次请求发出去的，按编号 0 去取等待者会领走别人的那一条。
+fn pick_token_id(token: &str) -> anyhow::Result<u64> {
+    let digits = token
+        .strip_prefix('p')
+        .or_else(|| token.strip_prefix('n'))
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| anyhow::anyhow!("token \"{token}\" names no picker"))?;
+    digits
+        .parse()
+        .map_err(|error| anyhow::anyhow!("token \"{token}\" names no picker: {error}"))
+}
+
 /// How the host should open the window.
 ///
 /// An editor window is a real top-level window that the taskbar lists and that
@@ -1311,8 +1355,15 @@ impl Platform for OhosPlatform {
         self.next_pick_id.set(id + 1);
         self.pending_picks
             .borrow_mut()
-            .retain(|_, sender| !sender.is_canceled());
-        self.pending_picks.borrow_mut().insert(id, sender);
+            .retain(|_, waiter| !waiter.sender.is_canceled());
+        // 保存对话框占一个位置，这次请求只可能拿到一条记录。
+        self.pending_picks.borrow_mut().insert(
+            id,
+            PickWaiter {
+                sender,
+                max_records: 1,
+            },
+        );
         let payload = format!(
             "n{id}|{}|{}",
             host::encode_field(&directory.display().to_string()),

@@ -21,9 +21,9 @@ use crate::{
     ForegroundExecutor, GpuSpecs, Modifiers, MonochromeSprite, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PrimitiveBatch, PromptButton,
-    PromptLevel, Quad, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, ScrollDelta,
-    ScrollWheelEvent, Size, TouchPhase, Underline, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowControls, WindowParams, point, px,
+    PromptLevel, Quad, RequestFrameOptions, ScaledPixels, Scene, ScrollDelta, ScrollWheelEvent,
+    Size, TouchPhase, Underline, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowParams, point, px,
 };
 
 use super::atlas::{AtlasUpload, OhosAtlas};
@@ -975,20 +975,6 @@ impl PlatformWindow for OhosWindow {
             minimize: true,
             window_menu: false,
         }
-    }
-
-    fn start_window_resize(&self, edge: ResizeEdge) {
-        let value = match edge {
-            ResizeEdge::Top => "top",
-            ResizeEdge::TopRight => "top-right",
-            ResizeEdge::Right => "right",
-            ResizeEdge::BottomRight => "bottom-right",
-            ResizeEdge::Bottom => "bottom",
-            ResizeEdge::BottomLeft => "bottom-left",
-            ResizeEdge::Left => "left",
-            ResizeEdge::TopLeft => "top-left",
-        };
-        host::window_op_for(self.shared.id(), host::op::START_RESIZE, value);
     }
 
     fn request_decorations(&self, decorations: crate::WindowDecorations) {
