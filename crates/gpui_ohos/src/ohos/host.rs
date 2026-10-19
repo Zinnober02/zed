@@ -1,13 +1,20 @@
 //! Bridge to the ArkTS host.
 //!
 //! The host owns the OHOS window manager, file pickers, cursor and lifecycle,
-//! so the backend talks to it through two C function pointers supplied at
-//! startup: a command channel and a synchronous query channel. Host events
-//! (focus, window status, color mode, lifecycle, picker results) arrive back
-//! through \`host_event\`.
+//! so the backend talks to it through the function pointers supplied at startup:
+//! commands, questions, and the answer to a close question. Host events (focus,
+//! window status, color mode, lifecycle, picker results, query answers) arrive
+//! back through \`host_event\`.
 
+use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
-use std::sync::OnceLock;
+use std::sync::{
+    Condvar, Mutex, OnceLock,
+    atomic::{AtomicI32, Ordering},
+};
+use std::time::{Duration, Instant};
+
+use futures::channel::oneshot;
 
 /// Commands the backend sends to the host. Fire-and-forget.
 pub(crate) mod op {
@@ -73,6 +80,11 @@ pub(crate) mod event {
     pub const BENCHMARK: i32 = 8;
     /// The pointer entered or left a window: "<surface id>\t1" or "...\t0".
     pub const HOVER: i32 = 9;
+    /// The host answers a question the backend asked: the argument is
+    /// "<request number>\t<status code>\t<answer>", where the number is the one
+    /// the backend chose and the answer is escaped by `encode_field`'s rules
+    /// because it may hold a newline or a tab of its own.
+    pub const QUERY_ANSWER: i32 = 10;
 }
 
 /// 把字段里的分隔符换成转义序列，分隔符本身只在字段之间起作用。
@@ -127,9 +139,13 @@ pub struct HostOps {
     /// Run a command: returns 0 on success, negative on failure. An empty id means
     /// the command names no window.
     pub window_op: Option<unsafe extern "C" fn(i32, *const c_char, *const c_char) -> i32>,
-    /// Answer a query: returns the byte count written, or negative on failure.
-    pub query:
-        Option<unsafe extern "C" fn(i32, *const c_char, *const c_char, *mut c_char, usize) -> i32>,
+    /// Hand a question to the host and return at once. The host answers exactly
+    /// once through `host_event` with `event::QUERY_ANSWER` and this request
+    /// number; a negative return means the question was not taken and no answer
+    /// will come.
+    pub begin_query: Option<unsafe extern "C" fn(i32, *const c_char, *const c_char, i32) -> i32>,
+    /// The platform's answer to a close question the host asked about a window.
+    pub answer_close: Option<unsafe extern "C" fn(*const c_char, bool)>,
 }
 
 static OPS: OnceLock<HostOps> = OnceLock::new();
@@ -184,45 +200,280 @@ pub(crate) fn request_frame() {
     super::want_tick();
 }
 
-/// Ask the host a question, returning its UTF-8 answer.
+/// Numbers for the questions this side asks.
 ///
-/// The answer is asked for in two steps - size first, then bytes - because the
-/// host truncates at whatever buffer it is handed, and a fixed buffer silently
-/// cut directory listings in half. Asking twice is free: the host caches the
-/// answer so the second step does not repeat the work it did for the first.
-pub(crate) fn query(op: i32, arg: &str) -> anyhow::Result<String> {
+/// The number, and not the position in any queue, is what matches an answer to the
+/// caller still waiting for it: the answer is produced on the host's thread, which
+/// knows nothing about who is waiting.
+fn next_request_number() -> i32 {
+    static NEXT: AtomicI32 = AtomicI32::new(0);
+    loop {
+        let number = NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if number > 0 {
+            return number;
+        }
+    }
+}
+
+/// One answer from the host: the status it gave and the text it produced.
+struct QueryAnswer {
+    code: i32,
+    text: String,
+}
+
+/// One question waiting for its answer, and when it stops being worth waiting for.
+struct PendingQuery {
+    op: i32,
+    sender: oneshot::Sender<QueryAnswer>,
+    deadline: Instant,
+}
+
+/// 还在等回答的调用方，按请求号排列。
+struct QueryWaiters {
+    entries: Mutex<HashMap<i32, PendingQuery>>,
+    /// 唤醒看门狗重算下一次醒来的时刻：有新问题进来，或者有问题被答掉了。
+    changed: Condvar,
+}
+
+impl QueryWaiters {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i32, PendingQuery>> {
+        // 写入者只有本文件，所以锁中毒只可能来自持锁时的 panic。这份表是一张待配对表，
+        // 取回内层值继续用比让此后每个问题都失败更接近事实。
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+static QUERY_WAITERS: OnceLock<QueryWaiters> = OnceLock::new();
+static QUERY_WATCHDOG: OnceLock<()> = OnceLock::new();
+
+/// 多少算"没有人回答"。
+///
+/// 页面那一侧为一个问题只做几个文件系统调用，正常一帧之内就回；能超过这个数说明页面
+/// 根本没有在处理问题。这是兜底，正常路径上它不会醒；没有它，页面卡住的问题会让调用方
+/// 永远等下去，而且连一行日志都不留。
+const QUERY_ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn query_waiters() -> &'static QueryWaiters {
+    let waiters = QUERY_WAITERS.get_or_init(|| QueryWaiters {
+        entries: Mutex::new(HashMap::new()),
+        changed: Condvar::new(),
+    });
+    // 每个进程一个看门狗，第一次提问时启动。它不为单个问题注册定时器：只在最早的
+    // 截止时刻醒一次，被应答唤醒就重算，所以正常路径上它一直睡着。
+    QUERY_WATCHDOG.get_or_init(|| {
+        let spawned = std::thread::Builder::new()
+            .name("gpui-host-queries".to_string())
+            .spawn(move || watch_queries(waiters));
+        if let Err(error) = spawned {
+            super::vk::log(&format!(
+                "[gpui_ohos] no watchdog for unanswered questions: {error}"
+            ));
+        }
+    });
+    waiters
+}
+
+/// 把久到没有回答的问题交还给它自己的调用方，附一个错误。
+fn watch_queries(waiters: &'static QueryWaiters) {
+    loop {
+        let expired = {
+            let mut entries = waiters.lock();
+            loop {
+                // 先把最早的时刻算出来再放掉迭代器：它还借着这张表，而下面两个分支都要
+                // 再次动它。
+                let next = { entries.values().map(|entry| entry.deadline).min() };
+                let Some(next) = next else {
+                    // 没有待答的问题，睡到有人提问。
+                    entries = waiters
+                        .changed
+                        .wait(entries)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    continue;
+                };
+                let now = Instant::now();
+                if next <= now {
+                    break;
+                }
+                let wait = next.saturating_duration_since(now);
+                match waiters.changed.wait_timeout(entries, wait) {
+                    Ok((guard, _)) => entries = guard,
+                    Err(poisoned) => entries = poisoned.into_inner().0,
+                }
+            }
+            let now = Instant::now();
+            let due: Vec<i32> = entries
+                .iter()
+                .filter(|(_, entry)| entry.deadline <= now)
+                .map(|(request, _)| *request)
+                .collect();
+            let mut expired = Vec::with_capacity(due.len());
+            for request in due {
+                if let Some(entry) = entries.remove(&request) {
+                    expired.push((request, entry.op, entry.sender));
+                }
+            }
+            expired
+        };
+        for (request, op, sender) in expired {
+            super::vk::log(&format!(
+                "[gpui_ohos] query {request} (op {op}) has no answer after \
+                 {QUERY_ANSWER_TIMEOUT:?}; releasing its caller with an error"
+            ));
+            if sender
+                .send(QueryAnswer {
+                    code: -7,
+                    text: String::new(),
+                })
+                .is_err()
+            {
+                super::vk::log(&format!(
+                    "[gpui_ohos] query {request} timed out with nobody left waiting"
+                ));
+            }
+        }
+    }
+}
+
+/// Ask the host a question and wait for its answer without holding a thread.
+///
+/// The question goes out with a number this side chose and comes back through
+/// `event::QUERY_ANSWER`, so neither thread waits for the other: the host's page
+/// answers on its own thread, and the caller is woken wherever it happens to be
+/// waiting. A question that cannot be answered still wakes its caller - refused
+/// outright, or left unanswered past `QUERY_ANSWER_TIMEOUT` where the watchdog
+/// releases it with an error and a log line - because waiting for an answer that
+/// will never come is the failure this replaced.
+pub(crate) async fn query(op: i32, arg: &str) -> anyhow::Result<String> {
     let ops = OPS
         .get()
         .ok_or_else(|| anyhow::anyhow!("host ops are not installed"))?;
     let call = ops
-        .query
-        .ok_or_else(|| anyhow::anyhow!("the host does not answer queries"))?;
+        .begin_query
+        .ok_or_else(|| anyhow::anyhow!("the host does not answer questions"))?;
     let id = CString::new("").expect("an empty id has no NUL");
-    let arg = CString::new(arg).map_err(|_| anyhow::anyhow!("query argument contains a NUL"))?;
-    let needed = unsafe { call(op, id.as_ptr(), arg.as_ptr(), std::ptr::null_mut(), 0) };
-    if needed < 0 {
-        anyhow::bail!("host query {op} failed while sizing its answer: {needed}");
-    }
-    let mut buffer = vec![0u8; needed as usize];
-    let written = unsafe {
-        call(
+    let arg_text =
+        CString::new(arg).map_err(|_| anyhow::anyhow!("query argument contains a NUL"))?;
+    let waiters = query_waiters();
+    let request = next_request_number();
+    let (sender, receiver) = oneshot::channel();
+    // Registered before the question leaves: the page may answer it before this
+    // call returns, and that answer has to find its waiter.
+    waiters.lock().insert(
+        request,
+        PendingQuery {
             op,
-            id.as_ptr(),
-            arg.as_ptr(),
-            buffer.as_mut_ptr() as *mut c_char,
-            buffer.len(),
-        )
-    };
-    if written < 0 {
-        anyhow::bail!("host query {op} failed while copying its answer: {written}");
+            sender,
+            deadline: Instant::now() + QUERY_ANSWER_TIMEOUT,
+        },
+    );
+    // 新问题的截止时刻可能更早，看门狗要重算。
+    waiters.changed.notify_all();
+    let status = unsafe { call(op, id.as_ptr(), arg_text.as_ptr(), request) };
+    if status < 0 {
+        // Refused: no answer will come, so the waiter has to go now.
+        let taken = waiters.lock().remove(&request);
+        if taken.is_some() {
+            waiters.changed.notify_all();
+        }
+        match taken {
+            Some(_) => {}
+            None => super::vk::log(&format!(
+                "[gpui_ohos] question {request} was refused after its waiter went away"
+            )),
+        }
+        anyhow::bail!("host query {op} was not taken: {status}");
     }
-    buffer.truncate(written as usize);
-    String::from_utf8(buffer).map_err(|error| {
-        anyhow::anyhow!(
-            "host query {op} answered with invalid UTF-8 at byte {}",
-            error.utf8_error().valid_up_to()
-        )
-    })
+    match receiver.await {
+        Ok(answer) if answer.code == 0 => Ok(answer.text),
+        Ok(answer) if answer.code == -7 => {
+            anyhow::bail!("host query {op} was not answered within {QUERY_ANSWER_TIMEOUT:?}")
+        }
+        Ok(answer) => anyhow::bail!("host query {op} failed with status {}", answer.code),
+        Err(error) => anyhow::bail!("the host never answered query {op}: {error}"),
+    }
+}
+
+/// Hand the host's answer to the caller waiting for it.
+///
+/// The text is escaped at the field boundary like every other field the host
+/// sends: a directory listing holds newlines and a name may hold a tab, and either
+/// one would cut the answer short. An escape this side does not know is an error
+/// handed to the caller; guessing would answer with somebody else's text.
+pub(crate) fn complete_query(payload: &str) {
+    let missing = |what: &str| {
+        super::vk::log(&format!(
+            "[gpui_ohos] query answer {payload:?} has no {what}"
+        ));
+    };
+    let Some((request, rest)) = payload.split_once('\t') else {
+        missing("request number");
+        return;
+    };
+    let Ok(request) = request.parse::<i32>() else {
+        missing("readable request number");
+        return;
+    };
+    let Some((status, encoded)) = rest.split_once('\t') else {
+        missing("status");
+        return;
+    };
+    let Ok(code) = status.parse::<i32>() else {
+        missing("readable status");
+        return;
+    };
+    let answer = match decode_field(encoded) {
+        Ok(text) => QueryAnswer { code, text },
+        Err(error) => {
+            super::vk::log(&format!(
+                "[gpui_ohos] answer to query {request} was damaged in transit: {error}"
+            ));
+            QueryAnswer {
+                code: -11,
+                text: String::new(),
+            }
+        }
+    };
+    let waiters = query_waiters();
+    let taken = waiters.lock().remove(&request);
+    if taken.is_some() {
+        // 这个问题不再需要看门狗：叫醒它去重算下一次醒来的时刻。
+        waiters.changed.notify_all();
+    }
+    match taken {
+        Some(entry) => {
+            if entry.sender.send(answer).is_err() {
+                super::vk::log(&format!(
+                    "[gpui_ohos] answer to query {request} arrived too late"
+                ));
+            }
+        }
+        None => super::vk::log(&format!(
+            "[gpui_ohos] answer to query {request} arrived with nobody waiting"
+        )),
+    }
+}
+
+/// Report the platform's answer to a close question about one window.
+///
+/// The host's close handler already returned, so this settles a promise there
+/// rather than returning a value: the answer is the platform's to give and the
+/// question cannot wait for it.
+pub(crate) fn answer_close(id: &str, allowed: bool) {
+    let Some(ops) = OPS.get() else {
+        super::vk::log("[gpui_ohos] no host ops to answer a close question");
+        return;
+    };
+    let Some(call) = ops.answer_close else {
+        super::vk::log("[gpui_ohos] the host does not take close answers");
+        return;
+    };
+    let Ok(id) = CString::new(id) else {
+        super::vk::log("[gpui_ohos] the window id of a close answer contains a NUL");
+        return;
+    };
+    unsafe { call(id.as_ptr(), allowed) };
 }
 
 const SEEK_SET: i32 = 0;
@@ -266,8 +517,8 @@ pub(crate) fn read_fd_bytes(fd: i32) -> std::io::Result<Vec<u8>> {
 /// The host closes it, because the page holds the `fs.File` that opened it: a
 /// raw `close` here released the number while that object stayed alive, and the
 /// object closed whatever the process had handed the same number to afterwards.
-pub(crate) fn close_fd(fd: i32) -> std::io::Result<()> {
-    status(query::CLOSE_FILE, &fd.to_string())
+pub(crate) async fn close_fd(fd: i32) -> std::io::Result<()> {
+    status(query::CLOSE_FILE, fd.to_string()).await
 }
 
 /// Read a picked public file as UTF-8 text.
@@ -306,13 +557,18 @@ pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
 }
 
 /// Ask the host to open a picked file read/write, returning its descriptor.
-pub(crate) fn open_file(uri: &str) -> Option<i32> {
-    query(query::OPEN_FILE, uri).ok()?.trim().parse().ok()
+pub(crate) async fn open_file(uri: String) -> Option<i32> {
+    query(query::OPEN_FILE, &uri)
+        .await
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Run a command whose answer is "0" on success.
-fn status(op: i32, arg: &str) -> std::io::Result<()> {
-    match query(op, arg) {
+async fn status(op: i32, arg: String) -> std::io::Result<()> {
+    match query(op, &arg).await {
         Ok(answer) if answer.trim() == "0" => Ok(()),
         Ok(answer) => Err(std::io::Error::other(answer.trim().to_string())),
         Err(error) => Err(std::io::Error::other(error.to_string())),
@@ -320,33 +576,38 @@ fn status(op: i32, arg: &str) -> std::io::Result<()> {
 }
 
 /// Create a directory inside a picked root.
-pub(crate) fn create_dir(uri: &str) -> std::io::Result<()> {
-    status(query::CREATE_DIR, uri)
+pub(crate) async fn create_dir(uri: String) -> std::io::Result<()> {
+    status(query::CREATE_DIR, uri).await
 }
 
 /// Remove a file, or a directory when `is_dir` is set, inside a picked root.
-pub(crate) fn remove(uri: &str, is_dir: bool) -> std::io::Result<()> {
+pub(crate) async fn remove(uri: String, is_dir: bool) -> std::io::Result<()> {
     status(
         query::REMOVE,
-        &format!("{}	{}", if is_dir { 1 } else { 0 }, encode_field(uri)),
+        format!("{}\t{}", if is_dir { 1 } else { 0 }, encode_field(&uri)),
     )
+    .await
 }
 
 /// Rename an entry inside a picked root.
-pub(crate) fn rename(from: &str, to: &str) -> std::io::Result<()> {
+pub(crate) async fn rename(from: String, to: String) -> std::io::Result<()> {
     status(
         query::RENAME,
-        &format!("{}	{}", encode_field(from), encode_field(to)),
+        format!("{}\t{}", encode_field(&from), encode_field(&to)),
     )
+    .await
 }
 
 /// The folder the host wants restored, if any.
-pub(crate) fn restore_folder() -> Option<String> {
-    let answer = query(query::RESTORE_FOLDER, "").ok()?;
+///
+/// The error is kept apart from the empty answer: "the host has no folder" and
+/// "the question failed" lead to the same silence, and only one of them is a bug.
+pub(crate) async fn restore_folder() -> anyhow::Result<Option<String>> {
+    let answer = query(query::RESTORE_FOLDER, "").await?;
     if answer.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(answer)
+    Ok(Some(answer))
 }
 
 /// Ask the host to list a picked directory as (name, is_dir, uri).
@@ -354,8 +615,9 @@ pub(crate) fn restore_folder() -> Option<String> {
 /// A failed listing is an error and not an empty one: the caller compares
 /// listings to decide what appeared and what disappeared, so an empty answer
 /// reads as every file in the directory having been deleted.
-pub(crate) fn list_dir(uri: &str) -> std::io::Result<Vec<(String, bool, String)>> {
-    let answer = query(query::LIST_DIR, uri)
+pub(crate) async fn list_dir(uri: String) -> std::io::Result<Vec<(String, bool, String)>> {
+    let answer = query(query::LIST_DIR, &uri)
+        .await
         .map_err(|error| std::io::Error::other(format!("listing {uri} failed: {error}")))?;
     let mut entries = Vec::new();
     for line in answer.lines() {

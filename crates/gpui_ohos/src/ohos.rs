@@ -14,17 +14,15 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     ffi::c_void,
-    future::Future,
     rc::{Rc, Weak},
     sync::{
         Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, Ordering},
-        mpsc,
     },
     time::{Duration, Instant},
 };
 
-use futures::{FutureExt as _, channel::oneshot, future::BoxFuture};
+use futures::future::BoxFuture;
 
 pub use vk::LogFn;
 
@@ -74,51 +72,6 @@ pub fn set_root_dir(path: &str) {
 /// The directory set by set_root_dir, if any.
 pub fn root_dir() -> Option<String> {
     ROOT_DIR.get().cloned()
-}
-
-/// Closures waiting for the ArkUI UI thread, drained from platform::tick.
-///
-/// The host bridge ends up in the JavaScript VM, which may only be entered from
-/// the thread it was created on, so filesystem work running on a background
-/// executor has to be marshalled back here.
-static UI_TASKS: Mutex<std::collections::VecDeque<Box<dyn FnOnce() + Send>>> =
-    Mutex::new(std::collections::VecDeque::new());
-
-/// Run every closure queued by run_on_ui. Called from the UI thread.
-/// Run the tasks the filesystem bridge queued, for at most `budget`.
-///
-/// These tasks call into the host and some of them read whole files, so one of
-/// them can easily outlast a frame; whatever the budget does not cover stays
-/// queued and runs on the next frame instead of holding the display back for
-/// several periods.
-pub(crate) fn drain_ui_tasks(budget: std::time::Duration) {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        if std::time::Instant::now() >= deadline {
-            return;
-        }
-        let task = {
-            let mut tasks = UI_TASKS.lock().unwrap();
-            tasks.pop_front()
-        };
-        match task {
-            Some(task) => task(),
-            None => return,
-        }
-    }
-}
-
-/// Run a closure on the ArkUI UI thread and await its result.
-pub fn run_on_ui<T, F>(f: F) -> impl Future<Output = T> + Send
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let (sender, receiver) = oneshot::channel();
-    UI_TASKS.lock().unwrap().push_back(Box::new(move || {
-        let _ = sender.send(f());
-    }));
-    receiver.map(|result| result.expect("the UI thread dropped a host task"))
 }
 
 fn set_current(platform: &Rc<OhosPlatform>) {
@@ -187,43 +140,53 @@ impl PlatformQueue {
     }
 }
 
-/// How long a caller waits for the platform's thread to answer.
-const PLATFORM_ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Run a job on the platform's thread and wait for its answer. `None` means there
-/// is no platform to run it on, or that the platform did not answer within
-/// `PLATFORM_ANSWER_TIMEOUT`.
+/// The gate the platform's thread holds while it draws a frame.
 ///
-/// The host calls this from the ArkUI thread, which has to keep running the
-/// application's windows. Waiting without an end there meant a platform thread
-/// that stopped serving its queue froze the window with it, and the user's close
-/// request never came back.
-pub(crate) fn on_platform<R: Send + 'static>(
-    job: impl FnOnce(&Rc<OhosPlatform>) -> R + Send + 'static,
-) -> Option<R> {
-    if let Some(platform) = with_current(|platform| platform.clone()) {
-        return Some(job(&platform));
+/// The host destroys a native window as soon as its own call returns, so that
+/// call must not return while a frame is still being presented into the window.
+/// It takes this gate once, which can only mean the frame in flight has finished;
+/// and the platform's thread, which draws only while holding it, then reads the
+/// retired list before drawing, so no frame starts on a window the host has
+/// released.
+///
+/// The wait is bounded by what the platform's thread holds the gate for: one frame
+/// while the application runs, and the whole application start while
+/// `start_platform` is inside it (starting draws too, and a window can be released
+/// as soon as it exists). That span never waits for the ArkUI thread in return -
+/// every host call the platform thread makes is a post - so the ArkUI thread's
+/// wait has an end without either side waiting for the other.
+static PRESENT_GATE: Mutex<()> = Mutex::new(());
+
+/// Windows the host is about to release, waiting for the platform's thread to
+/// apply them inside the frame gate.
+static RETIRED_SURFACES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn present_gate() -> std::sync::MutexGuard<'static, ()> {
+    // 写入者只有本文件；锁中毒只可能来自持锁时的 panic，而它保护的只是一个空值，
+    // 取回内层值继续画帧比让界面停在最后一帧更接近事实。
+    PRESENT_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Note a window the host is releasing, for the platform's thread to apply.
+fn retire_surface(id: &str) {
+    let mut retired = RETIRED_SURFACES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if retired.iter().any(|existing| existing == id) {
+        return;
     }
-    let (sender, receiver) = mpsc::sync_channel(1);
-    platform_queue().push(Box::new(move |platform| {
-        // The caller may have given up waiting; the answer has nowhere to go then,
-        // which is not an error worth reporting.
-        if sender.send(job(platform)).is_err() {
-            return;
-        }
-    }));
-    match receiver.recv_timeout(PLATFORM_ANSWER_TIMEOUT) {
-        Ok(answer) => Some(answer),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // The job stays in the queue, so the platform still performs it once it
-            // serves the queue again; only the answer is lost.
-            vk::log(&format!(
-                "[gpui_ohos] the platform thread did not answer within {PLATFORM_ANSWER_TIMEOUT:?}"
-            ));
-            None
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => None,
-    }
+    retired.push(id.to_string());
+}
+
+/// Take the windows the host has released. Called from the platform's thread
+/// inside the frame gate.
+fn take_retired_surfaces() -> Vec<String> {
+    let mut retired = RETIRED_SURFACES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *retired)
 }
 
 /// Hand a job to the platform's thread without waiting for it.
@@ -330,8 +293,15 @@ where
         .spawn(move || {
             let platform = new_platform();
             platform.set_surface(&id, window.as_ptr(), width, height);
-            boot(&platform);
-            platform.launch();
+            {
+                // Starting the application draws into the surface too, and the host
+                // may release that window as soon as it exists; the frame gate is
+                // what tells the host when it is safe to.
+                let gate = present_gate();
+                boot(&platform);
+                platform.launch();
+                drop(gate);
+            }
             inputmethod::attach();
             platform.request_frames();
             vk::log(&format!(
@@ -530,64 +500,73 @@ pub fn write_picked_file_bytes(fd: i32, data: &[u8]) -> Result<(), String> {
 }
 
 /// Open a picked file read/write and return its descriptor.
+///
+/// Blocks the calling thread until the host answers. Nothing in the tree calls it;
+/// the filesystem bridge uses the asynchronous form below.
 pub fn open_picked_file(uri: &str) -> Option<i32> {
-    host::open_file(uri)
+    futures::executor::block_on(host::open_file(uri.to_string()))
 }
 
-/// List a picked directory, on the UI thread.
+/// List a picked directory. The answer is awaited, never waited for on the host's
+/// side: the question carries a number and the host answers it from its own thread.
 pub fn list_picked_dir_async(
     uri: String,
 ) -> BoxFuture<'static, std::io::Result<Vec<(String, bool, String)>>> {
-    Box::pin(run_on_ui(move || host::list_dir(&uri)))
+    Box::pin(host::list_dir(uri))
 }
 
-/// Open a picked file, on the UI thread.
+/// Open a picked file, with the answer awaited.
 pub fn open_picked_file_async(uri: String) -> BoxFuture<'static, Option<i32>> {
-    Box::pin(run_on_ui(move || host::open_file(&uri)))
+    Box::pin(host::open_file(uri))
 }
 
-/// Release a descriptor opened for a single picked-file operation, on the UI thread.
+/// Release a descriptor opened for a single picked-file operation.
 pub fn close_picked_file_async(fd: i32) -> BoxFuture<'static, std::io::Result<()>> {
-    Box::pin(run_on_ui(move || host::close_fd(fd)))
+    Box::pin(host::close_fd(fd))
 }
 
-/// Read a picked file's bytes, on the UI thread.
+/// Read a picked file's bytes through its descriptor.
+///
+/// The descriptor is the process's, so no thread hop is involved: the read happens
+/// wherever the caller is waiting for it.
 pub fn read_picked_file_bytes_async(fd: i32) -> BoxFuture<'static, std::io::Result<Vec<u8>>> {
-    Box::pin(run_on_ui(move || host::read_fd_bytes(fd)))
+    Box::pin(async move { host::read_fd_bytes(fd) })
 }
 
-/// Overwrite a picked file, on the UI thread.
+/// Overwrite a picked file through its descriptor.
 pub fn write_picked_file_bytes_async(
     fd: i32,
     data: Vec<u8>,
 ) -> BoxFuture<'static, std::io::Result<()>> {
-    Box::pin(run_on_ui(move || host::write_fd_bytes(fd, &data)))
+    Box::pin(async move { host::write_fd_bytes(fd, &data) })
 }
 
-/// Create a directory under a picked root, on the UI thread.
+/// Create a directory under a picked root.
 pub fn create_picked_dir_async(uri: String) -> BoxFuture<'static, std::io::Result<()>> {
-    Box::pin(run_on_ui(move || host::create_dir(&uri)))
+    Box::pin(host::create_dir(uri))
 }
 
-/// Remove a file or directory under a picked root, on the UI thread.
+/// Remove a file or directory under a picked root.
 pub fn remove_picked_path_async(
     uri: String,
     is_dir: bool,
 ) -> BoxFuture<'static, std::io::Result<()>> {
-    Box::pin(run_on_ui(move || host::remove(&uri, is_dir)))
+    Box::pin(host::remove(uri, is_dir))
 }
 
-/// Rename an entry under a picked root, on the UI thread.
+/// Rename an entry under a picked root.
 pub fn rename_picked_path_async(
     from: String,
     to: String,
 ) -> BoxFuture<'static, std::io::Result<()>> {
-    Box::pin(run_on_ui(move || host::rename(&from, &to)))
+    Box::pin(host::rename(from, to))
 }
 
 /// List a picked directory as (name, is_directory, uri).
+///
+/// Blocks the calling thread until the host answers; see `open_picked_file`.
 pub fn list_picked_dir(uri: &str) -> std::io::Result<Vec<(String, bool, String)>> {
-    host::list_dir(uri)
+    futures::executor::block_on(host::list_dir(uri.to_string()))
 }
 
 /// Logical pixels per device pixel used by the backend renderer.
@@ -631,6 +610,12 @@ pub fn set_host_ops(ops: HostOps) {
 
 /// Handle an event pushed from the ArkTS host.
 pub fn host_event(kind: i32, arg: &str) {
+    // 查询的答案按请求号配对，谁在等谁就知道，所以它在这里就交给等待者，
+    // 不必再走平台线程的队列：那个队列可能正被一帧占着，而答案的等待者可能就在等这一帧。
+    if kind == host::event::QUERY_ANSWER {
+        host::complete_query(arg);
+        return;
+    }
     // 焦点离开时最后按下的修饰键不会再等来抬起事件，累积的状态只能在这里复位；
     // 应用侧保留的修饰键状态同样要收一次复位后的事件，否则它也会停在按下。
     if kind == host::event::FOCUS && arg.rsplit('\t').next() == Some("0") {
@@ -643,13 +628,39 @@ pub fn host_event(kind: i32, arg: &str) {
 
 /// Whether the application lets this window close. Asked by the host before it
 /// closes a window on its own.
+///
+/// The answer is not returned here: only the platform's thread may give it, and
+/// this is the host's own close handler asking, on the thread that has to keep
+/// running the windows. Waiting for the platform there was half of a wait that
+/// could only end in a timeout. The question is queued, the answer goes back
+/// through `host::answer_close`, and the return value only says whether that
+/// answer is still to come.
 pub fn should_close_window(id: &str) -> bool {
     let id = id.to_string();
-    // No answer means nothing to ask: there is no platform, or it did not answer
-    // within `PLATFORM_ANSWER_TIMEOUT`. Both allow the close, because the host asked
-    // on behalf of a user who wants the window gone, and refusing leaves a window
-    // that can never be closed.
-    on_platform(move |platform| platform.should_close_window(&id)).unwrap_or(true)
+    if let Some(platform) = with_current(|platform| platform.clone()) {
+        // Already on the platform's thread: nothing to wait for, so the answer goes
+        // back with this call.
+        let allowed = platform.should_close_window(&id);
+        host::answer_close(&id, allowed);
+        return true;
+    }
+    if !PLATFORM_STARTED.load(Ordering::SeqCst) {
+        // No platform means no application state to save: the window may go.
+        vk::log(&format!(
+            "[gpui_ohos] close question for {id}: no platform, the window may close"
+        ));
+        host::answer_close(&id, true);
+        return true;
+    }
+    vk::log(&format!("[gpui_ohos] close question for {id} queued"));
+    post(move |platform| {
+        let allowed = platform.should_close_window(&id);
+        vk::log(&format!(
+            "[gpui_ohos] close answer for {id}: {allowed} (deferred by the host)"
+        ));
+        host::answer_close(&id, allowed);
+    });
+    false
 }
 
 /// An additional XComponent surface was created for another window.
@@ -683,26 +694,47 @@ pub fn surface_resized(id: &str, width: u32, height: u32) {
 /// XComponent surface destroyed.
 /// The host is about to destroy a native window.
 ///
-/// Waiting for the platform thread is the handshake that makes that safe: that
-/// thread is the only one rendering into the window, and the host tears the window
-/// down as soon as this returns. Answering without waiting would let a frame be
-/// presented into a window that no longer exists.
+/// The platform's thread is the only one rendering into that window, so the frame
+/// it may be drawing has to finish before the host tears the window down, which it
+/// does as soon as this returns. The window is noted for retirement first, and
+/// then the frame gate is taken once: getting it means no frame is in flight, and
+/// the platform's thread, which draws only while holding it, reads the retirement
+/// list before drawing, so it never starts a frame on a window the host has
+/// released. The wait is the frame in flight, or the rest of the application start
+/// while `start_platform` holds the gate; it is never a queue round-trip, and the
+/// platform's thread never waits for this one inside that span.
 pub fn surface_destroyed(id: &str) {
-    let id = id.to_string();
-    // A timeout has no value to fall back on: this call answers with nothing, and
-    // the close is the host's to make. The job stays queued and removes the surface
-    // whenever the platform serves its queue again, so only the handshake above is
-    // lost, and the host tears the window down with the platform thread possibly
-    // still pointing at it. That risk is smaller than holding the ArkUI thread for
-    // as long as the platform thread stays stuck.
-    on_platform(move |platform| {
-        vk::log(&format!("[gpui_ohos] surface_destroyed id={id}"));
-        platform.surface_destroyed(&id);
-    });
+    let id_text = id.to_string();
+    // 平台线程自己报的销毁：它不在帧里（帧循环里没有销毁窗口的入口），直接应用。
+    if with_current(|platform| {
+        vk::log(&format!(
+            "[gpui_ohos] surface_destroyed on the platform thread: {id_text}"
+        ));
+        platform.surface_destroyed(&id_text);
+    })
+    .is_some()
+    {
+        return;
+    }
+    retire_surface(&id_text);
+    {
+        let gate = present_gate();
+        drop(gate);
+    }
+    vk::log(&format!(
+        "[gpui_ohos] surface retired {id_text}: no frame is in flight, the host may release it"
+    ));
 }
+
 /// One frame's work: the input method's queued commands and cursor context, then
 /// the frame itself.
 fn tick_platform(platform: &Rc<OhosPlatform>) {
+    // 帧必须在这把锁里画完：宿主正拿着它去释放已经退役的窗口。拿到锁的第一件事是应用
+    // 退役表，这样接下来这一帧不会画到一个宿主已经释放的窗口上。
+    let gate = present_gate();
+    for id in take_retired_surfaces() {
+        platform.surface_destroyed(&id);
+    }
     for command in inputmethod::drain() {
         platform.handle_ime(command);
     }
@@ -713,6 +745,7 @@ fn tick_platform(platform: &Rc<OhosPlatform>) {
     // request made while another window was focused is replayed here once it does.
     inputmethod::apply(platform.focused_surface().as_deref());
     platform.tick();
+    drop(gate);
 }
 
 /// The application wants the process to end. Recorded rather than sent: the host

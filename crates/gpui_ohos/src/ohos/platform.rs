@@ -379,6 +379,45 @@ impl OhosPlatform {
         self.restore_folder.borrow_mut().take()
     }
 
+    /// Ask the host for the folder it restored, without waiting for the answer.
+    ///
+    /// The answer is produced on the host's thread, and the delivery wants the
+    /// platform's own, so the question is awaited on a background task and handed
+    /// back here. Waiting where the question is asked would block the frame loop
+    /// for as long as the host's thread takes, which is what made this the one
+    /// place the platform waited for the host.
+    fn ask_restore_folder(&self) {
+        let executor = self.background_executor.clone();
+        executor
+            .spawn(async move {
+                let answer = match host::restore_folder().await {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        // 一次没有答案的询问会让恢复目录这件事悄悄消失，所以失败要留下记录。
+                        super::vk::log(&format!(
+                            "[gpui_ohos] asking the host for the restored folder failed: {error}"
+                        ));
+                        None
+                    }
+                };
+                super::post(move |platform| platform.note_restore_folder(answer));
+            })
+            .detach();
+    }
+
+    /// Take the folder the host answered the pull with.
+    pub(crate) fn note_restore_folder(&self, answer: Option<String>) {
+        match answer {
+            Some(uri) => *self.restore_folder.borrow_mut() = Some(uri),
+            None => {
+                // 宿主那边没有可恢复的目录，或者这次询问没有得到回答；两种都不再问第二次。
+                super::vk::log("[gpui_ohos] the host named no folder to restore");
+                return;
+            }
+        }
+        self.deliver_restore_folder();
+    }
+
     /// Hand the previous session's folder to the open listener once it exists.
     ///
     /// The host answers with the folder's sandbox path, and
@@ -394,11 +433,9 @@ impl OhosPlatform {
             }
             None if !self.restore_pulled.replace(true) => {
                 // The host may have pushed the folder before the backend was
-                // ready to receive events, so ask for it once.
-                match host::restore_folder() {
-                    Some(uri) => uri,
-                    None => return,
-                }
+                // ready to receive events, so ask for it once - and answer later.
+                self.ask_restore_folder();
+                return;
             }
             None => return,
         };
@@ -675,10 +712,6 @@ impl OhosPlatform {
     /// One host frame: drain host tasks and foreground tasks, fire due timers,
     /// then draw.
     pub(crate) fn tick(&self) {
-        // Filesystem work hops here to reach the host bridge, which may only be
-        // called from this thread. The budget keeps one slow read from costing
-        // several frames.
-        super::drain_ui_tasks(std::time::Duration::from_millis(2));
         // A resize waited for this moment: it blocks on the GPU.
         self.apply_pending_surface_size();
         // Asking for the previous folder while the app is still creating its
