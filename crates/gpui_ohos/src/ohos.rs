@@ -30,8 +30,8 @@ pub use host::HostOps;
 
 pub use inputmethod::{
     commit_text as ime_commit_text, delete_backward as ime_delete_backward,
-    delete_forward as ime_delete_forward, finish_preview as ime_finish_preview, hide as ime_hide,
-    preview_text as ime_preview_text, show as ime_show,
+    delete_forward as ime_delete_forward, finish_preview as ime_finish_preview,
+    preview_text as ime_preview_text,
 };
 
 /// Log a line through the host-provided hilog sink.
@@ -479,34 +479,6 @@ where
     })
 }
 
-/// Read a file the user picked, through the descriptor the host opened.
-pub fn read_picked_file(fd: i32) -> Result<String, String> {
-    host::read_fd(fd).map_err(|error| error.to_string())
-}
-
-/// Read a picked file's raw bytes.
-pub fn read_picked_file_bytes(fd: i32) -> Result<Vec<u8>, String> {
-    host::read_fd_bytes(fd).map_err(|error| error.to_string())
-}
-
-/// Overwrite a file the user picked, through its descriptor.
-pub fn write_picked_file(fd: i32, data: &str) -> Result<(), String> {
-    host::write_fd(fd, data).map_err(|error| error.to_string())
-}
-
-/// Overwrite a picked file with raw bytes.
-pub fn write_picked_file_bytes(fd: i32, data: &[u8]) -> Result<(), String> {
-    host::write_fd_bytes(fd, data).map_err(|error| error.to_string())
-}
-
-/// Open a picked file read/write and return its descriptor.
-///
-/// Blocks the calling thread until the host answers. Nothing in the tree calls it;
-/// the filesystem bridge uses the asynchronous form below.
-pub fn open_picked_file(uri: &str) -> Option<i32> {
-    futures::executor::block_on(host::open_file(uri.to_string()))
-}
-
 /// List a picked directory. The answer is awaited, never waited for on the host's
 /// side: the question carries a number and the host answers it from its own thread.
 pub fn list_picked_dir_async(
@@ -562,45 +534,14 @@ pub fn rename_picked_path_async(
     Box::pin(host::rename(from, to))
 }
 
-/// List a picked directory as (name, is_directory, uri).
-///
-/// Blocks the calling thread until the host answers; see `open_picked_file`.
-pub fn list_picked_dir(uri: &str) -> std::io::Result<Vec<(String, bool, String)>> {
-    futures::executor::block_on(host::list_dir(uri.to_string()))
-}
-
 /// Logical pixels per device pixel used by the backend renderer.
 pub fn scale() -> f32 {
     window::SCALE
 }
 
-/// Read the system clipboard. Needs ohos.permission.READ_PASTEBOARD.
-pub fn read_clipboard() -> Option<String> {
-    clipboard::read_text()
-}
-
-/// Write plain text to the system clipboard. No permission required.
-pub fn write_clipboard(text: &str) -> bool {
-    clipboard::write_text(text)
-}
-
 /// Take the folder URI the host restored from persisted authorization.
 pub fn take_restore_folder() -> Option<String> {
     with_current(|platform| platform.take_restore_folder()).flatten()
-}
-
-/// Pick files/folders and return the host's raw answer lines
-/// ("f|fd|name" for files, "d|uri" for folders).
-pub fn pick_items(
-    files: bool,
-    directories: bool,
-    multiple: bool,
-) -> futures::channel::oneshot::Receiver<Vec<String>> {
-    with_current(|platform| platform.pick_raw(files, directories, multiple)).unwrap_or_else(|| {
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        let _ = sender.send(Vec::new());
-        receiver
-    })
 }
 
 /// Install the host function pointers supplied by the ArkTS layer.

@@ -31,7 +31,6 @@ pub(crate) mod op {
     pub const PICK_PATHS: i32 = 12;
     pub const PICK_NEW_PATH: i32 = 13;
     pub const REQUEST_FOCUS: i32 = 15;
-    /// Ask the host to draw a frame now rather than at the next refresh.
     /// Create another OHOS window with an XComponent named by the argument.
     pub const CREATE_WINDOW: i32 = 16;
     /// Which way round the theme is: the host draws the window buttons for it.
@@ -146,6 +145,12 @@ pub struct HostOps {
     pub begin_query: Option<unsafe extern "C" fn(i32, *const c_char, *const c_char, i32) -> i32>,
     /// The platform's answer to a close question the host asked about a window.
     pub answer_close: Option<unsafe extern "C" fn(*const c_char, bool)>,
+    /// Give up on a question by its request number.
+    ///
+    /// The host keeps what it still owes an answer for; a question the watchdog
+    /// has already released would otherwise stay recorded there for the life of
+    /// the process, and the caller is not coming back for the answer.
+    pub forget_query: Option<unsafe extern "C" fn(i32)>,
 }
 
 static OPS: OnceLock<HostOps> = OnceLock::new();
@@ -332,6 +337,8 @@ fn watch_queries(waiters: &'static QueryWaiters) {
                     "[gpui_ohos] query {request} timed out with nobody left waiting"
                 ));
             }
+            // 宿主还记着这个号；告诉它不必再等答案，否则那条记录留到进程结束。
+            forget_query(request);
         }
     }
 }
@@ -460,6 +467,18 @@ pub(crate) fn complete_query(payload: &str) {
 /// The host's close handler already returned, so this settles a promise there
 /// rather than returning a value: the answer is the platform's to give and the
 /// question cannot wait for it.
+/// 告诉宿主某个问题不必再等答案。
+fn forget_query(request: i32) {
+    let Some(ops) = OPS.get() else {
+        return;
+    };
+    let Some(forget) = ops.forget_query else {
+        return;
+    };
+    // SAFETY: the host installed this pointer and it stays valid for the process.
+    unsafe { forget(request) };
+}
+
 pub(crate) fn answer_close(id: &str, allowed: bool) {
     let Some(ops) = OPS.get() else {
         super::vk::log("[gpui_ohos] no host ops to answer a close question");
