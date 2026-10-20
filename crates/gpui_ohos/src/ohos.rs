@@ -559,9 +559,14 @@ pub fn host_event(kind: i32, arg: &str) {
     }
     // 焦点离开时最后按下的修饰键不会再等来抬起事件，累积的状态只能在这里复位；
     // 应用侧保留的修饰键状态同样要收一次复位后的事件，否则它也会停在按下。
-    if kind == host::event::FOCUS && arg.splitn(2, '\t').nth(1) == Some("0") {
-        forget_modifiers();
-        post(|platform| platform.dispatch_modifiers("", crate::Modifiers::default()));
+    // 解析失败不在这里报：焦点事件会交给平台线程的 handle_host_event，它记那一行。
+    if kind == host::event::FOCUS {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(arg) {
+            if value["focused"].as_bool() == Some(false) {
+                forget_modifiers();
+                post(|platform| platform.dispatch_modifiers("", crate::Modifiers::default()));
+            }
+        }
     }
     let arg = arg.to_string();
     post(move |platform| platform.handle_host_event(kind, &arg));

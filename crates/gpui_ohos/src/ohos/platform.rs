@@ -88,12 +88,22 @@ const PICK_MAX_RECORDS: usize = 500;
 /// 也不会一直留着这一条。
 const PICK_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// 选择器答复里的一条记录。
+///
+/// 元素是 {"kind": "file", "fd": 数字, "name": 字符串, "path": 字符串} 或
+/// {"kind": "dir", "path": 字符串, "uri": 字符串}：按种类只出现相关字段，
+/// 名字、路径、URI 都是 JSON 字符串，不再有逐字段转义与竖线分隔。
+enum PickedItem {
+    File { fd: Option<i32>, path: String },
+    Dir { path: String },
+}
+
 /// 一个还没回来的选择器应答：发送端、这次请求向宿主声明的记录上限，以及放弃期限。
 ///
 /// 宿主回显的 token 里只有编号、没有条数，所以上限跟发送端存在一起，
 /// 解析应答时才有一份可以对得上的声明。
 struct PickWaiter {
-    sender: oneshot::Sender<Vec<String>>,
+    sender: oneshot::Sender<Vec<PickedItem>>,
     max_records: usize,
     deadline: std::time::Instant,
 }
@@ -119,8 +129,7 @@ pub(crate) struct OhosPlatform {
     on_reopen: RefCell<Option<Box<dyn FnMut()>>>,
     on_system_wake: RefCell<Option<Box<dyn FnMut()>>>,
     appearance: Cell<WindowAppearance>,
-    /// Raw host picker answers: "f|fd|name|path" for files, "d|path|uri" for
-    /// folders, every field escaped by `host::encode_field`.
+    /// Picker answers still on their way, by the number their token carries.
     pending_picks: RefCell<HashMap<u64, PickWaiter>>,
     next_pick_id: Cell<u64>,
     /// Folder URI the host restored from its persisted authorization.
@@ -227,6 +236,11 @@ impl OhosPlatform {
     pub(crate) fn focused_surface(&self) -> Option<String> {
         self.registry.focused_surface.borrow().clone()
     }
+    /// 宿主推上来的事件。
+    ///
+    /// 带记录的事件（焦点、悬停、窗口状态、窗口矩形、pick 应答、恢复目录）载荷是一份
+    /// JSON 文档，字段在这里逐个取，取不到就留一行日志；外观、生命周期、基准这三类只
+    /// 带一个固定的词，保持裸字符串——它们没有字段，也就没有可错位的地方。
     pub(crate) fn handle_host_event(&self, kind: i32, arg: &str) {
         super::vk::log(&format!("[gpui_ohos] host event {kind}: {arg}"));
         match kind {
@@ -248,30 +262,54 @@ impl OhosPlatform {
                 // of updating the window, and activating it there re-enters the
                 // same update ("RefCell already borrowed"). Queue it for the frame
                 // loop instead, which runs outside any update.
-                let (id, value) = split_window_event(arg);
-                self.note_focus(id, value != "0");
-                *self.pending_focus.borrow_mut() = Some((id.to_string(), value != "0"));
+                let Some((id, value)) = window_event(arg, "focus") else {
+                    return;
+                };
+                let Some(focused) = value["focused"].as_bool() else {
+                    super::vk::log(&format!(
+                        "[gpui_ohos] focus event has no focused flag: {arg}"
+                    ));
+                    return;
+                };
+                self.note_focus(&id, focused);
+                *self.pending_focus.borrow_mut() = Some((id, focused));
             }
             host::event::HOVER => {
-                let (id, value) = split_window_event(arg);
-                self.pending_hover
-                    .borrow_mut()
-                    .push((id.to_string(), value != "0"));
+                let Some((id, value)) = window_event(arg, "hover") else {
+                    return;
+                };
+                let Some(hovered) = value["hovered"].as_bool() else {
+                    super::vk::log(&format!(
+                        "[gpui_ohos] hover event has no hovered flag: {arg}"
+                    ));
+                    return;
+                };
+                self.pending_hover.borrow_mut().push((id, hovered));
             }
             host::event::WINDOW_STATUS => {
                 // 1 full screen, 2 maximize, 3 minimize, 4 floating, 5 split.
                 // On 2in1 the system reports MAXIMIZE for a screen-filling
                 // window, which is what GPUI's titlebar treats as fullscreen.
-                let (id, value) = split_window_event(arg);
-                let fullscreen = value == "1" || value == "2";
-                for window in self.route_targets(id) {
+                let Some((id, value)) = window_event(arg, "window status") else {
+                    return;
+                };
+                let Some(status) = value["status"].as_u64() else {
+                    super::vk::log(&format!(
+                        "[gpui_ohos] window status event has no status: {arg}"
+                    ));
+                    return;
+                };
+                let fullscreen = status == 1 || status == 2;
+                for window in self.route_targets(&id) {
                     window.set_fullscreen(fullscreen);
                 }
             }
             host::event::WINDOW_RECT => {
-                let (id, value) = split_window_event(arg);
-                if let Some(rect) = parse_rect(value) {
-                    self.window_rect.borrow_mut().insert(id.to_string(), rect);
+                let Some((id, value)) = window_event(arg, "window rectangle") else {
+                    return;
+                };
+                if let Some(rect) = parse_rect(&value) {
+                    self.window_rect.borrow_mut().insert(id.clone(), rect);
                     // The same size change also arrives as a window rectangle, and
                     // this used to be remembered only for the caret's origin. The
                     // surface was never told, so a maximized window kept rendering
@@ -284,14 +322,14 @@ impl OhosPlatform {
                             .surfaces
                             .borrow()
                             .iter()
-                            .find(|(existing, _)| existing == id)
+                            .find(|(existing, _)| existing == &id)
                             .map(|(_, surface)| {
                                 let state = surface.borrow();
                                 (state.width, state.height)
                             });
                         let wanted = (width as u32, height as u32);
                         if current != Some(wanted) {
-                            self.surface_resized(id, wanted.0, wanted.1);
+                            self.surface_resized(&id, wanted.0, wanted.1);
                         }
                     }
                 }
@@ -331,14 +369,31 @@ impl OhosPlatform {
                 _ => {}
             },
             host::event::RESTORE_FOLDER => {
-                if !arg.is_empty() {
-                    *self.restore_folder.borrow_mut() = Some(arg.to_string());
+                let value: serde_json::Value = match serde_json::from_str(arg) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        super::vk::log(&format!(
+                            "[gpui_ohos] restored folder event is not JSON: {error} in {arg}"
+                        ));
+                        return;
+                    }
+                };
+                let Some(uri) = value["uri"].as_str() else {
+                    super::vk::log(&format!(
+                        "[gpui_ohos] restored folder event has no uri: {arg}"
+                    ));
+                    return;
+                };
+                if !uri.is_empty() {
+                    *self.restore_folder.borrow_mut() = Some(uri.to_string());
                     self.deliver_restore_folder();
                 }
             }
             host::event::PICK_RESULT => {
-                let (token, rest) = arg.split_once('\t').unwrap_or((arg, ""));
-                let id = match pick_token_id(token) {
+                let Some((token, items)) = parse_picks(arg) else {
+                    return;
+                };
+                let id = match pick_token_id(&token) {
                     Ok(id) => id,
                     // 按编号 0 去取等待者会领走别人的那一条应答，所以坏 token 到此为止。
                     Err(error) => {
@@ -348,27 +403,22 @@ impl OhosPlatform {
                 };
                 match self.pending_picks.borrow_mut().remove(&id) {
                     Some(waiter) => {
-                        let lines: Vec<String> = rest
-                            .lines()
-                            .filter(|line| !line.is_empty())
-                            .map(str::to_string)
-                            .collect();
-                        // 记录之间只靠换行分隔，字段里的换行由宿主逐字段转义。多出上限
-                        // 的条数只可能来自被改过的应答，多出来的那条指向用户没有点过的文件。
-                        if lines.len() > waiter.max_records {
+                        // 多出上限的条数只可能来自被改过的应答，多出来的那条指向用户没有
+                        // 点过的文件。
+                        if items.len() > waiter.max_records {
                             super::vk::log(&format!(
                                 "[gpui_ohos] picker answer for {token} rejected: {} record(s), \
                                  the request asked for at most {}",
-                                lines.len(),
+                                items.len(),
                                 waiter.max_records
                             ));
                             return;
                         }
                         super::vk::log(&format!(
                             "[gpui_ohos] picker answer for {token}: {} item(s)",
-                            lines.len()
+                            items.len()
                         ));
-                        if waiter.sender.send(lines).is_err() {
+                        if waiter.sender.send(items).is_err() {
                             super::vk::log(&format!(
                                 "[gpui_ohos] picker answer for {token}: nobody is waiting"
                             ));
@@ -454,15 +504,16 @@ impl OhosPlatform {
         }
     }
 
-    /// Pick files/folders, returning the host's raw answer lines
-    /// ("f|fd|name|path" for files, "d|path|uri" for folders, every field
-    /// escaped by `host::encode_field`).
+    /// Pick files/folders, returning the records the host answered with.
+    ///
+    /// 请求的载荷是 JSON：{"token": "p12", "files": bool, "directories": bool,
+    /// "multiple": bool}。宿主把 token 原样放回它自己的答复里。
     pub(crate) fn pick_raw(
         &self,
         files: bool,
         directories: bool,
         multiple: bool,
-    ) -> oneshot::Receiver<Vec<String>> {
+    ) -> oneshot::Receiver<Vec<PickedItem>> {
         let (sender, receiver) = oneshot::channel();
         let id = self.next_pick_id.get();
         self.next_pick_id.set(id + 1);
@@ -482,10 +533,13 @@ impl OhosPlatform {
                 deadline: std::time::Instant::now() + PICK_ANSWER_TIMEOUT,
             },
         );
-        let payload = format!(
-            "p{id}|{}|{}|{}",
-            files as u8, directories as u8, multiple as u8
-        );
+        let payload = serde_json::json!({
+            "token": format!("p{id}"),
+            "files": files,
+            "directories": directories,
+            "multiple": multiple,
+        })
+        .to_string();
         host::window_op(host::op::PICK_PATHS, &payload);
         receiver
     }
@@ -1032,14 +1086,6 @@ impl OhosPlatform {
     }
 }
 
-/// Split a per-window host event into its surface id and payload.
-fn split_window_event(arg: &str) -> (&str, &str) {
-    match arg.split_once('\t') {
-        Some((id, value)) => (id, value),
-        None => ("", arg),
-    }
-}
-
 /// 把选择器应答的 token 还原成编号。
 ///
 /// token 是 "p<id>"（路径选择）或 "n<id>"（新建路径），宿主原样回显。别的形状说明
@@ -1080,11 +1126,12 @@ fn window_kind_name(kind: &WindowKind) -> &'static str {
     }
 }
 
-/// Payload for CREATE_WINDOW: "<id>\t<left>,<top>,<width>,<height>\t<kind>".
+/// Payload for CREATE_WINDOW:
+/// {"id": string, "left": n, "top": n, "width": n, "height": n, "kind": string}.
 ///
 /// 标题走已有的 SET_TITLE（新窗口的页面登记回调之后，应用自己会把标题交给 op 1），
-/// 能不能调整大小是窗口自己的属性。这两样都不在这条请求里，所以它不再有自由文本，
-/// 也就不需要任何转义。
+/// 能不能调整大小是窗口自己的属性；两样都不在这条请求里。整条换成 JSON 之后，页面
+/// 那一侧不再需要按制表符切字段。
 fn create_window_payload(
     id: &str,
     params: &WindowParams,
@@ -1103,7 +1150,15 @@ fn create_window_payload(
         (width, height)
     };
     let kind = window_kind_name(&params.kind);
-    format!("{id}\t{left},{top},{width},{height}\t{kind}")
+    serde_json::json!({
+        "id": id,
+        "left": left,
+        "top": top,
+        "width": width,
+        "height": height,
+        "kind": kind,
+    })
+    .to_string()
 }
 
 /// Map a GPUI cursor style to the OHOS PointerStyle enum member name.
@@ -1133,53 +1188,138 @@ fn cursor_style_name(style: CursorStyle) -> &'static str {
     }
 }
 
-/// Encode a raw picker answer as the handle GPUI passes around: "f|fd|name|path"
-/// becomes "fd:<fd>" and "d|path|uri" becomes the plain sandbox path, because a
-/// project opened from a tagged handle would otherwise show that tag as its
-/// location in the UI.
+/// 一个窗口事件：{"id": string, ...}。解析失败留下一行日志并返回 None。
 ///
-/// 各字段按本文件的字段编码还原，所以名字或路径里有竖线、制表符、换行时，
-/// 它仍然是同一个字段。还原失败按错误返回：这条应答已经被改过，拿它的一半
-/// 去打开文件就是打开用户没有点过的文件。
-fn picked_handle(line: &str) -> anyhow::Result<PathBuf> {
-    let mut parts = line.split('|');
-    match parts.next().unwrap_or_default() {
-        "f" => {
-            let fd = parts.next().unwrap_or_default();
-            // 名字不参与寻址，还原它是为了让改过的应答在这里就报错。
-            if let Some(name) = parts.next() {
-                host::decode_field(name)?;
-            }
-            // The host sends the sandbox path after the name, because a path of the
-            // form "fd:8" is relative as far as the editor is concerned and it
-            // refuses to trust a project containing one.
-            if let Some(path) = parts.next() {
-                let path = host::decode_field(path)?;
-                if path.starts_with('/') {
-                    return Ok(PathBuf::from(path));
-                }
-            }
-            if !fd.is_empty() {
-                return Ok(PathBuf::from(format!("fd:{fd}")));
-            }
-            Ok(PathBuf::from(host::decode_field(line)?))
+/// 界面上的表现是"窗口没反应"，所以每类失败都要有自己的那一行。
+fn window_event(arg: &str, what: &str) -> Option<(String, serde_json::Value)> {
+    let value: serde_json::Value = match serde_json::from_str(arg) {
+        Ok(value) => value,
+        Err(error) => {
+            super::vk::log(&format!(
+                "[gpui_ohos] {what} event is not JSON: {error} in {arg}"
+            ));
+            return None;
         }
-        "d" => match parts.next() {
-            Some(path) => Ok(PathBuf::from(host::decode_field(path)?)),
-            None => Ok(PathBuf::new()),
-        },
-        _ => Ok(PathBuf::from(host::decode_field(line)?)),
+    };
+    let Some(id) = value["id"].as_str() else {
+        super::vk::log(&format!("[gpui_ohos] {what} event has no surface id: {arg}"));
+        return None;
+    };
+    Some((id.to_string(), value))
+}
+
+/// 选择器答复：{"token": "p12", "items": [...]}，元素的形状见 `PickedItem`。
+fn parse_picks(arg: &str) -> Option<(String, Vec<PickedItem>)> {
+    let value: serde_json::Value = match serde_json::from_str(arg) {
+        Ok(value) => value,
+        Err(error) => {
+            super::vk::log(&format!(
+                "[gpui_ohos] picker answer is not JSON: {error} in {arg}"
+            ));
+            return None;
+        }
+    };
+    let Some(token) = value["token"].as_str() else {
+        super::vk::log(&format!("[gpui_ohos] picker answer has no token: {arg}"));
+        return None;
+    };
+    let Some(array) = value["items"].as_array() else {
+        super::vk::log(&format!("[gpui_ohos] picker answer has no items: {arg}"));
+        return None;
+    };
+    let mut items = Vec::with_capacity(array.len());
+    for item in array {
+        let kind = item["kind"].as_str().unwrap_or_default();
+        match kind {
+            "file" => {
+                let fd = match item["fd"].as_i64() {
+                    Some(fd) => match i32::try_from(fd) {
+                        Ok(fd) => Some(fd),
+                        Err(_) => {
+                            super::vk::log(&format!(
+                                "[gpui_ohos] picker answer has a file whose descriptor does not fit: {item}"
+                            ));
+                            return None;
+                        }
+                    },
+                    None => None,
+                };
+                // 名字不参与寻址，要求它存在是为了让改过的应答在这里就报错。
+                if item["name"].as_str().is_none() {
+                    super::vk::log(&format!(
+                        "[gpui_ohos] picker answer has a file without a name: {item}"
+                    ));
+                    return None;
+                }
+                let Some(path) = item["path"].as_str() else {
+                    super::vk::log(&format!(
+                        "[gpui_ohos] picker answer has a file without a path: {item}"
+                    ));
+                    return None;
+                };
+                items.push(PickedItem::File {
+                    fd,
+                    path: path.to_string(),
+                });
+            }
+            "dir" => {
+                let Some(path) = item["path"].as_str() else {
+                    super::vk::log(&format!(
+                        "[gpui_ohos] picker answer has a folder without a path: {item}"
+                    ));
+                    return None;
+                };
+                // URI 只是为了让改过的应答在这里报错，真正用它的人在上面的页面里。
+                if item["uri"].as_str().is_none() {
+                    super::vk::log(&format!(
+                        "[gpui_ohos] picker answer has a folder without a uri: {item}"
+                    ));
+                    return None;
+                }
+                items.push(PickedItem::Dir {
+                    path: path.to_string(),
+                });
+            }
+            other => {
+                super::vk::log(&format!(
+                    "[gpui_ohos] picker answer has an item of unknown kind {other:?}: {item}"
+                ));
+                return None;
+            }
+        }
+    }
+    Some((token.to_string(), items))
+}
+
+/// Turn one picker record into the handle GPUI passes around.
+///
+/// 一个绝对路径原样给出；否则退回 "fd:<fd>"，因为编辑器把不带前缀的相对路径当作
+/// 相对位置，遇到 "fd:8" 这样的值会拒绝信任整个工程。缺字段就是应答被改过，按错误
+/// 返回：拿它的一半去打开文件就是打开用户没有点过的文件。
+fn picked_handle(item: &PickedItem) -> anyhow::Result<PathBuf> {
+    match item {
+        PickedItem::File { fd, path } => {
+            if path.starts_with('/') {
+                return Ok(PathBuf::from(path));
+            }
+            match fd {
+                Some(fd) => Ok(PathBuf::from(format!("fd:{fd}"))),
+                None => anyhow::bail!("a picked file has neither a path nor a descriptor"),
+            }
+        }
+        PickedItem::Dir { path } => Ok(PathBuf::from(path)),
     }
 }
 
-/// Parse a host rect string of the form "x,y,w,h" (physical pixels).
-fn parse_rect(value: &str) -> Option<(f32, f32, f32, f32)> {
-    let mut parts = value.split(',');
-    let x = parts.next()?.trim().parse().ok()?;
-    let y = parts.next()?.trim().parse().ok()?;
-    let width = parts.next()?.trim().parse().ok()?;
-    let height = parts.next()?.trim().parse().ok()?;
-    Some((x, y, width, height))
+/// 窗口矩形事件里的四个数（设备像素）。
+fn parse_rect(value: &serde_json::Value) -> Option<(f32, f32, f32, f32)> {
+    let number = |name: &str| value[name].as_f64().map(|number| number as f32);
+    Some((
+        number("left")?,
+        number("top")?,
+        number("width")?,
+        number("height")?,
+    ))
 }
 
 impl Platform for OhosPlatform {
@@ -1386,9 +1526,9 @@ impl Platform for OhosPlatform {
         self.foreground_executor
             .spawn(async move {
                 let answer = match raw.await {
-                    Ok(lines) => lines
+                    Ok(items) => items
                         .iter()
-                        .map(|line| picked_handle(line))
+                        .map(picked_handle)
                         .collect::<anyhow::Result<Vec<PathBuf>>>()
                         .map(|paths| if paths.is_empty() { None } else { Some(paths) }),
                     Err(_) => Ok(None),
@@ -1425,17 +1565,19 @@ impl Platform for OhosPlatform {
                 deadline: std::time::Instant::now() + PICK_ANSWER_TIMEOUT,
             },
         );
-        let payload = format!(
-            "n{id}|{}|{}",
-            host::encode_field(&directory.display().to_string()),
-            host::encode_field(suggested_name.unwrap_or(""))
-        );
+        // 请求的载荷是 JSON：{"token": "n7", "directory": 路径, "suggested_name": 名字}。
+        let payload = serde_json::json!({
+            "token": format!("n{id}"),
+            "directory": directory.display().to_string(),
+            "suggested_name": suggested_name.unwrap_or(""),
+        })
+        .to_string();
         host::window_op(host::op::PICK_NEW_PATH, &payload);
         let (tx, rx) = oneshot::channel();
         self.foreground_executor
             .spawn(async move {
                 let answer = match raw.await {
-                    Ok(lines) => lines.first().map(|line| picked_handle(line)).transpose(),
+                    Ok(items) => items.first().map(picked_handle).transpose(),
                     Err(_) => Ok(None),
                 };
                 if let Err(error) = &answer {

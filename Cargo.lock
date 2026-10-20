@@ -7806,6 +7806,7 @@ dependencies = [
  "naga",
  "parking_lot",
  "raw-window-handle",
+ "serde_json",
  "smallvec",
  "uuid",
 ]

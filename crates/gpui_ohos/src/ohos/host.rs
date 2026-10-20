@@ -44,12 +44,11 @@ pub(crate) mod op {
     pub const SET_BACKGROUND: i32 = 21;
 }
 
-/// Synchronous queries. The host writes a UTF-8 answer into the buffer.
+/// 问宿主的那些问题。答案是一份 JSON 文档，形状按 op 写在 `query` 上方。
 pub(crate) mod query {
     /// Open a picked file read/write and return its descriptor.
     pub const OPEN_FILE: i32 = 105;
-    /// List a picked directory: "name|isDir|uri" per line, name and uri escaped
-    /// by `encode_field`.
+    /// List a picked directory: [{"name": string, "is_dir": bool, "uri": string}].
     pub const LIST_DIR: i32 = 106;
     /// The folder to restore, if the host has one. Pulled instead of pushed so
     /// the backend cannot miss it by starting a moment late.
@@ -80,57 +79,13 @@ pub(crate) mod event {
     /// The pointer entered or left a window: "<surface id>\t1" or "...\t0".
     pub const HOVER: i32 = 9;
     /// The host answers a question the backend asked: the argument is
-    /// "<request number>\t<status code>\t<JSON string>", where the number is the
-    /// one the backend chose and the third field is a complete JSON string literal
-    /// (see `napi_init.cpp`'s json_answer.h: its rules are the only ones on this
-    /// channel). A JSON string cannot hold a raw tab, which is what lets the two
-    /// numbers be split off at the first two tabs.
+    /// "<request number>\t<status code>\t<JSON document>", where the number is the
+    /// one the backend chose and the third field is the whole answer as JSON --
+    /// a number, a boolean, a string, an array or an object, per the table above
+    /// `query`. It is not wrapped in a JSON string: the document is the payload.
+    /// JSON escapes tabs inside strings, so splitting the first two fields at
+    /// their tabs stays safe.
     pub const QUERY_ANSWER: i32 = 10;
-}
-
-/// 把字段里的分隔符换成转义序列，分隔符本身只在字段之间起作用。
-///
-/// 标题、路径和目录项名字里都可能出现竖线与制表符，旧协议把它们当成了字段
-/// 边界：标题含制表符时整条建窗请求的字段全部错位，路径含竖线时会打开另一个
-/// 真实文件，目录项名字含竖线时这个文件是目录还是文件会被判反。
-/// 调用方只对单个字段调用它，不要对拼好的整条应答调用。
-pub(crate) fn encode_field(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '%' => encoded.push_str("%25"),
-            '|' => encoded.push_str("%7C"),
-            '\t' => encoded.push_str("%09"),
-            '\n' => encoded.push_str("%0A"),
-            other => encoded.push(other),
-        }
-    }
-    encoded
-}
-
-/// 把字段还原成原来的文本。
-///
-/// 认不出的转义按错误上报，不猜也不截断：应答在传输中被改过的时候，任何猜测
-/// 都等于让后续操作作用在用户没有点过的文件上。
-pub(crate) fn decode_field(value: &str) -> anyhow::Result<String> {
-    let mut decoded = String::with_capacity(value.len());
-    let mut characters = value.chars();
-    while let Some(character) = characters.next() {
-        if character != '%' {
-            decoded.push(character);
-            continue;
-        }
-        let code: String = characters.by_ref().take(2).collect();
-        let replacement = match code.as_str() {
-            "25" => '%',
-            "7C" => '|',
-            "09" => '\t',
-            "0A" => '\n',
-            other => anyhow::bail!("undeclared escape %{other} in field {value:?}"),
-        };
-        decoded.push(replacement);
-    }
-    Ok(decoded)
 }
 
 /// Function pointers implemented by the ArkTS host.
@@ -354,7 +309,17 @@ fn watch_queries(waiters: &'static QueryWaiters) {
 /// outright, or left unanswered past `QUERY_ANSWER_TIMEOUT` where the watchdog
 /// releases it with an error and a log line - because waiting for an answer that
 /// will never come is the failure this replaced.
-pub(crate) async fn query(op: i32, arg: &str) -> anyhow::Result<String> {
+/// 每个问题回答什么形状（宿主用 JSON.stringify 产生，这里按 op 取用）：
+///
+///   OPEN_FILE (105)        数字：picker 打开文件拿到的描述符；打不开是 null
+///   LIST_DIR (106)         数组：[{"name": string, "is_dir": bool, "uri": string}]
+///   RESTORE_FOLDER (107)   字符串：上次的目录 URI；没有是 null
+///   CREATE_DIR (109) / REMOVE (110) / RENAME (111) / CLOSE_FILE (112)
+///                          true 表示成功，其它值是错误文本
+///   窗口矩形/状态/配色/id (100-103)  后端已不再提问，页面仍按 JSON 回答
+///
+/// 这份表与 pages/Index.ets 的 QUERY_* 分支一一对应，改一边就要改另一边。
+pub(crate) async fn query(op: i32, arg: &str) -> anyhow::Result<serde_json::Value> {
     let ops = OPS
         .get()
         .ok_or_else(|| anyhow::anyhow!("host ops are not installed"))?;
@@ -395,7 +360,7 @@ pub(crate) async fn query(op: i32, arg: &str) -> anyhow::Result<String> {
         anyhow::bail!("host query {op} was not taken: {status}");
     }
     match receiver.await {
-        Ok(answer) if answer.code == 0 => Ok(answer.text),
+        Ok(answer) if answer.code == 0 => parse_answer(op, &answer.text),
         Ok(answer) if answer.code == -7 => {
             anyhow::bail!("host query {op} was not answered within {QUERY_ANSWER_TIMEOUT:?}")
         }
@@ -404,10 +369,25 @@ pub(crate) async fn query(op: i32, arg: &str) -> anyhow::Result<String> {
     }
 }
 
-/// 把应答拆成三段：请求号、状态码、答案的 JSON 文本。
+/// 把应答文本按 JSON 解析。
 ///
-/// 只切前两刀：第三段是完整的 JSON 字符串字面量，里面不会出现裸制表符（0x09 必须
-/// 写成 \u0009），所以第三段原样交给 JSON 解析器，制表符、换行、引号都由它还原。
+/// 调用方只拿得到"是个错误"，所以"宿主到底回了什么形状"只能靠这一行日志。
+fn parse_answer(op: i32, text: &str) -> anyhow::Result<serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            super::vk::log(&format!(
+                "[gpui_ohos] answer to query {op} is not JSON: {error} in {text:?}"
+            ));
+            anyhow::bail!("host query {op} answered with something that is not JSON: {error}")
+        }
+    }
+}
+
+/// 把应答拆成三段：请求号、状态码、答案的 JSON 文档。
+///
+/// 只切前两刀：第三段是整份 JSON 文档（数字、布尔、字符串、数组或对象），JSON 里的
+/// 制表符只能写成 \u0009，所以第三段本身不含裸制表符。
 fn answer_fields(payload: &str) -> anyhow::Result<(i32, i32, &str)> {
     let mut fields = payload.splitn(3, '\t');
     let request = fields.next().unwrap_or_default();
@@ -426,19 +406,11 @@ fn answer_fields(payload: &str) -> anyhow::Result<(i32, i32, &str)> {
     Ok((request, code, answer))
 }
 
-/// 解析答案本身：一个 JSON 字符串字面量。
-///
-/// 解析不了就是解析不了：退回一段猜出来的文本等于把别人的答案交给调用方。
-fn answer_text(field: &str) -> anyhow::Result<String> {
-    serde_json::from_str(field)
-        .map_err(|error| anyhow::anyhow!("answer {field:?} is not a JSON string: {error}"))
-}
-
 /// Hand the host's answer to the caller waiting for it.
 ///
-/// 约定只有一处：宿主回送的是 "<请求号>\t<状态码>\t<JSON 字符串>"，请求号与状态码
-/// 是十进制，第三段的编码规则见 json_answer.h（C++ 侧唯一的编码处）。拆不开或者
-/// JSON 坏掉的应答都会以错误交给等待者，绝不猜内容。
+/// 约定只有一处：宿主回送的是 "<请求号>\t<状态码>\t<JSON 文档>"，请求号与状态码是
+/// 十进制，第三段就是答案本身（见 json_answer.h）。形状按 JSON 解析留给等待者那一侧
+/// ——它知道 op，能把失败写进带 op 的日志里。
 pub(crate) fn complete_query(payload: &str) {
     let (request, code, encoded) = match answer_fields(payload) {
         Ok(fields) => fields,
@@ -451,17 +423,9 @@ pub(crate) fn complete_query(payload: &str) {
             return;
         }
     };
-    let answer = match answer_text(encoded) {
-        Ok(text) => QueryAnswer { code, text },
-        Err(error) => {
-            super::vk::log(&format!(
-                "[gpui_ohos] answer to query {request} was damaged in transit: {error}"
-            ));
-            QueryAnswer {
-                code: -11,
-                text: String::new(),
-            }
-        }
+    let answer = QueryAnswer {
+        code,
+        text: encoded.to_string(),
     };
     let waiters = query_waiters();
     let taken = waiters.lock().remove(&request);
@@ -597,20 +561,50 @@ pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
 }
 
 /// Ask the host to open a picked file read/write, returning its descriptor.
+///
+/// 宿主回一个 JSON 数字（打不开时是 null）。不是数字就是应答坏了：留下日志，并按
+/// "打不开"交还调用方 —— 那本来就是这条询问的失败形态。
 pub(crate) async fn open_file(uri: String) -> Option<i32> {
-    query(query::OPEN_FILE, &uri)
-        .await
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    let value = match query(query::OPEN_FILE, &uri).await {
+        Ok(value) => value,
+        Err(error) => {
+            super::vk::log(&format!(
+                "[gpui_ohos] opening picked file {uri} failed: {error}"
+            ));
+            return None;
+        }
+    };
+    if value.is_null() {
+        return None;
+    }
+    match value.as_i64().and_then(|fd| i32::try_from(fd).ok()) {
+        Some(fd) => Some(fd),
+        None => {
+            super::vk::log(&format!(
+                "[gpui_ohos] answer to query {} is not a descriptor: {value}",
+                query::OPEN_FILE
+            ));
+            None
+        }
+    }
 }
 
-/// Run a command whose answer is "0" on success.
+/// 一个改动作业的结果：true 是成功，其它值是宿主给的错误文本。
 async fn status(op: i32, arg: String) -> std::io::Result<()> {
     match query(op, &arg).await {
-        Ok(answer) if answer.trim() == "0" => Ok(()),
-        Ok(answer) => Err(std::io::Error::other(answer.trim().to_string())),
+        Ok(serde_json::Value::Bool(true)) => Ok(()),
+        Ok(value) => {
+            let text = match value.as_str() {
+                Some(text) => text.to_string(),
+                None => value.to_string(),
+            };
+            // 作业失败与应答坏了在这里长得一样，都只表现为"没反应"；留下 op 与原文，
+            // 两种都能查到。
+            super::vk::log(&format!(
+                "[gpui_ohos] query {op} did not succeed: {text}"
+            ));
+            Err(std::io::Error::other(text))
+        }
         Err(error) => Err(std::io::Error::other(error.to_string())),
     }
 }
@@ -621,33 +615,43 @@ pub(crate) async fn create_dir(uri: String) -> std::io::Result<()> {
 }
 
 /// Remove a file, or a directory when `is_dir` is set, inside a picked root.
+///
+/// 请求的载荷是 JSON：{"is_dir": bool, "uri": string}。路径里的制表符、竖线与换行
+/// 都不再需要转义，宿主按 JSON 取字段。
 pub(crate) async fn remove(uri: String, is_dir: bool) -> std::io::Result<()> {
-    status(
-        query::REMOVE,
-        format!("{}\t{}", if is_dir { 1 } else { 0 }, encode_field(&uri)),
-    )
-    .await
+    let payload = serde_json::json!({ "is_dir": is_dir, "uri": uri }).to_string();
+    status(query::REMOVE, payload).await
 }
 
 /// Rename an entry inside a picked root.
+///
+/// 请求的载荷是 JSON：{"from": string, "to": string}。
 pub(crate) async fn rename(from: String, to: String) -> std::io::Result<()> {
-    status(
-        query::RENAME,
-        format!("{}\t{}", encode_field(&from), encode_field(&to)),
-    )
-    .await
+    let payload = serde_json::json!({ "from": from, "to": to }).to_string();
+    status(query::RENAME, payload).await
 }
 
 /// The folder the host wants restored, if any.
 ///
-/// The error is kept apart from the empty answer: "the host has no folder" and
-/// "the question failed" lead to the same silence, and only one of them is a bug.
+/// 宿主回一个 JSON 字符串（没有就是 null）。空串与 null 都算"没有目录"；别的形状是
+/// 应答坏了，上报成错误，不再当成"没有"。
 pub(crate) async fn restore_folder() -> anyhow::Result<Option<String>> {
-    let answer = query(query::RESTORE_FOLDER, "").await?;
-    if answer.is_empty() {
+    let value = query(query::RESTORE_FOLDER, "").await?;
+    if value.is_null() {
         return Ok(None);
     }
-    Ok(Some(answer))
+    match value.as_str() {
+        Some("") => Ok(None),
+        Some(uri) => Ok(Some(uri.to_string())),
+        None => {
+            let message = format!(
+                "host query {} answered with something that is not a directory: {value}",
+                query::RESTORE_FOLDER
+            );
+            super::vk::log(&format!("[gpui_ohos] {message}"));
+            Err(anyhow::anyhow!(message))
+        }
+    }
 }
 
 /// Ask the host to list a picked directory as (name, is_dir, uri).
@@ -656,46 +660,57 @@ pub(crate) async fn restore_folder() -> anyhow::Result<Option<String>> {
 /// listings to decide what appeared and what disappeared, so an empty answer
 /// reads as every file in the directory having been deleted.
 pub(crate) async fn list_dir(uri: String) -> std::io::Result<Vec<(String, bool, String)>> {
-    let answer = query(query::LIST_DIR, &uri)
+    let value = query(query::LIST_DIR, &uri)
         .await
         .map_err(|error| std::io::Error::other(format!("listing {uri} failed: {error}")))?;
-    let mut entries = Vec::new();
-    for line in answer.lines() {
-        // A line the host could not have produced means the answer is damaged, and
-        // guessing which entry it was meant to be would act on the wrong file.
-        let mut parts = line.splitn(3, '|');
-        let (Some(name), Some(is_dir), Some(child_uri)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            return Err(std::io::Error::other(format!(
-                "malformed listing line for {uri}: {line}"
-            )));
-        };
-        let name = decode_field(name).map_err(|error| {
-            std::io::Error::other(format!("listing {uri} has a damaged name: {error}"))
+    parse_listing(&uri, &value).map_err(|error| {
+        super::vk::log(&format!(
+            "[gpui_ohos] answer to query {} is not a listing of {uri}: {error}",
+            query::LIST_DIR
+        ));
+        error
+    })
+}
+
+/// 列目录的应答：一个 JSON 数组，每项是 {"name": string, "is_dir": bool, "uri": string}。
+///
+/// 单独一个函数是为了能脱离宿主测：一项坏掉就整份上报，不跳过、不猜名字。
+fn parse_listing(
+    uri: &str,
+    value: &serde_json::Value,
+) -> std::io::Result<Vec<(String, bool, String)>> {
+    let Some(array) = value.as_array() else {
+        return Err(std::io::Error::other(format!(
+            "listing {uri} is not a JSON array: {value}"
+        )));
+    };
+    let mut entries = Vec::with_capacity(array.len());
+    for entry in array {
+        let name = entry["name"].as_str().ok_or_else(|| {
+            std::io::Error::other(format!("listing {uri} has an entry without a name: {entry}"))
         })?;
-        let child_uri = decode_field(child_uri).map_err(|error| {
-            std::io::Error::other(format!("listing {uri} has a damaged path: {error}"))
+        let is_dir = entry["is_dir"].as_bool().ok_or_else(|| {
+            std::io::Error::other(format!("listing {uri} has an entry without is_dir: {entry}"))
         })?;
-        entries.push((name, is_dir == "1", child_uri));
+        let child_uri = entry["uri"].as_str().ok_or_else(|| {
+            std::io::Error::other(format!("listing {uri} has an entry without a uri: {entry}"))
+        })?;
+        entries.push((name.to_string(), is_dir, child_uri.to_string()));
     }
     Ok(entries)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{answer_fields, answer_text};
+    use super::{answer_fields, parse_answer, parse_listing};
 
     #[test]
     fn answer_fields_splits_at_the_first_two_tabs() {
+        assert_eq!(answer_fields("7\t0\t{}").expect("一个完整的空对象"), (7, 0, "{}"));
+        // 第三段是整份 JSON 文档：里面的空格、逗号、方括号都原样留着。
         assert_eq!(
-            answer_fields("7\t0\t\"\"").expect("一个完整的空应答"),
-            (7, 0, "\"\"")
-        );
-        // 第三段里的制表符是 JSON 的 \u0009，不是裸制表符：只切前两刀。
-        assert_eq!(
-            answer_fields("9\t-2\t\"a\\u0009b\"").expect("第三段带转义的应答"),
-            (9, -2, "\"a\\u0009b\"")
+            answer_fields("9\t-2\t{\"a\": [1, 2]}").expect("第三段带结构的应答"),
+            (9, -2, "{\"a\": [1, 2]}")
         );
     }
 
@@ -703,27 +718,68 @@ mod tests {
     fn answer_fields_refuses_a_payload_with_missing_fields() {
         assert!(answer_fields("7").is_err(), "没有状态码与答案");
         assert!(answer_fields("7\t0").is_err(), "没有答案");
-        assert!(answer_fields("seven\t0\t\"\"").is_err(), "请求号不是数字");
-        assert!(answer_fields("7\tzero\t\"\"").is_err(), "状态码不是数字");
+        assert!(answer_fields("seven\t0\t{}").is_err(), "请求号不是数字");
+        assert!(answer_fields("7\tzero\t{}").is_err(), "状态码不是数字");
     }
 
     #[test]
-    fn answer_text_decodes_what_the_host_encodes() {
-        assert_eq!(answer_text("\"\"").expect("空串"), "");
-        assert_eq!(answer_text("\"a\\\"b\"").expect("引号"), "a\"b");
-        assert_eq!(answer_text("\"a\\\\b\"").expect("反斜杠"), "a\\b");
-        assert_eq!(answer_text("\"a\\u0009b\"").expect("制表符"), "a\tb");
-        assert_eq!(answer_text("\"a\\u000Ab\"").expect("换行"), "a\nb");
-        assert_eq!(answer_text("\"a\\u0001b\"").expect("控制字符"), "a\u{1}b");
-        assert_eq!(answer_text("\"中文\"").expect("非 ASCII"), "中文");
+    fn parse_answer_reads_the_document() {
+        assert_eq!(parse_answer(105, "42").expect("数字"), serde_json::json!(42));
+        assert_eq!(parse_answer(109, "true").expect("布尔"), serde_json::json!(true));
+        assert_eq!(parse_answer(106, "[]").expect("空数组"), serde_json::json!([]));
+        assert_eq!(
+            parse_answer(107, "null").expect("空值"),
+            serde_json::Value::Null
+        );
+        assert!(parse_answer(105, "").is_err(), "空应答");
+        assert!(parse_answer(105, "not json").is_err(), "不是 JSON");
     }
 
     #[test]
-    fn answer_text_refuses_what_is_not_a_json_string() {
-        assert!(answer_text("").is_err(), "空应答");
-        assert!(answer_text("plain text").is_err(), "不是 JSON");
-        assert!(answer_text("\"unterminated").is_err(), "引号没有闭合");
-        assert!(answer_text("123").is_err(), "数字不是字符串");
+    fn parse_listing_reads_entries() {
+        let value = serde_json::json!([
+            {"name": "a|b", "is_dir": true, "uri": "dir:x/a|b"},
+            {"name": "line\nbreak", "is_dir": false, "uri": "dir:x/line\nbreak"}
+        ]);
+        let entries = parse_listing("dir:x", &value).expect("一份完整的列目录应答");
+        assert_eq!(
+            entries,
+            vec![
+                ("a|b".to_string(), true, "dir:x/a|b".to_string()),
+                ("line\nbreak".to_string(), false, "dir:x/line\nbreak".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_listing_refuses_a_damaged_entry() {
+        assert!(
+            parse_listing("dir:x", &serde_json::json!("not an array")).is_err(),
+            "不是数组"
+        );
+        assert!(
+            parse_listing("dir:x", &serde_json::json!([{"is_dir": true, "uri": "u"}])).is_err(),
+            "缺 name"
+        );
+        assert!(
+            parse_listing("dir:x", &serde_json::json!([{"name": "a", "uri": "u"}])).is_err(),
+            "缺 is_dir"
+        );
+        assert!(
+            parse_listing(
+                "dir:x",
+                &serde_json::json!([{"name": "a", "is_dir": true}])
+            )
+            .is_err(),
+            "缺 uri"
+        );
+        assert!(
+            parse_listing(
+                "dir:x",
+                &serde_json::json!([{"name": "a", "is_dir": "yes", "uri": "u"}])
+            )
+            .is_err(),
+            "is_dir 不是布尔"
+        );
     }
 }
-
