@@ -20,7 +20,9 @@ use crate::{
 
 use super::dispatcher::OhosDispatcher;
 use super::display::OhosDisplay;
+use super::fields;
 use super::host;
+use super::json_object;
 use super::keyboard::{OhosKeyboardLayout, OhosKeyboardMapper};
 use super::text_system::OhosTextSystem;
 use super::window::{OhosWindow, WindowShared, benchmark_enabled};
@@ -93,7 +95,7 @@ const PICK_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 元素是 {"kind": "file", "fd": 数字, "name": 字符串, "path": 字符串} 或
 /// {"kind": "dir", "path": 字符串, "uri": 字符串}：按种类只出现相关字段，
 /// 名字、路径、URI 都是 JSON 字符串，不再有逐字段转义与竖线分隔。
-enum PickedItem {
+pub(crate) enum PickedItem {
     File { fd: Option<i32>, path: String },
     Dir { path: String },
 }
@@ -265,7 +267,7 @@ impl OhosPlatform {
                 let Some((id, value)) = window_event(arg, "focus") else {
                     return;
                 };
-                let Some(focused) = value["focused"].as_bool() else {
+                let Some(focused) = value[fields::FOCUSED].as_bool() else {
                     super::vk::log(&format!(
                         "[gpui_ohos] focus event has no focused flag: {arg}"
                     ));
@@ -278,7 +280,7 @@ impl OhosPlatform {
                 let Some((id, value)) = window_event(arg, "hover") else {
                     return;
                 };
-                let Some(hovered) = value["hovered"].as_bool() else {
+                let Some(hovered) = value[fields::HOVERED].as_bool() else {
                     super::vk::log(&format!(
                         "[gpui_ohos] hover event has no hovered flag: {arg}"
                     ));
@@ -293,7 +295,7 @@ impl OhosPlatform {
                 let Some((id, value)) = window_event(arg, "window status") else {
                     return;
                 };
-                let Some(status) = value["status"].as_u64() else {
+                let Some(status) = value[fields::STATUS].as_u64() else {
                     super::vk::log(&format!(
                         "[gpui_ohos] window status event has no status: {arg}"
                     ));
@@ -378,7 +380,7 @@ impl OhosPlatform {
                         return;
                     }
                 };
-                let Some(uri) = value["uri"].as_str() else {
+                let Some(uri) = value[fields::URI].as_str() else {
                     super::vk::log(&format!(
                         "[gpui_ohos] restored folder event has no uri: {arg}"
                     ));
@@ -533,13 +535,12 @@ impl OhosPlatform {
                 deadline: std::time::Instant::now() + PICK_ANSWER_TIMEOUT,
             },
         );
-        let payload = serde_json::json!({
-            "token": format!("p{id}"),
-            "files": files,
-            "directories": directories,
-            "multiple": multiple,
-        })
-        .to_string();
+        let payload = json_object(vec![
+            (fields::TOKEN, serde_json::Value::String(format!("p{id}"))),
+            (fields::FILES, serde_json::Value::Bool(files)),
+            (fields::DIRECTORIES, serde_json::Value::Bool(directories)),
+            (fields::MULTIPLE, serde_json::Value::Bool(multiple)),
+        ]);
         host::window_op(host::op::PICK_PATHS, &payload);
         receiver
     }
@@ -1150,15 +1151,14 @@ fn create_window_payload(
         (width, height)
     };
     let kind = window_kind_name(&params.kind);
-    serde_json::json!({
-        "id": id,
-        "left": left,
-        "top": top,
-        "width": width,
-        "height": height,
-        "kind": kind,
-    })
-    .to_string()
+    json_object(vec![
+        (fields::ID, serde_json::Value::String(id.to_string())),
+        (fields::LEFT, serde_json::Value::Number(left.into())),
+        (fields::TOP, serde_json::Value::Number(top.into())),
+        (fields::WIDTH, serde_json::Value::Number(width.into())),
+        (fields::HEIGHT, serde_json::Value::Number(height.into())),
+        (fields::KIND, serde_json::Value::String(kind.to_string())),
+    ])
 }
 
 /// Map a GPUI cursor style to the OHOS PointerStyle enum member name.
@@ -1201,7 +1201,7 @@ fn window_event(arg: &str, what: &str) -> Option<(String, serde_json::Value)> {
             return None;
         }
     };
-    let Some(id) = value["id"].as_str() else {
+    let Some(id) = value[fields::ID].as_str() else {
         super::vk::log(&format!(
             "[gpui_ohos] {what} event has no surface id: {arg}"
         ));
@@ -1221,20 +1221,20 @@ fn parse_picks(arg: &str) -> Option<(String, Vec<PickedItem>)> {
             return None;
         }
     };
-    let Some(token) = value["token"].as_str() else {
+    let Some(token) = value[fields::TOKEN].as_str() else {
         super::vk::log(&format!("[gpui_ohos] picker answer has no token: {arg}"));
         return None;
     };
-    let Some(array) = value["items"].as_array() else {
+    let Some(array) = value[fields::ITEMS].as_array() else {
         super::vk::log(&format!("[gpui_ohos] picker answer has no items: {arg}"));
         return None;
     };
     let mut items = Vec::with_capacity(array.len());
     for item in array {
-        let kind = item["kind"].as_str().unwrap_or_default();
+        let kind = item[fields::KIND].as_str().unwrap_or_default();
         match kind {
             "file" => {
-                let fd = match item["fd"].as_i64() {
+                let fd = match item[fields::FD].as_i64() {
                     Some(fd) => match i32::try_from(fd) {
                         Ok(fd) => Some(fd),
                         Err(_) => {
@@ -1247,13 +1247,13 @@ fn parse_picks(arg: &str) -> Option<(String, Vec<PickedItem>)> {
                     None => None,
                 };
                 // 名字不参与寻址，要求它存在是为了让改过的应答在这里就报错。
-                if item["name"].as_str().is_none() {
+                if item[fields::NAME].as_str().is_none() {
                     super::vk::log(&format!(
                         "[gpui_ohos] picker answer has a file without a name: {item}"
                     ));
                     return None;
                 }
-                let Some(path) = item["path"].as_str() else {
+                let Some(path) = item[fields::PATH].as_str() else {
                     super::vk::log(&format!(
                         "[gpui_ohos] picker answer has a file without a path: {item}"
                     ));
@@ -1265,14 +1265,14 @@ fn parse_picks(arg: &str) -> Option<(String, Vec<PickedItem>)> {
                 });
             }
             "dir" => {
-                let Some(path) = item["path"].as_str() else {
+                let Some(path) = item[fields::PATH].as_str() else {
                     super::vk::log(&format!(
                         "[gpui_ohos] picker answer has a folder without a path: {item}"
                     ));
                     return None;
                 };
                 // URI 只是为了让改过的应答在这里报错，真正用它的人在上面的页面里。
-                if item["uri"].as_str().is_none() {
+                if item[fields::URI].as_str().is_none() {
                     super::vk::log(&format!(
                         "[gpui_ohos] picker answer has a folder without a uri: {item}"
                     ));
@@ -1317,10 +1317,10 @@ fn picked_handle(item: &PickedItem) -> anyhow::Result<PathBuf> {
 fn parse_rect(value: &serde_json::Value) -> Option<(f32, f32, f32, f32)> {
     let number = |name: &str| value[name].as_f64().map(|number| number as f32);
     Some((
-        number("left")?,
-        number("top")?,
-        number("width")?,
-        number("height")?,
+        number(fields::LEFT)?,
+        number(fields::TOP)?,
+        number(fields::WIDTH)?,
+        number(fields::HEIGHT)?,
     ))
 }
 
@@ -1567,13 +1567,18 @@ impl Platform for OhosPlatform {
                 deadline: std::time::Instant::now() + PICK_ANSWER_TIMEOUT,
             },
         );
-        // 请求的载荷是 JSON：{"token": "n7", "directory": 路径, "suggested_name": 名字}。
-        let payload = serde_json::json!({
-            "token": format!("n{id}"),
-            "directory": directory.display().to_string(),
-            "suggested_name": suggested_name.unwrap_or(""),
-        })
-        .to_string();
+        // 请求的载荷是 JSON，字段名见 schema（pick_new_path 的请求）。
+        let payload = json_object(vec![
+            (fields::TOKEN, serde_json::Value::String(format!("n{id}"))),
+            (
+                fields::DIRECTORY,
+                serde_json::Value::String(directory.display().to_string()),
+            ),
+            (
+                fields::SUGGESTED_NAME,
+                serde_json::Value::String(suggested_name.unwrap_or("").to_string()),
+            ),
+        ]);
         host::window_op(host::op::PICK_NEW_PATH, &payload);
         let (tx, rx) = oneshot::channel();
         self.foreground_executor

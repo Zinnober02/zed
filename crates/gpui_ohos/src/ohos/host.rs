@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
+
+use super::fields;
 use std::sync::{
     Condvar, Mutex, OnceLock,
     atomic::{AtomicI32, Ordering},
@@ -525,13 +527,6 @@ pub(crate) async fn close_fd(fd: i32) -> std::io::Result<()> {
     status(query::CLOSE_FILE, fd.to_string()).await
 }
 
-/// Read a picked public file as UTF-8 text.
-pub(crate) fn read_fd(fd: i32) -> std::io::Result<String> {
-    let bytes = read_fd_bytes(fd)?;
-    String::from_utf8(bytes)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-}
-
 /// Replace a picked public file's contents through its descriptor.
 pub(crate) fn write_fd_bytes(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
     unsafe {
@@ -553,11 +548,6 @@ pub(crate) fn write_fd_bytes(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
         written += count as usize;
     }
     Ok(())
-}
-
-/// Replace a picked public file's contents with UTF-8 text.
-pub(crate) fn write_fd(fd: i32, data: &str) -> std::io::Result<()> {
-    write_fd_bytes(fd, data.as_bytes())
 }
 
 /// Ask the host to open a picked file read/write, returning its descriptor.
@@ -617,7 +607,10 @@ pub(crate) async fn create_dir(uri: String) -> std::io::Result<()> {
 /// 请求的载荷是 JSON：{"is_dir": bool, "uri": string}。路径里的制表符、竖线与换行
 /// 都不再需要转义，宿主按 JSON 取字段。
 pub(crate) async fn remove(uri: String, is_dir: bool) -> std::io::Result<()> {
-    let payload = serde_json::json!({ "is_dir": is_dir, "uri": uri }).to_string();
+    let payload = super::json_object(vec![
+        (fields::IS_DIR, serde_json::Value::Bool(is_dir)),
+        (fields::URI, serde_json::Value::String(uri)),
+    ]);
     status(query::REMOVE, payload).await
 }
 
@@ -625,7 +618,10 @@ pub(crate) async fn remove(uri: String, is_dir: bool) -> std::io::Result<()> {
 ///
 /// 请求的载荷是 JSON：{"from": string, "to": string}。
 pub(crate) async fn rename(from: String, to: String) -> std::io::Result<()> {
-    let payload = serde_json::json!({ "from": from, "to": to }).to_string();
+    let payload = super::json_object(vec![
+        (fields::FROM, serde_json::Value::String(from)),
+        (fields::TO, serde_json::Value::String(to)),
+    ]);
     status(query::RENAME, payload).await
 }
 
@@ -684,17 +680,17 @@ fn parse_listing(
     };
     let mut entries = Vec::with_capacity(array.len());
     for entry in array {
-        let name = entry["name"].as_str().ok_or_else(|| {
+        let name = entry[fields::NAME].as_str().ok_or_else(|| {
             std::io::Error::other(format!(
                 "listing {uri} has an entry without a name: {entry}"
             ))
         })?;
-        let is_dir = entry["is_dir"].as_bool().ok_or_else(|| {
+        let is_dir = entry[fields::IS_DIR].as_bool().ok_or_else(|| {
             std::io::Error::other(format!(
                 "listing {uri} has an entry without is_dir: {entry}"
             ))
         })?;
-        let child_uri = entry["uri"].as_str().ok_or_else(|| {
+        let child_uri = entry[fields::URI].as_str().ok_or_else(|| {
             std::io::Error::other(format!("listing {uri} has an entry without a uri: {entry}"))
         })?;
         entries.push((name.to_string(), is_dir, child_uri.to_string()));
@@ -705,6 +701,8 @@ fn parse_listing(
 #[cfg(test)]
 mod tests {
     use super::{answer_fields, parse_answer, parse_listing};
+    use crate::ohos::fields;
+    use crate::ohos::json_value;
 
     #[test]
     fn answer_fields_splits_at_the_first_two_tabs() {
@@ -749,11 +747,19 @@ mod tests {
         assert!(parse_answer(105, "not json").is_err(), "不是 JSON");
     }
 
+    fn entry(name: &str, is_dir: bool, uri: &str) -> serde_json::Value {
+        json_value(vec![
+            (fields::NAME, serde_json::Value::String(name.to_string())),
+            (fields::IS_DIR, serde_json::Value::Bool(is_dir)),
+            (fields::URI, serde_json::Value::String(uri.to_string())),
+        ])
+    }
+
     #[test]
     fn parse_listing_reads_entries() {
-        let value = serde_json::json!([
-            {"name": "a|b", "is_dir": true, "uri": "dir:x/a|b"},
-            {"name": "line\nbreak", "is_dir": false, "uri": "dir:x/line\nbreak"}
+        let value = serde_json::Value::Array(vec![
+            entry("a|b", true, "dir:x/a|b"),
+            entry("line\nbreak", false, "dir:x/line\nbreak"),
         ]);
         let entries = parse_listing("dir:x", &value).expect("一份完整的列目录应答");
         assert_eq!(
@@ -775,24 +781,37 @@ mod tests {
             parse_listing("dir:x", &serde_json::json!("not an array")).is_err(),
             "不是数组"
         );
+        let missing_name = json_value(vec![
+            (fields::IS_DIR, serde_json::Value::Bool(true)),
+            (fields::URI, serde_json::Value::String("u".to_string())),
+        ]);
         assert!(
-            parse_listing("dir:x", &serde_json::json!([{"is_dir": true, "uri": "u"}])).is_err(),
+            parse_listing("dir:x", &serde_json::Value::Array(vec![missing_name])).is_err(),
             "缺 name"
         );
+        let missing_is_dir = json_value(vec![
+            (fields::NAME, serde_json::Value::String("a".to_string())),
+            (fields::URI, serde_json::Value::String("u".to_string())),
+        ]);
         assert!(
-            parse_listing("dir:x", &serde_json::json!([{"name": "a", "uri": "u"}])).is_err(),
+            parse_listing("dir:x", &serde_json::Value::Array(vec![missing_is_dir])).is_err(),
             "缺 is_dir"
         );
+        let missing_uri = json_value(vec![
+            (fields::NAME, serde_json::Value::String("a".to_string())),
+            (fields::IS_DIR, serde_json::Value::Bool(true)),
+        ]);
         assert!(
-            parse_listing("dir:x", &serde_json::json!([{"name": "a", "is_dir": true}])).is_err(),
+            parse_listing("dir:x", &serde_json::Value::Array(vec![missing_uri])).is_err(),
             "缺 uri"
         );
+        let wrong_type = json_value(vec![
+            (fields::NAME, serde_json::Value::String("a".to_string())),
+            (fields::IS_DIR, serde_json::Value::String("yes".to_string())),
+            (fields::URI, serde_json::Value::String("u".to_string())),
+        ]);
         assert!(
-            parse_listing(
-                "dir:x",
-                &serde_json::json!([{"name": "a", "is_dir": "yes", "uri": "u"}])
-            )
-            .is_err(),
+            parse_listing("dir:x", &serde_json::Value::Array(vec![wrong_type])).is_err(),
             "is_dir 不是布尔"
         );
     }

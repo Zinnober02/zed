@@ -6,6 +6,7 @@ mod host;
 mod inputmethod;
 mod keyboard;
 mod platform;
+mod protocol_fields;
 mod text_system;
 mod vk;
 mod window;
@@ -27,6 +28,27 @@ use futures::future::BoxFuture;
 pub use vk::LogFn;
 
 pub use host::HostOps;
+
+/// schema 生成的字段常量（gen-protocol.py 的产物）。读写点用它取 JSON 的键，
+/// 字段名就不再有三处手写。
+pub(crate) use protocol_fields::fields;
+
+/// 用生成的字段常量拼一份 JSON 对象文本。
+///
+/// 收一组（常量, 值），顺序原样保留：跨边界的形状由 schema 描述，这里只负责把
+/// 常量变成键。字段名因此不会在读写点再出现字面量。
+pub(crate) fn json_value(pairs: Vec<(&str, serde_json::Value)>) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (name, value) in pairs {
+        map.insert(name.to_string(), value);
+    }
+    serde_json::Value::Object(map)
+}
+
+/// 同上，直接给出可以回送的 JSON 文本。
+pub(crate) fn json_object(pairs: Vec<(&str, serde_json::Value)>) -> String {
+    json_value(pairs).to_string()
+}
 
 pub use inputmethod::{
     commit_text as ime_commit_text, delete_backward as ime_delete_backward,
@@ -562,7 +584,7 @@ pub fn host_event(kind: i32, arg: &str) {
     // 解析失败不在这里报：焦点事件会交给平台线程的 handle_host_event，它记那一行。
     if kind == host::event::FOCUS {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(arg) {
-            if value["focused"].as_bool() == Some(false) {
+            if value[fields::FOCUSED].as_bool() == Some(false) {
                 forget_modifiers();
                 post(|platform| platform.dispatch_modifiers("", crate::Modifiers::default()));
             }
