@@ -26,6 +26,139 @@ fn system_shell() -> &'static str {
     }
 }
 
+/// Variables this entry point sets for a reason, and which the user's shell must not
+/// take back.
+///
+/// The editor's data, cache, state and temp directories stay in the sandbox: the
+/// application cannot execute anything under the home directory until the user grants
+/// that, and language servers have to be executable. The rest - PATH above all - belongs
+/// to whoever configured the shell.
+const OWNED_VARIABLES: [&str; 8] = [
+    "HOME",
+    "SHELL",
+    "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "TMPDIR",
+];
+
+/// Report one line through the host's logger.
+///
+/// These lines are written before the editor installs its own sink, so the logger the
+/// host passed in is the only one that reaches hilog.
+fn host_log(log: LogFn, text: &str) {
+    if let Ok(line) = std::ffi::CString::new(format!("{text}\n")) {
+        log(line.as_ptr());
+    }
+}
+
+/// How long the user's startup files may take before the editor gives up on them.
+const SHELL_ENVIRONMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Take the environment the user's own shell produces.
+///
+/// An interactive shell sources the files they configured; running one and reading back
+/// what it reports is how the editor learns the PATH and the variables those files build,
+/// including whatever they installed under their home directory. A shell that hangs or
+/// writes nothing usable leaves the environment as it was - the editor still runs, just
+/// with the environment the platform gave it.
+fn adopt_user_shell_environment(shell: &str, log: LogFn) {
+    let started = std::time::Instant::now();
+    // The marker separates the environment from anything the startup files print; the
+    // answer is everything after the last one.
+    const MARKER: &str = "__zed_env_below__";
+    let mut command = std::process::Command::new(shell);
+    command
+        // 与上游的 login shell 语义对齐：-l 覆盖 zprofile/zlogin，-i 覆盖 zshrc。
+        .arg("-l")
+        .arg("-i")
+        .arg("-c")
+        .arg(format!("printf '{MARKER}\\n'; env"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            host_log(
+                log,
+                &format!("[zed_ohos] the shell {shell} would not start: {error}"),
+            );
+            return;
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        host_log(log, "[zed_ohos] the shell has no output pipe");
+        let _ = child.kill();
+        return;
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut reader = stdout;
+        let mut buffer = String::new();
+        let result = reader.read_to_string(&mut buffer).map(|_| buffer);
+        let _ = sender.send(result);
+    });
+    let deadline = started + SHELL_ENVIRONMENT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                host_log(
+                    log,
+                    &format!(
+                        "[zed_ohos] the shell did not finish in {}ms; keeping the environment the platform gave",
+                        SHELL_ENVIRONMENT_TIMEOUT.as_millis()
+                    ),
+                );
+                return;
+            }
+            Err(error) => {
+                host_log(
+                    log,
+                    &format!("[zed_ohos] waiting for the shell failed: {error}"),
+                );
+                return;
+            }
+        }
+    }
+    let Ok(Ok(output)) = receiver.recv_timeout(std::time::Duration::from_millis(200)) else {
+        host_log(log, "[zed_ohos] the shell produced no readable environment");
+        return;
+    };
+    let Some(answer) = output.rsplit_once(MARKER).map(|(_, after)| after) else {
+        host_log(log, "[zed_ohos] the shell printed no environment marker");
+        return;
+    };
+    let mut adopted = 0;
+    for line in answer.lines() {
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.is_empty() || OWNED_VARIABLES.contains(&name) {
+            continue;
+        }
+        // SAFETY: this runs before the editor starts any thread, so no other thread
+        // reads the environment while it changes.
+        unsafe { std::env::set_var(name, value) };
+        adopted += 1;
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    host_log(
+        log,
+        &format!(
+            "[zed_ohos] adopted {adopted} variable(s) from {shell} in {}ms, PATH={path}",
+            started.elapsed().as_millis()
+        ),
+    );
+}
 /// Called by the host from OnSurfaceCreated.
 #[unsafe(no_mangle)]
 pub extern "C" fn ohos_gpui_app_main(
@@ -46,7 +179,28 @@ pub extern "C" fn ohos_gpui_app_main(
     // denied and the app stops at its launch-failure dialog.
     // SAFETY: called before any other thread exists.
     unsafe {
-        std::env::set_var("HOME", "/data/storage/el2/base/haps/entry/files");
+        // HOME is the directory the user's own files live in: every shell and tool the
+        // editor starts reads ~/.local/bin and friends out of it, so pointing it at the
+        // sandbox left those installations invisible inside the terminal. The editor's
+        // own data, cache and state move to explicit XDG paths below instead - they
+        // must stay in the sandbox, where they can be executed and written.
+        let sandbox = Path::new("/data/storage/el2/base/haps/entry/files");
+        std::env::set_var("HOME", "/storage/Users/currentUser");
+        // The same paths those defaults resolved to while HOME was the sandbox, so the
+        // language servers already installed there keep working.
+        std::env::set_var("XDG_DATA_HOME", sandbox.join(".local/share"));
+        std::env::set_var("XDG_CACHE_HOME", sandbox.join(".cache"));
+        std::env::set_var("XDG_STATE_HOME", sandbox.join(".local/state"));
+        std::env::set_var("TMPDIR", sandbox.join(".cache/tmp"));
+        for dir in [".local/share", ".cache", ".local/state", ".cache/tmp"] {
+            let path = sandbox.join(dir);
+            if let Err(error) = std::fs::create_dir_all(&path) {
+                let message = format!("[zed_ohos] could not create {}: {error}\n", path.display());
+                if let Ok(text) = std::ffi::CString::new(message) {
+                    log(text.as_ptr());
+                }
+            }
+        }
         // The terminal backend takes the shell and the user name from the
         // environment and falls back to the passwd database, which holds no
         // entry for an application uid (getpwuid_r answers "not found"), and
@@ -83,6 +237,13 @@ pub extern "C" fn ohos_gpui_app_main(
             let path = std::env::var("PATH").unwrap_or_default();
             std::env::set_var("PATH", format!("{}:{path}", user_bin.display()));
         }
+        // Everything else comes from the user's own shell, the way it does on the
+        // platforms this editor was written for: no login shell exists here, so the
+        // shell is named outright and told where the startup files are, and it reports
+        // the environment those files produce. Child processes start needing it within a
+        // second of launch - the git panel and the language servers look for their tools
+        // on PATH - so the capture is bounded and runs before any of them.
+        adopt_user_shell_environment(system_shell(), log);
         // This git reads no home configuration file, so the only way to tell it that
         // the repositories under the user's home are fine to touch is the environment,
         // which every child the editor spawns inherits.
