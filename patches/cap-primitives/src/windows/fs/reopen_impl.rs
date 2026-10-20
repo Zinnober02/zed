@@ -1,4 +1,4 @@
-use crate::fs::{get_access_mode, get_flags_and_attributes, OpenOptions};
+use crate::fs::{OpenOptions, get_access_mode, get_flags_and_attributes};
 use io_lifetimes::AsHandle;
 use std::{fs, io};
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};

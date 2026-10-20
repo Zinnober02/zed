@@ -9,7 +9,7 @@
 
 #[cfg(racy_asserts)]
 use crate::fs::is_same_file;
-use crate::fs::{manually, OpenOptions};
+use crate::fs::{OpenOptions, manually};
 use std::path::Path;
 use std::{fs, io};
 #[cfg_attr(target_env = "ohos", allow(unused_imports))]
@@ -18,7 +18,7 @@ use {
     super::super::super::fs::compute_oflags,
     crate::fs::errors,
     io_lifetimes::FromFd,
-    rustix::fs::{openat2, Mode, OFlags, RawMode, ResolveFlags},
+    rustix::fs::{Mode, OFlags, RawMode, ResolveFlags, openat2},
     rustix::path::Arg,
     std::sync::atomic::AtomicBool,
     std::sync::atomic::Ordering::Relaxed,

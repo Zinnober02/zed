@@ -2,8 +2,8 @@
 //! filesystem permissions modification.
 
 #[cfg(racy_asserts)]
-use crate::fs::{map_result, stat, stat_unchecked, FollowSymlinks, Metadata};
-use crate::fs::{set_permissions_impl, set_symlink_permissions_impl, Permissions};
+use crate::fs::{FollowSymlinks, Metadata, map_result, stat, stat_unchecked};
+use crate::fs::{Permissions, set_permissions_impl, set_symlink_permissions_impl};
 use std::path::Path;
 use std::{fs, io};
 

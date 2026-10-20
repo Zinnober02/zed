@@ -4,7 +4,7 @@
 use crate::fs::remove_file_impl;
 #[cfg(racy_asserts)]
 use crate::fs::{
-    manually, map_result, remove_file_unchecked, stat_unchecked, FollowSymlinks, Metadata,
+    FollowSymlinks, Metadata, manually, map_result, remove_file_unchecked, stat_unchecked,
 };
 use std::path::Path;
 use std::{fs, io};

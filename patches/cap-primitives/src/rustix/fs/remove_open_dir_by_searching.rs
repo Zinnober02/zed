@@ -1,4 +1,4 @@
-use crate::fs::{errors, is_root_dir, read_dir_unchecked, FollowSymlinks, Metadata};
+use crate::fs::{FollowSymlinks, Metadata, errors, is_root_dir, read_dir_unchecked};
 use std::path::Component;
 use std::{fs, io};
 

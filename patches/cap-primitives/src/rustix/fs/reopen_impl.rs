@@ -1,4 +1,4 @@
-use crate::fs::{open_unchecked, OpenOptions};
+use crate::fs::{OpenOptions, open_unchecked};
 use crate::rustix::fs::file_path;
 use io_lifetimes::AsFilelike;
 use rustix::fs::CWD;

@@ -1,5 +1,5 @@
-use crate::fs::{manually, FollowSymlinks, ImplMetadataExt, Metadata};
-use rustix::fs::{statat, AtFlags};
+use crate::fs::{FollowSymlinks, ImplMetadataExt, Metadata, manually};
+use rustix::fs::{AtFlags, statat};
 use std::path::Path;
 use std::{fs, io};
 

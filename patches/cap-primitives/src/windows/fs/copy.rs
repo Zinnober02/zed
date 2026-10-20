@@ -1,5 +1,5 @@
 use super::get_path::get_path;
-use crate::fs::{open, OpenOptions};
+use crate::fs::{OpenOptions, open};
 use std::path::Path;
 use std::{fs, io};
 

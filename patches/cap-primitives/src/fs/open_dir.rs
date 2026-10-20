@@ -3,7 +3,7 @@
 
 #[allow(unused_imports)]
 use crate::fs::open_unchecked;
-use crate::fs::{dir_options, open, open_ambient_dir_impl, readdir_options, FollowSymlinks};
+use crate::fs::{FollowSymlinks, dir_options, open, open_ambient_dir_impl, readdir_options};
 use ambient_authority::AmbientAuthority;
 use std::path::{Component, Path};
 use std::{fs, io};

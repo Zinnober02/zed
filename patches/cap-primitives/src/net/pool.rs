@@ -1,7 +1,7 @@
+use crate::AmbientAuthority;
 #[cfg(test)]
 use crate::ambient_authority;
 use crate::net::pool::net::ToSocketAddrs;
-use crate::AmbientAuthority;
 use ipnet::IpNet;
 #[cfg(test)]
 use std::str::FromStr;

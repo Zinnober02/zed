@@ -1,8 +1,8 @@
 //! This defines `stat`, the primary entrypoint to sandboxed metadata querying.
 
+use crate::fs::{FollowSymlinks, Metadata, stat_impl};
 #[cfg(racy_asserts)]
 use crate::fs::{canonicalize, map_result, stat_unchecked};
-use crate::fs::{stat_impl, FollowSymlinks, Metadata};
 use std::path::Path;
 use std::{fs, io};
 

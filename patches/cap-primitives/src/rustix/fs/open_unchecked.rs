@@ -1,8 +1,8 @@
 use super::compute_oflags;
-use crate::fs::{stat_unchecked, OpenOptions, OpenUncheckedError};
 use crate::AmbientAuthority;
+use crate::fs::{OpenOptions, OpenUncheckedError, stat_unchecked};
 use io_lifetimes::AsFilelike;
-use rustix::fs::{openat, Mode, CWD};
+use rustix::fs::{CWD, Mode, openat};
 use rustix::io;
 use std::fs;
 use std::path::Path;

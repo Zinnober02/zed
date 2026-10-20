@@ -1,4 +1,4 @@
-use crate::fs::{target_o_path, FollowSymlinks, OpenOptions};
+use crate::fs::{FollowSymlinks, OpenOptions, target_o_path};
 use rustix::fs::OFlags;
 use std::io;
 

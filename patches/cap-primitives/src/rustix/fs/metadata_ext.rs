@@ -2,9 +2,9 @@
 
 use crate::fs::{ImplFileTypeExt, ImplPermissionsExt, Metadata};
 use crate::time::{Duration, SystemClock, SystemTime};
-#[cfg(target_os = "linux")]
-use rustix::fs::{makedev, Statx, StatxFlags};
 use rustix::fs::{RawMode, Stat};
+#[cfg(target_os = "linux")]
+use rustix::fs::{Statx, StatxFlags, makedev};
 use std::{fs, io};
 
 #[derive(Debug, Clone)]

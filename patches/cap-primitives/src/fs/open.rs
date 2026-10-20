@@ -2,8 +2,8 @@
 //! opening.
 
 #[cfg(racy_asserts)]
-use crate::fs::{file_path, open_unchecked, stat_unchecked, Metadata};
-use crate::fs::{open_impl, OpenOptions};
+use crate::fs::{Metadata, file_path, open_unchecked, stat_unchecked};
+use crate::fs::{OpenOptions, open_impl};
 use std::path::Path;
 use std::{fs, io};
 

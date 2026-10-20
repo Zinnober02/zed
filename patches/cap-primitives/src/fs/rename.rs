@@ -8,8 +8,8 @@ use std::{fs, io};
 #[cfg(racy_asserts)]
 use {
     crate::fs::{
-        manually, map_result, path_requires_dir, rename_unchecked, stat_unchecked, FollowSymlinks,
-        Metadata,
+        FollowSymlinks, Metadata, manually, map_result, path_requires_dir, rename_unchecked,
+        stat_unchecked,
     },
     std::path::PathBuf,
 };

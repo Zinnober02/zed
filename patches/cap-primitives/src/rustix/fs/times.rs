@@ -1,7 +1,7 @@
 use crate::fs::SystemTimeSpec;
 use crate::time::SystemClock;
 use io_lifetimes::BorrowedFd;
-use rustix::fs::{utimensat, AtFlags, Timestamps, UTIME_NOW, UTIME_OMIT};
+use rustix::fs::{AtFlags, Timestamps, UTIME_NOW, UTIME_OMIT, utimensat};
 use rustix::time::Timespec;
 use std::path::Path;
 use std::{fs, io};
