@@ -559,7 +559,7 @@ pub fn host_event(kind: i32, arg: &str) {
     }
     // 焦点离开时最后按下的修饰键不会再等来抬起事件，累积的状态只能在这里复位；
     // 应用侧保留的修饰键状态同样要收一次复位后的事件，否则它也会停在按下。
-    if kind == host::event::FOCUS && arg.rsplit('\t').next() == Some("0") {
+    if kind == host::event::FOCUS && arg.splitn(2, '\t').nth(1) == Some("0") {
         forget_modifiers();
         post(|platform| platform.dispatch_modifiers("", crate::Modifiers::default()));
     }

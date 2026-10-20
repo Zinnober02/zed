@@ -20,6 +20,8 @@ collections.workspace = true
 futures.workspace = true
 raw-window-handle = "0.6"
 uuid.workspace = true
+# 查询应答的第三段是一个 JSON 字符串：解析交给它，规则只在 C++ 那边写一遍。
+serde_json.workspace = true
 
 # Text shaping/rasterization (fonts come from /system/fonts).
 cosmic-text = "0.17"

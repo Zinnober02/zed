@@ -1080,11 +1080,11 @@ fn window_kind_name(kind: &WindowKind) -> &'static str {
     }
 }
 
-/// Payload for CREATE_WINDOW:
-/// "<id>\t<left>,<top>,<width>,<height>\t<title>\t<resizable>\t<kind>".
+/// Payload for CREATE_WINDOW: "<id>\t<left>,<top>,<width>,<height>\t<kind>".
 ///
-/// 标题是这条通道里唯一的自由文本，制表符、竖线与换行都要先转义，否则整条
-/// 请求的字段跟着错位。
+/// 标题走已有的 SET_TITLE（新窗口的页面登记回调之后，应用自己会把标题交给 op 1），
+/// 能不能调整大小是窗口自己的属性。这两样都不在这条请求里，所以它不再有自由文本，
+/// 也就不需要任何转义。
 fn create_window_payload(
     id: &str,
     params: &WindowParams,
@@ -1102,15 +1102,8 @@ fn create_window_payload(
     } else {
         (width, height)
     };
-    let title = params
-        .titlebar
-        .as_ref()
-        .and_then(|titlebar| titlebar.title.as_ref())
-        .map(|title| host::encode_field(title))
-        .unwrap_or_default();
-    let resizable = if params.is_resizable { "1" } else { "0" };
     let kind = window_kind_name(&params.kind);
-    format!("{id}\t{left},{top},{width},{height}\t{title}\t{resizable}\t{kind}")
+    format!("{id}\t{left},{top},{width},{height}\t{kind}")
 }
 
 /// Map a GPUI cursor style to the OHOS PointerStyle enum member name.

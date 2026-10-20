@@ -80,9 +80,11 @@ pub(crate) mod event {
     /// The pointer entered or left a window: "<surface id>\t1" or "...\t0".
     pub const HOVER: i32 = 9;
     /// The host answers a question the backend asked: the argument is
-    /// "<request number>\t<status code>\t<answer>", where the number is the one
-    /// the backend chose and the answer is escaped by `encode_field`'s rules
-    /// because it may hold a newline or a tab of its own.
+    /// "<request number>\t<status code>\t<JSON string>", where the number is the
+    /// one the backend chose and the third field is a complete JSON string literal
+    /// (see `napi_init.cpp`'s json_answer.h: its rules are the only ones on this
+    /// channel). A JSON string cannot hold a raw tab, which is what lets the two
+    /// numbers be split off at the first two tabs.
     pub const QUERY_ANSWER: i32 = 10;
 }
 
@@ -402,35 +404,54 @@ pub(crate) async fn query(op: i32, arg: &str) -> anyhow::Result<String> {
     }
 }
 
+/// 把应答拆成三段：请求号、状态码、答案的 JSON 文本。
+///
+/// 只切前两刀：第三段是完整的 JSON 字符串字面量，里面不会出现裸制表符（0x09 必须
+/// 写成 \u0009），所以第三段原样交给 JSON 解析器，制表符、换行、引号都由它还原。
+fn answer_fields(payload: &str) -> anyhow::Result<(i32, i32, &str)> {
+    let mut fields = payload.splitn(3, '\t');
+    let request = fields.next().unwrap_or_default();
+    let status = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no status after the request number"))?;
+    let answer = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no answer after the status"))?;
+    let request: i32 = request
+        .parse()
+        .map_err(|error| anyhow::anyhow!("request number {request:?} is not a number: {error}"))?;
+    let code: i32 = status
+        .parse()
+        .map_err(|error| anyhow::anyhow!("status {status:?} is not a number: {error}"))?;
+    Ok((request, code, answer))
+}
+
+/// 解析答案本身：一个 JSON 字符串字面量。
+///
+/// 解析不了就是解析不了：退回一段猜出来的文本等于把别人的答案交给调用方。
+fn answer_text(field: &str) -> anyhow::Result<String> {
+    serde_json::from_str(field)
+        .map_err(|error| anyhow::anyhow!("answer {field:?} is not a JSON string: {error}"))
+}
+
 /// Hand the host's answer to the caller waiting for it.
 ///
-/// The text is escaped at the field boundary like every other field the host
-/// sends: a directory listing holds newlines and a name may hold a tab, and either
-/// one would cut the answer short. An escape this side does not know is an error
-/// handed to the caller; guessing would answer with somebody else's text.
+/// 约定只有一处：宿主回送的是 "<请求号>\t<状态码>\t<JSON 字符串>"，请求号与状态码
+/// 是十进制，第三段的编码规则见 json_answer.h（C++ 侧唯一的编码处）。拆不开或者
+/// JSON 坏掉的应答都会以错误交给等待者，绝不猜内容。
 pub(crate) fn complete_query(payload: &str) {
-    let missing = |what: &str| {
-        super::vk::log(&format!(
-            "[gpui_ohos] query answer {payload:?} has no {what}"
-        ));
+    let (request, code, encoded) = match answer_fields(payload) {
+        Ok(fields) => fields,
+        Err(error) => {
+            // 连请求号都读不出来，就没有等待者可以叫醒：只能留下记录，等看门狗在
+            // 调用方那边兜底并写另一行。
+            super::vk::log(&format!(
+                "[gpui_ohos] query answer {payload:?} cannot be read: {error}"
+            ));
+            return;
+        }
     };
-    let Some((request, rest)) = payload.split_once('\t') else {
-        missing("request number");
-        return;
-    };
-    let Ok(request) = request.parse::<i32>() else {
-        missing("readable request number");
-        return;
-    };
-    let Some((status, encoded)) = rest.split_once('\t') else {
-        missing("status");
-        return;
-    };
-    let Ok(code) = status.parse::<i32>() else {
-        missing("readable status");
-        return;
-    };
-    let answer = match decode_field(encoded) {
+    let answer = match answer_text(encoded) {
         Ok(text) => QueryAnswer { code, text },
         Err(error) => {
             super::vk::log(&format!(
@@ -660,3 +681,49 @@ pub(crate) async fn list_dir(uri: String) -> std::io::Result<Vec<(String, bool, 
     }
     Ok(entries)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{answer_fields, answer_text};
+
+    #[test]
+    fn answer_fields_splits_at_the_first_two_tabs() {
+        assert_eq!(
+            answer_fields("7\t0\t\"\"").expect("一个完整的空应答"),
+            (7, 0, "\"\"")
+        );
+        // 第三段里的制表符是 JSON 的 \u0009，不是裸制表符：只切前两刀。
+        assert_eq!(
+            answer_fields("9\t-2\t\"a\\u0009b\"").expect("第三段带转义的应答"),
+            (9, -2, "\"a\\u0009b\"")
+        );
+    }
+
+    #[test]
+    fn answer_fields_refuses_a_payload_with_missing_fields() {
+        assert!(answer_fields("7").is_err(), "没有状态码与答案");
+        assert!(answer_fields("7\t0").is_err(), "没有答案");
+        assert!(answer_fields("seven\t0\t\"\"").is_err(), "请求号不是数字");
+        assert!(answer_fields("7\tzero\t\"\"").is_err(), "状态码不是数字");
+    }
+
+    #[test]
+    fn answer_text_decodes_what_the_host_encodes() {
+        assert_eq!(answer_text("\"\"").expect("空串"), "");
+        assert_eq!(answer_text("\"a\\\"b\"").expect("引号"), "a\"b");
+        assert_eq!(answer_text("\"a\\\\b\"").expect("反斜杠"), "a\\b");
+        assert_eq!(answer_text("\"a\\u0009b\"").expect("制表符"), "a\tb");
+        assert_eq!(answer_text("\"a\\u000Ab\"").expect("换行"), "a\nb");
+        assert_eq!(answer_text("\"a\\u0001b\"").expect("控制字符"), "a\u{1}b");
+        assert_eq!(answer_text("\"中文\"").expect("非 ASCII"), "中文");
+    }
+
+    #[test]
+    fn answer_text_refuses_what_is_not_a_json_string() {
+        assert!(answer_text("").is_err(), "空应答");
+        assert!(answer_text("plain text").is_err(), "不是 JSON");
+        assert!(answer_text("\"unterminated").is_err(), "引号没有闭合");
+        assert!(answer_text("123").is_err(), "数字不是字符串");
+    }
+}
+
