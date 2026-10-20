@@ -81,13 +81,21 @@ pub(crate) struct WindowRegistry {
 /// 宿主在一次选择里最多给出的记录条数，与它的 `maxSelectNumber` 一致。
 const PICK_MAX_RECORDS: usize = 500;
 
-/// 一个还没回来的选择器应答：发送端，加上这次请求向宿主声明的记录上限。
+/// 一次选择问出去之后等多久就不再认它。
+///
+/// 选择器由用户操作，开着不关是正常的，所以这个期限只是上限：宿主对某次请求从不
+/// 回事件、此后也不再发起新的选择时，等待它的调用方靠这条期限被放开，进程里那张表
+/// 也不会一直留着这一条。
+const PICK_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// 一个还没回来的选择器应答：发送端、这次请求向宿主声明的记录上限，以及放弃期限。
 ///
 /// 宿主回显的 token 里只有编号、没有条数，所以上限跟发送端存在一起，
 /// 解析应答时才有一份可以对得上的声明。
 struct PickWaiter {
     sender: oneshot::Sender<Vec<String>>,
     max_records: usize,
+    deadline: std::time::Instant,
 }
 
 pub(crate) struct OhosPlatform {
@@ -471,6 +479,7 @@ impl OhosPlatform {
                 sender,
                 // 宿主按 multiple 决定选择器给几个位置，超过它的条数这次请求拿不到。
                 max_records: if multiple { PICK_MAX_RECORDS } else { 1 },
+                deadline: std::time::Instant::now() + PICK_ANSWER_TIMEOUT,
             },
         );
         let payload = format!(
@@ -711,6 +720,30 @@ impl OhosPlatform {
 
     /// One host frame: drain host tasks and foreground tasks, fire due timers,
     /// then draw.
+    /// 放弃没人应答的选择，把等它的调用方放开。
+    ///
+    /// 丢掉发送端就是唤醒的方式：调用方收到的是取消，与用户关掉选择器同一结果。
+    fn expire_pending_picks(&self) {
+        if self.pending_picks.borrow().is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let expired: Vec<u64> = self
+            .pending_picks
+            .borrow()
+            .iter()
+            .filter(|(_, waiter)| waiter.deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if self.pending_picks.borrow_mut().remove(&id).is_some() {
+                super::log_line(&format!(
+                    "[gpui_ohos] picker {id} was never answered; releasing whoever waited for it"
+                ));
+            }
+        }
+    }
+
     pub(crate) fn tick(&self) {
         // A resize waited for this moment: it blocks on the GPU.
         self.apply_pending_surface_size();
@@ -728,6 +761,7 @@ impl OhosPlatform {
             self.restore_delivered.set(true);
             self.deliver_restore_folder();
         }
+        self.expire_pending_picks();
         let mut receiver = self.main_receiver.clone();
         while let Ok(Some(runnable)) = receiver.try_pop() {
             runnable.run();
@@ -1395,6 +1429,7 @@ impl Platform for OhosPlatform {
             PickWaiter {
                 sender,
                 max_records: 1,
+                deadline: std::time::Instant::now() + PICK_ANSWER_TIMEOUT,
             },
         );
         let payload = format!(
