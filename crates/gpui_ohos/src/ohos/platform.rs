@@ -1202,7 +1202,9 @@ fn window_event(arg: &str, what: &str) -> Option<(String, serde_json::Value)> {
         }
     };
     let Some(id) = value["id"].as_str() else {
-        super::vk::log(&format!("[gpui_ohos] {what} event has no surface id: {arg}"));
+        super::vk::log(&format!(
+            "[gpui_ohos] {what} event has no surface id: {arg}"
+        ));
         return None;
     };
     Some((id.to_string(), value))

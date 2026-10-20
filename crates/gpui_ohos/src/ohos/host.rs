@@ -600,9 +600,7 @@ async fn status(op: i32, arg: String) -> std::io::Result<()> {
             };
             // 作业失败与应答坏了在这里长得一样，都只表现为"没反应"；留下 op 与原文，
             // 两种都能查到。
-            super::vk::log(&format!(
-                "[gpui_ohos] query {op} did not succeed: {text}"
-            ));
+            super::vk::log(&format!("[gpui_ohos] query {op} did not succeed: {text}"));
             Err(std::io::Error::other(text))
         }
         Err(error) => Err(std::io::Error::other(error.to_string())),
@@ -687,10 +685,14 @@ fn parse_listing(
     let mut entries = Vec::with_capacity(array.len());
     for entry in array {
         let name = entry["name"].as_str().ok_or_else(|| {
-            std::io::Error::other(format!("listing {uri} has an entry without a name: {entry}"))
+            std::io::Error::other(format!(
+                "listing {uri} has an entry without a name: {entry}"
+            ))
         })?;
         let is_dir = entry["is_dir"].as_bool().ok_or_else(|| {
-            std::io::Error::other(format!("listing {uri} has an entry without is_dir: {entry}"))
+            std::io::Error::other(format!(
+                "listing {uri} has an entry without is_dir: {entry}"
+            ))
         })?;
         let child_uri = entry["uri"].as_str().ok_or_else(|| {
             std::io::Error::other(format!("listing {uri} has an entry without a uri: {entry}"))
@@ -706,7 +708,10 @@ mod tests {
 
     #[test]
     fn answer_fields_splits_at_the_first_two_tabs() {
-        assert_eq!(answer_fields("7\t0\t{}").expect("一个完整的空对象"), (7, 0, "{}"));
+        assert_eq!(
+            answer_fields("7\t0\t{}").expect("一个完整的空对象"),
+            (7, 0, "{}")
+        );
         // 第三段是整份 JSON 文档：里面的空格、逗号、方括号都原样留着。
         assert_eq!(
             answer_fields("9\t-2\t{\"a\": [1, 2]}").expect("第三段带结构的应答"),
@@ -724,9 +729,18 @@ mod tests {
 
     #[test]
     fn parse_answer_reads_the_document() {
-        assert_eq!(parse_answer(105, "42").expect("数字"), serde_json::json!(42));
-        assert_eq!(parse_answer(109, "true").expect("布尔"), serde_json::json!(true));
-        assert_eq!(parse_answer(106, "[]").expect("空数组"), serde_json::json!([]));
+        assert_eq!(
+            parse_answer(105, "42").expect("数字"),
+            serde_json::json!(42)
+        );
+        assert_eq!(
+            parse_answer(109, "true").expect("布尔"),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            parse_answer(106, "[]").expect("空数组"),
+            serde_json::json!([])
+        );
         assert_eq!(
             parse_answer(107, "null").expect("空值"),
             serde_json::Value::Null
@@ -746,7 +760,11 @@ mod tests {
             entries,
             vec![
                 ("a|b".to_string(), true, "dir:x/a|b".to_string()),
-                ("line\nbreak".to_string(), false, "dir:x/line\nbreak".to_string()),
+                (
+                    "line\nbreak".to_string(),
+                    false,
+                    "dir:x/line\nbreak".to_string()
+                ),
             ]
         );
     }
@@ -766,11 +784,7 @@ mod tests {
             "缺 is_dir"
         );
         assert!(
-            parse_listing(
-                "dir:x",
-                &serde_json::json!([{"name": "a", "is_dir": true}])
-            )
-            .is_err(),
+            parse_listing("dir:x", &serde_json::json!([{"name": "a", "is_dir": true}])).is_err(),
             "缺 uri"
         );
         assert!(
