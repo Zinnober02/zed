@@ -992,6 +992,9 @@ nix = { path = "patches/nix" }
 alsa = { path = "patches/alsa" }
 # OHOS: like musl, its cmsg length fields are socklen_t, not size_t.
 uds = { path = "patches/uds" }
+# OHOS: 应用的 seccomp 策略把 openat2 变成 SIGSYS 终止进程，cap-primitives 来不及发现
+# 这个调用不可用；补丁让它在 ohos 上返回 ENOSYS，退回自带的分段解析，见 patches/cap-primitives。
+cap-primitives = { path = "patches/cap-primitives" }
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "0890bbb8ca40a4b5d1f67031698dd7918b37d991" }
 webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "0a1c519cfce9b365229026b55de9b9dbdb6fed3c" }
 
