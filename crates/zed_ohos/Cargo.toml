@@ -23,3 +23,5 @@ zed = { path = "../zed" }
 
 [build-dependencies]
 cc = "1"
+# 构建脚本要算出 rust 阶段的输入指纹（宿主用同一个定义比对），所以用同一份 sha2。
+sha2.workspace = true

@@ -57,6 +57,15 @@ fn host_log(log: LogFn, text: &str) {
 /// How long the user's startup files may take before the editor gives up on them.
 const SHELL_ENVIRONMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
+/// rust 阶段输入内容的指纹，构建脚本算好交过来。
+///
+/// 宿主用它判断"装的库与当前源码是否一致"，条件只看这些文件的内容：与 git HEAD 无关，
+/// 所以只改文档或只改宿主时，库与指纹仍然一致。
+const RUST_FINGERPRINT: &str = match option_env!("OHOS_RUST_FP") {
+    Some(value) => value,
+    None => "unknown",
+};
+
 /// Take the environment the user's own shell produces.
 ///
 /// An interactive shell sources the files they configured; running one and reading back
@@ -174,6 +183,10 @@ pub extern "C" fn ohos_gpui_app_main(
         // SAFETY: the host passes a valid, NUL-terminated identifier.
         unsafe { CStr::from_ptr(id) }.to_string_lossy().into_owned()
     };
+    host_log(
+        log,
+        &format!("[zed_ohos] rust fingerprint {RUST_FINGERPRINT}"),
+    );
     // Zed resolves its data, config and log directories from HOME, which the
     // sandbox does not define; without this every directory creation is
     // denied and the app stops at its launch-failure dialog.
