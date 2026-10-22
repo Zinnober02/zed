@@ -145,16 +145,26 @@ impl PlatformQueue {
 
     /// Wake the loop without handing it work: the caller set state it has to look
     /// at, such as a pending frame request.
+    ///
+    /// 通知与 take() 里"看完标志再睡"用同一把锁：只对着条件变量叫一声会撞上还没睡下
+    /// 的等待者，那一拍的通知就丢了，于是这一帧要等到下一次 vsync 才画出来。
     pub(crate) fn wake(&self) {
+        let _guard = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.wake.notify_all();
     }
 
     /// Take everything queued so far, waiting up to `timeout` for the first one.
     /// An empty result means the wait ran out, not that there is nothing to do:
     /// frames are driven by the host, so a quiet queue is normal.
+    ///
+    /// 已经记下的帧请求同样结束等待：vsync 回调大多落在平台线程正在画帧的时候，那次
+    /// 通知没有人接，只剩这个标志，不先看它一眼就睡下会白丢一拍。
     pub(crate) fn take(&self, timeout: Duration) -> Vec<PlatformJob> {
         let mut jobs = self.jobs.lock().unwrap();
-        if jobs.is_empty() {
+        while jobs.is_empty() && !TICK_WANTED.load(Ordering::SeqCst) {
             let (guard, _) = self.wake.wait_timeout(jobs, timeout).unwrap();
             jobs = guard;
         }
@@ -733,6 +743,18 @@ pub(crate) fn want_tick() {
 /// Called by the host once per refresh.
 pub fn tick() {
     want_tick();
+}
+
+/// 按住指针期间每个 vsync 都要提交一幅：内容没变也提交。
+///
+/// 帧仍由宿主的 vsync 回路驱动（它本来就每拍调一次 tick），这里只说明"这一拍即使内容
+/// 没变也要送出去"，判定放在 OhosWindow::render() 里。
+pub fn set_continuous_frames(on: bool) {
+    window::set_continuous_frames(on);
+    if on {
+        // 进入的那一刻就要求一帧，不必等到下一个刷新点。
+        want_tick();
+    }
 }
 
 /// The NDK's own button numbers: left 1, right 2, middle 3, back 4, forward 5.

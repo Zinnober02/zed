@@ -50,6 +50,23 @@ pub(crate) fn benchmark_enabled() -> bool {
     BENCHMARK_FRAMES.load(Ordering::Relaxed) > 0
 }
 
+/// 指针按住期间每个 vsync 都要提交一幅画面。
+///
+/// 拖动时选区每帧都在变；但输入是成批到达的，没有新事件的那些刷新点上内容恰好没变，
+/// 那一拍就被"内容没变就不提交"挡掉了，帧数因此掉到输入批次那么多。按住期间关掉这条
+/// 判断：内容没变也提交，帧数只由刷新率决定。
+static CONTINUOUS_FRAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 设定"按住期间连续出帧"。宿主在鼠标按下、抬起、失焦与关窗时调用。
+pub(crate) fn set_continuous_frames(on: bool) {
+    CONTINUOUS_FRAMES.store(on, Ordering::Relaxed);
+}
+
+/// 现在是否要求每个 vsync 都提交一幅。
+pub(crate) fn continuous_frames() -> bool {
+    CONTINUOUS_FRAMES.load(Ordering::Relaxed)
+}
+
 /// Consume one benchmark frame, returning true while the benchmark runs.
 fn take_benchmark_frame() -> bool {
     let remaining = BENCHMARK_FRAMES.load(Ordering::Relaxed);
@@ -543,8 +560,11 @@ impl WindowShared {
         // for hashing one.
         let hash_started = std::time::Instant::now();
         let benchmark = take_benchmark_frame();
+        // 按住指针期间每一拍都要有画面交给合成器：内容没变也提交。
+        let continuous = continuous_frames();
         let hash = if benchmark { 0 } else { scene_hash(scene) };
         if !benchmark
+            && !continuous
             && self.last_scene_hash.get() == Some(hash)
             && !self.atlas.has_pending_uploads()
             && self.pending_uploads.borrow().is_empty()

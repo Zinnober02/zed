@@ -9,6 +9,6 @@ pub use ohos::{
     key_event, key_pre_ime, list_picked_dir_async, log_line, open_picked_file_async, pointer_down,
     pointer_move, pointer_up, read_picked_file_bytes_async, remove_picked_path_async,
     rename_picked_path_async, root_dir, run_app_on_surface, run_with_surface, scale, scroll,
-    set_host_ops, set_root_dir, should_close_window, surface_created, surface_destroyed,
-    surface_resized, take_restore_folder, tick, write_picked_file_bytes_async,
+    set_continuous_frames, set_host_ops, set_root_dir, should_close_window, surface_created,
+    surface_destroyed, surface_resized, take_restore_folder, tick, write_picked_file_bytes_async,
 };

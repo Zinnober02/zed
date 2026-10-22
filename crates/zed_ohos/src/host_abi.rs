@@ -113,6 +113,12 @@ pub extern "C" fn ohos_gpui_tick() {
     gpui_ohos::tick();
 }
 
+/// 按住指针期间每个 vsync 都提交一幅：内容没变也提交。
+#[unsafe(no_mangle)]
+pub extern "C" fn ohos_gpui_set_continuous_frames(on: bool) {
+    gpui_ohos::set_continuous_frames(on);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ohos_gpui_pointer_down(id: *const c_char, x: f32, y: f32, button: u32) {
     gpui_ohos::pointer_down(&text(id), x, y, button);
