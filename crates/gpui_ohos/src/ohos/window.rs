@@ -50,23 +50,6 @@ pub(crate) fn benchmark_enabled() -> bool {
     BENCHMARK_FRAMES.load(Ordering::Relaxed) > 0
 }
 
-/// 指针按住期间每个 vsync 都要提交一幅画面。
-///
-/// 拖动时选区每帧都在变；但输入是成批到达的，没有新事件的那些刷新点上内容恰好没变，
-/// 那一拍就被"内容没变就不提交"挡掉了，帧数因此掉到输入批次那么多。按住期间关掉这条
-/// 判断：内容没变也提交，帧数只由刷新率决定。
-static CONTINUOUS_FRAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// 设定"按住期间连续出帧"。宿主在鼠标按下、抬起、失焦与关窗时调用。
-pub(crate) fn set_continuous_frames(on: bool) {
-    CONTINUOUS_FRAMES.store(on, Ordering::Relaxed);
-}
-
-/// 现在是否要求每个 vsync 都提交一幅。
-pub(crate) fn continuous_frames() -> bool {
-    CONTINUOUS_FRAMES.load(Ordering::Relaxed)
-}
-
 /// Consume one benchmark frame, returning true while the benchmark runs.
 fn take_benchmark_frame() -> bool {
     let remaining = BENCHMARK_FRAMES.load(Ordering::Relaxed);
@@ -156,7 +139,12 @@ pub(crate) struct WindowShared {
     /// can be dropped before its command buffer runs, and the atlas has already
     /// forgotten those regions by then.
     pending_uploads: RefCell<Vec<AtlasUpload>>,
-    last_scene_hash: Cell<Option<u64>>,
+    /// 下一帧必须送到显示，即使内容一点没变。
+    ///
+    /// 平时 gpui 只在内容变化时才叫这一侧提交，帧数跟着内容走；首帧、窗口尺寸变化、
+    /// surface 重建与窗口重新可见这几种情况下没有内容变化可依，显示上却留着旧的画面，
+    /// 所以由这里显式要求一次，经 `require_presentation` 交给 gpui。
+    present_due: Cell<bool>,
     #[allow(dead_code)]
     foreground_executor: ForegroundExecutor,
 }
@@ -210,7 +198,7 @@ impl WindowShared {
             virtual_keyboard_visible: Cell::new(false),
             atlas: Arc::new(OhosAtlas::new()),
             pending_uploads: RefCell::new(Vec::new()),
-            last_scene_hash: Cell::new(None),
+            present_due: Cell::new(true),
             foreground_executor,
         })
     }
@@ -243,11 +231,16 @@ impl WindowShared {
         let mut callback = self.callbacks.borrow_mut().request_frame.take();
         if let Some(cb) = callback.as_mut() {
             cb(RequestFrameOptions {
-                require_presentation: true,
+                require_presentation: self.present_due.get(),
                 force_render: benchmark_enabled(),
             });
         }
         self.callbacks.borrow_mut().request_frame = callback;
+    }
+
+    /// 要求下一帧无论如何都提交一次，见 `present_due`。
+    pub(crate) fn require_present(&self) {
+        self.present_due.set(true);
     }
 
     /// Current editor text, caret (UTF-16) and caret rect, mirrored to the
@@ -299,6 +292,10 @@ impl WindowShared {
             return;
         }
         self.active.set(active);
+        if active {
+            // 窗口重新拿到焦点就是它又摆在前面了：显示上留着的是它被盖住之前的那一幅。
+            self.require_present();
+        }
         let mut callback = self.callbacks.borrow_mut().active_status_change.take();
         if let Some(callback) = callback.as_mut() {
             callback(active);
@@ -501,6 +498,9 @@ impl WindowShared {
             cb(new_bounds.size, scale);
         }
         self.callbacks.borrow_mut().resize = callback;
+        // 尺寸变了但内容可能一个像素都没变（布局重算结果相同），旧尺寸的那一幅已经
+        // 不该留在显示上。
+        self.require_present();
     }
 
     fn ensure_renderer(&self) -> bool {
@@ -540,6 +540,9 @@ impl WindowShared {
                     .set_device_limit(renderer.max_image_dimension_2d());
                 *self.renderer.borrow_mut() = Some(renderer);
                 self.renderer_window.set(window as usize);
+                // A new native window means the compositor keeps showing whatever
+                // the one before it last held, so this frame has to reach the display.
+                self.require_present();
                 true
             }
             Err(error) => {
@@ -556,21 +559,7 @@ impl WindowShared {
         if self.closed.get() || !self.ensure_renderer() {
             return;
         }
-        // The benchmark forces redraws of an unchanged scene, so it must not pay
-        // for hashing one.
-        let hash_started = std::time::Instant::now();
-        let benchmark = take_benchmark_frame();
-        // 按住指针期间每一拍都要有画面交给合成器：内容没变也提交。
-        let continuous = continuous_frames();
-        let hash = if benchmark { 0 } else { scene_hash(scene) };
-        if !benchmark
-            && !continuous
-            && self.last_scene_hash.get() == Some(hash)
-            && !self.atlas.has_pending_uploads()
-            && self.pending_uploads.borrow().is_empty()
-        {
-            return;
-        }
+        take_benchmark_frame();
         let frame = self.frame_count.get() + 1;
         self.frame_count.set(frame);
         if frame % 120 == 1 {
@@ -621,26 +610,21 @@ impl WindowShared {
         } else {
             false
         };
+        // 已经送到显示才算还清了这一帧；没送到的下一次请求还要再要一次。
+        if presented {
+            self.present_due.set(false);
+        }
         // What a frame costs on the CPU decides how fast it could go on a display
         // that asks for more, since presenting itself is paced by the display.
         static CPU_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let sample = CPU_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if sample % 60 == 0 {
             super::vk::log(&format!(
-                // The first figure is everything after the hash - scene building
-                // and presenting, which includes waiting for the compositor - and
-                // the second is the hash itself.
-                "[gpui_ohos] frame cpu {}us after hashing ({}us hashing)",
-                work_started.elapsed().as_micros(),
-                work_started
-                    .saturating_duration_since(hash_started)
-                    .as_micros()
+                // Scene building and presenting, which includes waiting for the
+                // compositor.
+                "[gpui_ohos] frame cpu {}us",
+                work_started.elapsed().as_micros()
             ));
-        }
-        // A frame that never reached the display must be drawn again, so the hash
-        // is only remembered once it has been presented.
-        if !benchmark && presented {
-            self.last_scene_hash.set(Some(hash));
         }
     }
 
@@ -825,6 +809,7 @@ impl PlatformWindow for OhosWindow {
 
     fn activate(&self) {
         self.shared.active.set(true);
+        self.shared.require_present();
         let mut callback = self
             .shared
             .callbacks
@@ -1527,199 +1512,6 @@ pub(super) fn build_draw_list(
         ));
     }
     (quads, paths, glyphs, sprites, batches)
-}
-
-/// Cheap identity of the rendered scene, used to skip unchanged frames.
-fn scene_hash(scene: &Scene) -> u64 {
-    use std::hash::{Hash, Hasher};
-    // FxHash rather than the default SipHash: the whole scene is hashed every
-    // frame, and SipHash measured about 9 ms for a frame whose other work is
-    // under 0.2 ms. This hash only has to notice changes, not resist an
-    // adversary choosing collisions.
-    let mut hasher = collections::FxHasher::default();
-    scene.quads.len().hash(&mut hasher);
-    for quad in &scene.quads {
-        quad.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
-        quad.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
-        quad.bounds.size.width.as_f32().to_bits().hash(&mut hasher);
-        quad.bounds.size.height.as_f32().to_bits().hash(&mut hasher);
-        // A frame that only moves a mask, reorders layers, or changes a border or
-        // a gradient still looks different, so all of it belongs in the identity.
-        quad.order.hash(&mut hasher);
-        quad.content_mask
-            .bounds
-            .origin
-            .x
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        quad.content_mask
-            .bounds
-            .origin
-            .y
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        quad.content_mask
-            .bounds
-            .size
-            .width
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        quad.content_mask
-            .bounds
-            .size
-            .height
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        for width in [
-            quad.border_widths.top,
-            quad.border_widths.right,
-            quad.border_widths.bottom,
-            quad.border_widths.left,
-        ] {
-            width.0.to_bits().hash(&mut hasher);
-        }
-        for radius in [
-            quad.corner_radii.top_left,
-            quad.corner_radii.top_right,
-            quad.corner_radii.bottom_right,
-            quad.corner_radii.bottom_left,
-        ] {
-            radius.as_f32().to_bits().hash(&mut hasher);
-        }
-        quad.background.as_solid().is_some().hash(&mut hasher);
-        if let Some(color) = quad.background.as_solid() {
-            let rgba = color.to_rgb();
-            rgba.r.to_bits().hash(&mut hasher);
-            rgba.g.to_bits().hash(&mut hasher);
-            rgba.b.to_bits().hash(&mut hasher);
-            rgba.a.to_bits().hash(&mut hasher);
-        }
-        // The border is drawn from this colour: changing only it used to leave
-        // the previous frame on screen.
-        let border = quad.border_color.to_rgb();
-        border.r.to_bits().hash(&mut hasher);
-        border.g.to_bits().hash(&mut hasher);
-        border.b.to_bits().hash(&mut hasher);
-        border.a.to_bits().hash(&mut hasher);
-    }
-    scene.paths.len().hash(&mut hasher);
-    for path in &scene.paths {
-        path.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
-        path.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
-        path.bounds.size.width.as_f32().to_bits().hash(&mut hasher);
-        path.bounds.size.height.as_f32().to_bits().hash(&mut hasher);
-        path.vertices.len().hash(&mut hasher);
-        // Only the count is hashed, not the vertices themselves: measured on
-        // device, hashing a long path's vertices costs about 9 ms per frame,
-        // which is more than the whole 120 Hz budget. Covering them properly
-        // needs the cheaper two-level fingerprint the fix plan describes; until
-        // then a path that keeps its vertex count but moves them can be missed.
-        if let Some(color) = path.color.as_solid() {
-            let rgba = color.to_rgb();
-            rgba.r.to_bits().hash(&mut hasher);
-            rgba.g.to_bits().hash(&mut hasher);
-            rgba.b.to_bits().hash(&mut hasher);
-            rgba.a.to_bits().hash(&mut hasher);
-        }
-    }
-    scene.underlines.len().hash(&mut hasher);
-    for underline in &scene.underlines {
-        underline
-            .bounds
-            .origin
-            .x
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        underline
-            .bounds
-            .origin
-            .y
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        underline
-            .bounds
-            .size
-            .width
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        underline
-            .bounds
-            .size
-            .height
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        let underline_rgb = underline.color.to_rgb();
-        underline_rgb.r.to_bits().hash(&mut hasher);
-        underline_rgb.g.to_bits().hash(&mut hasher);
-        underline_rgb.b.to_bits().hash(&mut hasher);
-        underline_rgb.a.to_bits().hash(&mut hasher);
-    }
-    scene.monochrome_sprites.len().hash(&mut hasher);
-    for sprite in &scene.monochrome_sprites {
-        sprite.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
-        sprite.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
-        sprite
-            .bounds
-            .size
-            .width
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        sprite
-            .bounds
-            .size
-            .height
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        sprite.tile.bounds.origin.x.0.hash(&mut hasher);
-        sprite.tile.bounds.origin.y.0.hash(&mut hasher);
-        sprite.tile.bounds.size.width.0.hash(&mut hasher);
-        sprite.tile.bounds.size.height.0.hash(&mut hasher);
-        let rgba = sprite.color.to_rgb();
-        rgba.r.to_bits().hash(&mut hasher);
-        rgba.g.to_bits().hash(&mut hasher);
-        rgba.b.to_bits().hash(&mut hasher);
-        rgba.a.to_bits().hash(&mut hasher);
-    }
-    // Polychrome sprites were missing from this hash altogether, so adding,
-    // moving, fading or repainting an image never redrew the window: the frame
-    // showing the previous one stayed on screen.
-    scene.polychrome_sprites.len().hash(&mut hasher);
-    for sprite in &scene.polychrome_sprites {
-        sprite.bounds.origin.x.as_f32().to_bits().hash(&mut hasher);
-        sprite.bounds.origin.y.as_f32().to_bits().hash(&mut hasher);
-        sprite
-            .bounds
-            .size
-            .width
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        sprite
-            .bounds
-            .size
-            .height
-            .as_f32()
-            .to_bits()
-            .hash(&mut hasher);
-        sprite.tile.bounds.origin.x.0.hash(&mut hasher);
-        sprite.tile.bounds.origin.y.0.hash(&mut hasher);
-        sprite.tile.bounds.size.width.0.hash(&mut hasher);
-        sprite.tile.bounds.size.height.0.hash(&mut hasher);
-        sprite.tile.tile_id.0.hash(&mut hasher);
-        sprite.opacity.to_bits().hash(&mut hasher);
-        sprite.order.hash(&mut hasher);
-    }
-    hasher.finish()
 }
 
 /// Put text into the focused field of the window.

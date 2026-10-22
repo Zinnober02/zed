@@ -745,18 +745,6 @@ pub fn tick() {
     want_tick();
 }
 
-/// 按住指针期间每个 vsync 都要提交一幅：内容没变也提交。
-///
-/// 帧仍由宿主的 vsync 回路驱动（它本来就每拍调一次 tick），这里只说明"这一拍即使内容
-/// 没变也要送出去"，判定放在 OhosWindow::render() 里。
-pub fn set_continuous_frames(on: bool) {
-    window::set_continuous_frames(on);
-    if on {
-        // 进入的那一刻就要求一帧，不必等到下一个刷新点。
-        want_tick();
-    }
-}
-
 /// The NDK's own button numbers: left 1, right 2, middle 3, back 4, forward 5.
 fn map_button(button: u32) -> MouseButton {
     match button {

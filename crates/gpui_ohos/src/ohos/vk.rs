@@ -1203,8 +1203,11 @@ impl VkRenderer {
             p_next: std::ptr::null(),
             flags: 0,
             surface: self.surface,
-            // Two images throttle acquisition to one frame in flight, so ask
-            // for one more than the driver's minimum when it allows it.
+            // Three images is what the three upstream platforms ask for: Windows
+            // sets BUFFER_COUNT = 3, Wayland's mailbox defaults to three, and so
+            // does macOS. Every image beyond that is one more frame of queueing
+            // delay, and an editor cares about input latency far more than about
+            // that headroom.
             min_image_count: caps.min_image_count.max(3).min(caps.max_image_count.max(3)),
             image_format: chosen.format,
             image_color_space: chosen.color_space,
@@ -1488,7 +1491,7 @@ impl Drop for VkRenderer {
 //
 // Instead of a full descriptor/pipeline setup, the scene is composited on the
 // CPU (solid quads plus glyph coverage) and uploaded to the swapchain image
-// through a host-visible staging buffer. Static frames are skipped by hash.
+// through a host-visible staging buffer.
 // ===========================================================================
 
 const ST_BUFFER_CREATE_INFO: u32 = 12;
