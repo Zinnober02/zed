@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -29,6 +30,7 @@ use crate::{
 use super::atlas::{AtlasUpload, OhosAtlas};
 use super::display::OhosDisplay;
 use super::host;
+use super::inputmethod::IME_TEXT_LIMIT;
 use super::platform::SurfaceState;
 use super::vk::{DrawBatch, DrawPipeline, VkRenderer};
 
@@ -93,6 +95,30 @@ impl Default for WindowCallbacks {
     }
 }
 
+/// Text read from the editor for the input method.
+///
+/// Reading it costs a copy of everything it covers, and the platform asks on every
+/// frame, so it is read again only when the editor may have changed it: gpui draws
+/// a frame only when the scene was invalidated, and an edit always invalidates it,
+/// so a frame drawn since the last read is the sign that there is something new to
+/// read. The interval on top of that keeps a document whose scene is invalidated on
+/// every frame — a text selection being dragged, say — from paying for the copy on
+/// every frame.
+struct ImeText {
+    text: Arc<String>,
+    /// UTF-16 offset in the document where the text starts.
+    start: usize,
+    /// How many UTF-16 units it covers.
+    units: usize,
+    /// The frame this text was read at.
+    drawn: u64,
+    /// When it was read.
+    taken: Instant,
+}
+
+/// Shortest interval between two reads of the editor's text.
+const IME_TEXT_INTERVAL: Duration = Duration::from_millis(100);
+
 /// State shared between the boxed PlatformWindow owned by GPUI and the
 /// OhosPlatform, which needs to drive frames and surface changes.
 pub(crate) struct WindowShared {
@@ -127,6 +153,8 @@ pub(crate) struct WindowShared {
     appearance: Cell<WindowAppearance>,
     /// Caret rectangle in logical window coordinates, for the IME panel.
     ime_cursor: Cell<Bounds<Pixels>>,
+    /// The editor text last mirrored to the input method.
+    ime_text: RefCell<Option<ImeText>>,
     render_failure_logged: Cell<bool>,
     frame_count: Cell<u64>,
     /// Set when the host destroyed this window's surface; the platform then
@@ -194,6 +222,7 @@ impl WindowShared {
             )),
             render_failure_logged: Cell::new(false),
             frame_count: Cell::new(0),
+            ime_text: RefCell::new(None),
             closed: Cell::new(false),
             virtual_keyboard_visible: Cell::new(false),
             atlas: Arc::new(OhosAtlas::new()),
@@ -243,16 +272,73 @@ impl WindowShared {
         self.present_due.set(true);
     }
 
-    /// Current editor text, caret (UTF-16) and caret rect, mirrored to the
-    /// input method.
-    pub(crate) fn ime_context(&self) -> Option<(String, usize, Bounds<Pixels>)> {
+    /// The editor's text around the caret, where that text starts (UTF-16), the
+    /// caret (UTF-16) and the caret rect, mirrored to the input method.
+    ///
+    /// The caret is read on every frame: the input method follows it with its
+    /// candidate window, so it must not lag behind. The text is read again only
+    /// when it may have changed, which `text_around_caret` decides.
+    pub(crate) fn ime_context(&self) -> Option<(Arc<String>, usize, usize, Bounds<Pixels>)> {
         let cursor = self.ime_cursor.get();
         let mut guard = self.input_handler.borrow_mut();
         let handler = guard.as_mut()?;
+        let caret = handler.selected_text_range(true)?.range.end;
+        let (text, start) = self.text_around_caret(handler, caret)?;
+        Some((text, start, caret, cursor))
+    }
+
+    /// The text the input method mirrors: a window of the document around the
+    /// caret, and the UTF-16 offset it starts at.
+    ///
+    /// The input method is never shown more than `IME_TEXT_LIMIT` units, so
+    /// reading more than that window would copy the rest of the document for
+    /// nothing. It is re-read only when the editor may have changed it: a frame
+    /// drawn since the last read says so, because gpui draws only when the scene
+    /// was invalidated and an edit always invalidates it. A caret that has left
+    /// the window makes it unusable whatever the document did, so that re-reads
+    /// it as well.
+    fn text_around_caret(
+        &self,
+        handler: &mut PlatformInputHandler,
+        caret: usize,
+    ) -> Option<(Arc<String>, usize)> {
+        let cached = self.ime_text.borrow();
+        if let Some(mirrored) = cached.as_ref() {
+            let covers = caret >= mirrored.start && caret <= mirrored.start + mirrored.units;
+            if covers
+                && (mirrored.drawn == self.frame_count.get()
+                    || mirrored.taken.elapsed() < IME_TEXT_INTERVAL)
+            {
+                return Some((mirrored.text.clone(), mirrored.start));
+            }
+        }
+        drop(cached);
+        let requested = caret.saturating_sub(IME_TEXT_LIMIT / 2);
+        let requested = requested..requested.saturating_add(IME_TEXT_LIMIT);
         let mut adjusted = None;
-        let text = handler.text_for_range(0..usize::MAX, &mut adjusted)?;
-        let selection = handler.selected_text_range(true)?;
-        Some((text, selection.range.end, cursor))
+        let text = handler.text_for_range(requested.clone(), &mut adjusted);
+        // 编辑器在文档两端只能给出更短的一段，并把实际范围报回来：这份文本从它给出的
+        // 位置开始，不从请求的位置开始。
+        let start = adjusted.map_or(requested.start, |range| range.start);
+        let text = match text {
+            Some(text) => text,
+            // 取不到文本时沿用上一次那一份：这一拍输入法仍然要知道光标在哪里。
+            None => {
+                let cached = self.ime_text.borrow();
+                let mirrored = cached.as_ref()?;
+                return Some((mirrored.text.clone(), mirrored.start));
+            }
+        };
+        let units = text.encode_utf16().count();
+        let text = Arc::new(text);
+        *self.ime_text.borrow_mut() = Some(ImeText {
+            text: text.clone(),
+            start,
+            units,
+            drawn: self.frame_count.get(),
+            taken: Instant::now(),
+        });
+        Some((text, start))
     }
 
     pub(crate) fn shares_surface(&self, other: &Rc<RefCell<SurfaceState>>) -> bool {
@@ -570,6 +656,19 @@ impl WindowShared {
             ));
         }
         let work_started = std::time::Instant::now();
+        // 场景到这里就已经算完了（gpui 的布局、文本整形、绘制都在 `request_frames` 里
+        // 这一步之前）。它和后面两段加起来才是 `draw`，分开才知道该优化谁。
+        super::frame_probe::end_paint();
+        // 场景已经算完，这里顺手记一下它有多大：`paint` 贵而场景小，就是"算得贵"，
+        // 场景大才是"画得多"。
+        super::frame_probe::note_scene(
+            scene.quads.len() as u32,
+            scene.paths.len() as u32,
+            (scene.monochrome_sprites.len()
+                + scene.subpixel_sprites.len()
+                + scene.polychrome_sprites.len()) as u32,
+            scene.underlines.len() as u32,
+        );
         // Regions that a dropped frame never copied stay in front of this batch, so
         // nothing the atlas handed over is lost when a frame does not reach the
         // display.
@@ -579,8 +678,11 @@ impl WindowShared {
         let (sprite_w, sprite_h) = self.atlas.texture_size(AtlasTextureKind::Polychrome);
         let presented = if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
             let (width, height) = renderer.size();
+            // 场景转顶点：路径细分、字形排版都在这一个调用里，它自己也会随内容涨。
+            let build_started = std::time::Instant::now();
             let (quads, paths, glyphs, sprites, batches) =
                 build_draw_list(scene, width, height, atlas_w, atlas_h, sprite_w, sprite_h);
+            super::frame_probe::note_part(super::frame_probe::Part::Build, build_started.elapsed());
             match renderer.render_scene(
                 CLEAR_COLOR,
                 &quads,

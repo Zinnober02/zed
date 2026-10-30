@@ -3762,6 +3762,19 @@ impl VkRenderer {
             anyhow::bail!("vkQueuePresentKHR failed: {pr}");
         }
         let after_present = std::time::Instant::now();
+        // 这一帧的六段并进 `[frame]` 行。以前它们只在下面那条每 60 帧一次的日志里，
+        // 而 hilog 缓冲留不住 60 帧的历史：拖完之后再去看，行已经被冲掉了。
+        super::frame_probe::note_vk_frame(
+            after_acquire.duration_since(start),
+            after_fence.duration_since(after_acquire),
+            after_upload.duration_since(after_fence),
+            after_record.duration_since(after_upload),
+            after_submit.duration_since(after_record),
+            after_present.duration_since(after_submit),
+        );
+        // 这一帧交出去了：把"最新一条输入等了多久"记进分段延迟。放在 present 之后，
+        // 因为那之前的时间都能在下面的 stage 里看到。
+        crate::ohos::input_probe::note_present();
         // Which stage owns the frame time decides what to optimise, so sample it
         // rather than inferring it from the total.
         static GPU_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

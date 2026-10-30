@@ -128,6 +128,19 @@ pub extern "C" fn ohos_gpui_pointer_move(id: *const c_char, x: f32, y: f32) {
     gpui_ohos::pointer_move(&text(id), x, y);
 }
 
+/// 带时刻的移动。两个时刻都是 CLOCK_MONOTONIC 的纳秒：设备侧由 MMI 打，到达时刻
+/// 由宿主在回调入口读。它们只用于把输入到画面的耗时切成段，缺了（0）就不打点。
+#[unsafe(no_mangle)]
+pub extern "C" fn ohos_gpui_pointer_move_at(
+    id: *const c_char,
+    x: f32,
+    y: f32,
+    device_ns: i64,
+    arrival_ns: i64,
+) {
+    gpui_ohos::pointer_move_at(&text(id), x, y, device_ns, arrival_ns);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ohos_gpui_scroll(
     id: *const c_char,
