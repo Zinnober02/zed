@@ -999,7 +999,12 @@ notify-types = { git = "https://github.com/zed-industries/notify", rev = "0890bb
 webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "0a1c519cfce9b365229026b55de9b9dbdb6fed3c" }
 
 [profile.dev]
-split-debuginfo = "unpacked"
+# `unpacked` 把每个 codegen unit 的调试信息再写一份到 deps/*.dwo：这台机器上那批
+# 文件涨到 37GB / 12 万个，而 hmfs 不支持硬链接，每次构建都是逐文件真拷贝，链接器
+# 起来时还要把它们全读一遍。`packed` 只是不再分文件写，`.so` 里的 .debug_* 区块不受
+# 影响，addr2line 照常可用。代价落在增量构建的调试信息合并上，而 workflow 已经设了
+# CARGO_INCREMENTAL=0，这项本来也拿不到。
+split-debuginfo = "packed"
 incremental = true
 codegen-units = 16
 debug = "limited"
@@ -1008,7 +1013,7 @@ debug = "limited"
 # (without this cargo will compile ~400 crates twice)
 [profile.dev.build-override]
 codegen-units = 16
-split-debuginfo = "unpacked"
+split-debuginfo = "packed"
 debug = "limited"
 
 # "debug" is a reserved profile name.
