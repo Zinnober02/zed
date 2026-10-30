@@ -7,8 +7,9 @@ pub use ohos::{
     HostOps, LogFn, close_picked_file_async, create_picked_dir_async, current_platform, host_event,
     ime_commit_text, ime_delete_backward, ime_delete_forward, ime_finish_preview, ime_preview_text,
     key_event, key_pre_ime, list_picked_dir_async, log_line, open_picked_file_async, pointer_down,
-    pointer_move, pointer_up, read_picked_file_bytes_async, remove_picked_path_async,
-    rename_picked_path_async, root_dir, run_app_on_surface, run_with_surface, scale, scroll,
-    set_host_ops, set_root_dir, should_close_window, surface_created, surface_destroyed,
-    surface_resized, take_restore_folder, tick, write_picked_file_bytes_async,
+    pointer_move, pointer_move_at, pointer_up, read_picked_file_bytes_async,
+    remove_picked_path_async, rename_picked_path_async, root_dir, run_app_on_surface,
+    run_with_surface, scale, scroll, set_host_ops, set_root_dir, should_close_window,
+    surface_created, surface_destroyed, surface_resized, take_restore_folder, tick,
+    write_picked_file_bytes_async,
 };

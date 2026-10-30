@@ -393,11 +393,16 @@ impl PlatformAtlas for OhosAtlas {
         key: &AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(crate::Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
+        // 每个字形、每张图片绘制前都过一次这里，次数与图元数同量级。只计命中侧：
+        // 未命中侧的钱在栅格化上，那边已经有 ras 单独计时了。
+        let started = std::time::Instant::now();
         let mut state = self.state.borrow_mut();
         if let Some(tile) = state.tiles_by_key.get(key) {
             let tile = *tile;
             let frame = state.frame;
             state.used.insert(key.clone(), frame);
+            drop(state);
+            super::frame_probe::note_atlas_lookup(started.elapsed());
             return Ok(Some(tile));
         }
 

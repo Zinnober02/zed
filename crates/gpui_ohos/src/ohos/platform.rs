@@ -834,7 +834,14 @@ impl OhosPlatform {
         // activation. Applying it after the frames leaves gpui idle.
         let frame_started = std::time::Instant::now();
         self.dispatcher.run_due_timers();
+        // 一帧里真正提交绘制的那一段单独计时：它和整帧的差就是定时器、焦点、悬停这些
+        // 应用逻辑，两者混在一起时看不出该优化谁。
+        let draw_started = std::time::Instant::now();
+        // 绘制起点落在请求之前：gpui 的布局与绘制就发生在这个调用里，到它把场景交给
+        // 渲染器为止（`window.render`），那一段才是"一帧里应用自己算的那部分"。
+        super::frame_probe::begin_paint();
         self.request_frames();
+        super::frame_probe::note_part(super::frame_probe::Part::Draw, draw_started.elapsed());
         self.apply_pending_focus();
         self.apply_pending_hover();
         // The benchmark measures how fast frames can be produced, not how often
@@ -986,9 +993,10 @@ impl OhosPlatform {
             .collect()
     }
 
-    /// Text, caret and absolute caret rect (physical pixels) of the focused
-    /// editor, for IME context notifications.
-    pub(crate) fn ime_context(&self) -> Option<(String, usize, (f64, f64, f64, f64))> {
+    /// Text around the caret, where that text starts, the caret and the absolute
+    /// caret rect (physical pixels) of the focused editor, for IME context
+    /// notifications.
+    pub(crate) fn ime_context(&self) -> Option<(Arc<String>, usize, usize, (f64, f64, f64, f64))> {
         let rects = self.window_rect.borrow();
         let scale = super::window::SCALE as f64;
         // The focused window first: with several windows open, the first one with
@@ -1000,7 +1008,7 @@ impl OhosPlatform {
             .filter(|window| window.is_active())
             .chain(windows.iter().filter(|window| !window.is_active()));
         for window in ordered {
-            if let Some((text, caret, cursor)) = window.ime_context() {
+            if let Some((text, start, caret, cursor)) = window.ime_context() {
                 // This window's own origin, not whichever window reported last.
                 let (rect_x, rect_y, _, _) = rects
                     .get(window.id())
@@ -1010,7 +1018,7 @@ impl OhosPlatform {
                 let top = rect_y as f64 + cursor.origin.y.as_f32() as f64 * scale;
                 let width = cursor.size.width.as_f32() as f64 * scale;
                 let height = cursor.size.height.as_f32() as f64 * scale;
-                return Some((text, caret, (left, top, width, height)));
+                return Some((text, start, caret, (left, top, width, height)));
             }
         }
         None

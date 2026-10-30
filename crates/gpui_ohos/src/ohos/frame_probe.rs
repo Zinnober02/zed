@@ -189,7 +189,9 @@ pub(crate) fn begin_iteration() -> Duration {
     let now = Instant::now();
     LAST_ITERATION.with(|cell| {
         let previous = cell.replace(Some(now));
-        previous.map_or(Duration::ZERO, |previous| now.saturating_duration_since(previous))
+        previous.map_or(Duration::ZERO, |previous| {
+            now.saturating_duration_since(previous)
+        })
     })
 }
 
@@ -214,7 +216,10 @@ pub(crate) fn note_iteration(
             Some(frame) => {
                 window.frames = window.frames.saturating_add(1);
                 push(&mut window.frame, frame);
-                push(&mut window.rest, gap.saturating_sub(wait + jobs_took + frame));
+                push(
+                    &mut window.rest,
+                    gap.saturating_sub(wait + jobs_took + frame),
+                );
             }
             None => push(&mut window.rest, gap.saturating_sub(wait + jobs_took)),
         }

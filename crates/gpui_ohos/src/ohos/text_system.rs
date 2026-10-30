@@ -186,7 +186,10 @@ impl PlatformTextSystem for OhosTextSystem {
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
-        self.0.read().advance(font_id, glyph_id)
+        let started = std::time::Instant::now();
+        let result = self.0.read().advance(font_id, glyph_id);
+        super::frame_probe::note_text_advance(started.elapsed());
+        result
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
@@ -194,7 +197,10 @@ impl PlatformTextSystem for OhosTextSystem {
     }
 
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        self.0.write().raster_bounds(params)
+        let started = std::time::Instant::now();
+        let result = self.0.write().raster_bounds(params);
+        super::frame_probe::note_text_bounds(started.elapsed());
+        result
     }
 
     fn rasterize_glyph(
@@ -202,11 +208,19 @@ impl PlatformTextSystem for OhosTextSystem {
         params: &RenderGlyphParams,
         raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        self.0.write().rasterize_glyph(params, raster_bounds)
+        let started = std::time::Instant::now();
+        let result = self.0.write().rasterize_glyph(params, raster_bounds);
+        super::frame_probe::note_text_rasterize(started.elapsed());
+        result
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
-        self.0.write().layout_line(text, font_size, runs)
+        // 这一次调用就是一次完整的 cosmic-text 整形（`Shaping::Advanced`）。gpui 的
+        // 行缓存命中时根本不会到这里，所以这个计数直接等于"这一帧重新整形了几行"。
+        let started = std::time::Instant::now();
+        let layout = self.0.write().layout_line(text, font_size, runs);
+        super::frame_probe::note_text_layout(started.elapsed());
+        layout
     }
 
     fn recommended_rendering_mode(
