@@ -2,7 +2,9 @@ mod atlas;
 mod clipboard;
 mod dispatcher;
 mod display;
+mod frame_probe;
 mod host;
+mod input_probe;
 mod inputmethod;
 mod keyboard;
 mod platform;
@@ -110,8 +112,29 @@ fn with_current<R>(f: impl FnOnce(&Rc<OhosPlatform>) -> R) -> Option<R> {
 /// woken. The owner is whichever thread the platform was created on.
 type PlatformJob = Box<dyn FnOnce(&Rc<OhosPlatform>) + Send>;
 
+/// 队列里的一件活。
+///
+/// 移动事件单独成一类，为的是能合并：同一窗口、紧挨着排在队尾的两条移动只留最后一条。
+/// 只在"队尾那条也是同一窗口的移动"时替换，所以移动与其它作业之间的先后顺序一点没变——
+/// 按下、移动、抬起仍按到达顺序派发，被丢掉的只是中间那些位置。
+///
+/// 这是标准做法，不是给编辑器打的补丁：鼠标移动在系统那侧本来就被合过（设备 450~660 点/s
+/// 变成 90~120 次回调），平台层再合一次，只是把"一帧之内到达的几条"收敛成一帧一条。
+pub(crate) enum Queued {
+    Job(PlatformJob),
+    Move(MoveEvent),
+}
+
+/// 一条待派发的指针移动。两个时刻与 `pointer_move_at` 收到的一样，只进探针。
+pub(crate) struct MoveEvent {
+    id: String,
+    x: f32,
+    y: f32,
+    arrival_ns: i64,
+}
+
 pub(crate) struct PlatformQueue {
-    jobs: Mutex<VecDeque<PlatformJob>>,
+    queued: Mutex<VecDeque<Queued>>,
     wake: Condvar,
 }
 
@@ -132,15 +155,38 @@ impl NativeWindow {
 }
 pub(crate) fn platform_queue() -> &'static PlatformQueue {
     PLATFORM_QUEUE.get_or_init(|| PlatformQueue {
-        jobs: Mutex::new(VecDeque::new()),
+        queued: Mutex::new(VecDeque::new()),
         wake: Condvar::new(),
     })
 }
 
 impl PlatformQueue {
-    fn push(&self, job: PlatformJob) {
-        self.jobs.lock().unwrap().push_back(job);
+    fn push_job(&self, job: PlatformJob) {
+        self.queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(Queued::Job(job));
         self.wake.notify_all();
+    }
+
+    /// 投一条移动，返回它是否把队尾那条合并掉了。
+    ///
+    /// 合并掉的时候不再通知：那条已经在队里，平台线程本来就会来取。
+    fn push_move(&self, event: MoveEvent) -> bool {
+        let mut queued = self
+            .queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(Queued::Move(pending)) = queued.back_mut() {
+            if pending.id == event.id {
+                *pending = event;
+                return true;
+            }
+        }
+        queued.push_back(Queued::Move(event));
+        drop(queued);
+        self.wake.notify_all();
+        false
     }
 
     /// Wake the loop without handing it work: the caller set state it has to look
@@ -150,7 +196,7 @@ impl PlatformQueue {
     /// 的等待者，那一拍的通知就丢了，于是这一帧要等到下一次 vsync 才画出来。
     pub(crate) fn wake(&self) {
         let _guard = self
-            .jobs
+            .queued
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.wake.notify_all();
@@ -162,13 +208,16 @@ impl PlatformQueue {
     ///
     /// 已经记下的帧请求同样结束等待：vsync 回调大多落在平台线程正在画帧的时候，那次
     /// 通知没有人接，只剩这个标志，不先看它一眼就睡下会白丢一拍。
-    pub(crate) fn take(&self, timeout: Duration) -> Vec<PlatformJob> {
-        let mut jobs = self.jobs.lock().unwrap();
-        while jobs.is_empty() && !TICK_WANTED.load(Ordering::SeqCst) {
-            let (guard, _) = self.wake.wait_timeout(jobs, timeout).unwrap();
-            jobs = guard;
+    pub(crate) fn take(&self, timeout: Duration) -> Vec<Queued> {
+        let mut queued = self
+            .queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while queued.is_empty() && !TICK_WANTED.load(Ordering::SeqCst) {
+            let (guard, _) = self.wake.wait_timeout(queued, timeout).unwrap();
+            queued = guard;
         }
-        jobs.drain(..).collect()
+        queued.drain(..).collect()
     }
 }
 
@@ -227,7 +276,7 @@ pub(crate) fn post(job: impl FnOnce(&Rc<OhosPlatform>) + Send + 'static) {
         job(&platform);
         return;
     }
-    platform_queue().push(Box::new(job));
+    platform_queue().push_job(Box::new(job));
 }
 fn new_platform() -> Rc<OhosPlatform> {
     let platform = Rc::new(
@@ -343,15 +392,44 @@ where
                 root_dir()
             ));
             loop {
-                for job in platform_queue().take(Duration::from_millis(500)) {
-                    run_platform_step("a queued job", || job(&platform));
+                // 间隔在循环顶端取：放到一帧画完之后取，循环尾部的开销就会被算进下一轮。
+                let gap = frame_probe::begin_iteration();
+                let waited_from = Instant::now();
+                let entries = platform_queue().take(Duration::from_millis(500));
+                let waited = waited_from.elapsed();
+                let queued = entries.len() as u32;
+                // 派发了多少条移动：与 `merged` 相对，才看得出合并省掉了几成。
+                let mut moves = 0u32;
+                let jobs_started = Instant::now();
+                for entry in entries {
+                    let started = Instant::now();
+                    match entry {
+                        Queued::Job(job) => run_platform_step("a queued job", || job(&platform)),
+                        Queued::Move(event) => {
+                            moves += 1;
+                            run_platform_step("a pointer move", || dispatch_move(&platform, event));
+                        }
+                    }
+                    // 单件自己的耗时。`jobt` 是"这一轮所有活加起来"，两者一比才知道一轮
+                    // 里平均派发了几条，也才知道每个事件真正花多少钱。
+                    frame_probe::note_job(started.elapsed());
                 }
+                let jobs_took = jobs_started.elapsed();
                 // One frame per request however many arrived, and never from
                 // inside a job: a frame request made while drawing would otherwise
                 // re-enter the frame loop.
+                let mut frame_took = None;
                 if TICK_WANTED.swap(false, Ordering::SeqCst) {
+                    let frame_started = Instant::now();
                     run_platform_step("a frame", || tick_platform(&platform));
+                    frame_took = Some(frame_started.elapsed());
                 }
+                // 帧间隔的分解。与输入探针各按一秒限频、同一秒对齐，两行对着读就能分出
+                // "作业在排队"与"线程在别处"这两种看起来一样的现象。
+                frame_probe::note_iteration(gap, waited, queued, moves, jobs_took, frame_took);
+                // 分段延迟的汇总：自己按一秒限频，没有样本时一行也不打。
+                input_probe::report_if_due();
+                frame_probe::report_if_due();
                 // The queue that carried the quit has drained, so everything the
                 // shutdown queued behind it has run. Now the host can end it.
                 if QUIT_REQUESTED.swap(false, Ordering::SeqCst) {
@@ -704,25 +782,74 @@ pub fn surface_destroyed(id: &str) {
     ));
 }
 
+mod ime_probe {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    thread_local! {
+        static STATE: RefCell<Option<(Instant, Vec<u32>, u64)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(micros: u32, bytes: usize) {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let (started, samples, total) =
+                state.get_or_insert_with(|| (Instant::now(), Vec::new(), 0));
+            samples.push(micros);
+            *total += bytes as u64;
+            if started.elapsed().as_millis() < 1000 {
+                return;
+            }
+            samples.sort_unstable();
+            let at =
+                |percent: usize| samples[(samples.len() * percent / 100).min(samples.len() - 1)];
+            crate::log_line(&format!(
+                "[ime] calls={} p50={}us p90={}us max={}us bytes={}",
+                samples.len(),
+                at(50),
+                at(90),
+                samples[samples.len() - 1],
+                *total
+            ));
+            *started = Instant::now();
+            samples.clear();
+            *total = 0;
+        });
+    }
+}
+
 /// One frame's work: the input method's queued commands and cursor context, then
 /// the frame itself.
 fn tick_platform(platform: &Rc<OhosPlatform>) {
     // 帧必须在这把锁里画完：宿主正拿着它去释放已经退役的窗口。拿到锁的第一件事是应用
     // 退役表，这样接下来这一帧不会画到一个宿主已经释放的窗口上。
+    let gate_started = Instant::now();
     let gate = present_gate();
+    // 抢锁的时间单独记：宿主释放窗口时会拿住它，而那一刻平台线程什么也做不了。
+    frame_probe::note_part(frame_probe::Part::Gate, gate_started.elapsed());
     for id in take_retired_surfaces() {
         platform.surface_destroyed(&id);
     }
+    let ime_started = Instant::now();
     for command in inputmethod::drain() {
         platform.handle_ime(command);
     }
-    if let Some((text, caret, cursor)) = platform.ime_context() {
-        inputmethod::update_context(&text, caret, cursor);
+    let probe_started = std::time::Instant::now();
+    let ime_context = platform.ime_context();
+    ime_probe::record(
+        probe_started.elapsed().as_micros() as u32,
+        ime_context.as_ref().map_or(0, |context| context.0.len()),
+    );
+    if let Some((text, start, caret, cursor)) = ime_context {
+        inputmethod::update_context(&text, start, caret, cursor);
     }
     // The input method binds to a window only while that window holds focus, so a
     // request made while another window was focused is replayed here once it does.
     inputmethod::apply(platform.focused_surface().as_deref());
+    frame_probe::note_part(frame_probe::Part::Ime, ime_started.elapsed());
+    let tick_started = Instant::now();
     platform.tick();
+    frame_probe::note_part(frame_probe::Part::Tick, tick_started.elapsed());
     drop(gate);
 }
 
@@ -736,6 +863,7 @@ pub(crate) fn request_quit() {
 /// A frame was asked for. Requests coalesce: the first one wakes the loop and the
 /// loop draws once for all of them, which is the backpressure the frame loop had.
 pub(crate) fn want_tick() {
+    frame_probe::note_want();
     TICK_WANTED.store(true, Ordering::SeqCst);
     platform_queue().wake();
 }
@@ -813,16 +941,41 @@ pub fn pointer_up(id: &str, x: f32, y: f32, button: u32) {
 }
 
 pub fn pointer_move(id: &str, x: f32, y: f32) {
-    let id = id.to_string();
-    post(move |platform| {
-        // Which window a pointer event belongs to is decided in the host, where the
-        // hover reports arrive: it knows both the window the pointer is over and
-        // whether a button is still held. A second copy of that rule here could
-        // only disagree with the first.
-        for window in platform.route_targets(&id) {
-            window.pointer_move(crate::point(logical(x), logical(y)));
-        }
-    });
+    pointer_move_at(id, x, y, 0, 0);
+}
+
+/// 带两个时刻的移动：设备侧发生时刻与宿主收到的时刻，都是 CLOCK_MONOTONIC 的纳秒。
+///
+/// 时刻只进探针，不参与命中测试或坐标换算，缺了（0）就是不打点。分段延迟只能从这
+/// 一对时刻加上 present 的时刻算出来：宿主那一段量的是"设备采样到收到"，这里补的
+/// 是"收到到平台线程接手"和"接手到交出去"。
+pub fn pointer_move_at(id: &str, x: f32, y: f32, device_ns: i64, arrival_ns: i64) {
+    // 在调用线程上记下最新输入：它决定一帧交出去时"最新的输入已经等了多久"。
+    input_probe::note_input(device_ns);
+    let event = MoveEvent {
+        id: id.to_string(),
+        x,
+        y,
+        arrival_ns,
+    };
+    // 平台线程自己投出来的移动（合成点击里那一下）直接跑：排进队列再被取回来只会多一拍。
+    if let Some(platform) = with_current(|platform| platform.clone()) {
+        dispatch_move(&platform, event);
+        return;
+    }
+    if platform_queue().push_move(event) {
+        frame_probe::note_merged();
+    }
+}
+
+/// 派发一条指针移动。命中哪个窗口由宿主决定，见 `pointer_move_at`。
+pub(crate) fn dispatch_move(platform: &Rc<OhosPlatform>, event: MoveEvent) {
+    input_probe::note_dispatch(event.arrival_ns);
+    // 一秒内到达的移动可能不止一条：坐标换算只算一次，窗口可能不止一个。
+    let position = crate::point(logical(event.x), logical(event.y));
+    for window in platform.route_targets(&event.id) {
+        window.pointer_move(position);
+    }
 }
 
 /// ArkUI axis events (mouse wheel / touchpad) are already in logical pixels.
