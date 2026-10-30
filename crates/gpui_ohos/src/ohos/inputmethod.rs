@@ -7,7 +7,7 @@
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
@@ -57,10 +57,22 @@ impl ImeSession {
 /// (and logging) on every single frame.
 static RETRY_IN: AtomicU32 = AtomicU32::new(0);
 const RETRY_FRAMES: u32 = 30;
-/// (full text, caret index in UTF-16, absolute caret rect) mirrored from the
-/// focused editor.
-static IME_CONTEXT: Mutex<(String, usize, (f64, f64, f64, f64))> =
-    Mutex::new((String::new(), 0, (0.0, 0.0, 2.0, 20.0)));
+/// What the input method was told about the focused editor: the text it was
+/// handed, where that text starts, the caret as a document index in UTF-16, and
+/// the absolute caret rect.
+static IME_CONTEXT: Mutex<(Option<MirroredText>, usize, (f64, f64, f64, f64))> =
+    Mutex::new((None, 0, (0.0, 0.0, 2.0, 20.0)));
+
+/// The text handed to the input method, and where it starts.
+///
+/// It is a window of the document around the caret rather than the document: the
+/// input method is never shown more than IME_TEXT_LIMIT units, and every reader
+/// here mirrors what it was handed.
+struct MirroredText {
+    text: Arc<String>,
+    /// UTF-16 offset in the document where the text starts.
+    start: usize,
+}
 static PROXY: AtomicUsize = AtomicUsize::new(0);
 static SET_INPUT_TYPE: OnceLock<unsafe extern "C" fn(*mut c_void, i32) -> i32> = OnceLock::new();
 static NOTIFY_SELECTION: OnceLock<
@@ -145,8 +157,14 @@ unsafe extern "C" fn on_text_index_at_cursor(_proxy: *mut c_void) -> i32 {
 
 unsafe extern "C" fn write_text_slice(number: i32, text: *mut u16, length: *mut usize, left: bool) {
     let context = IME_CONTEXT.lock().unwrap();
-    let chars: Vec<u16> = context.0.encode_utf16().collect();
-    let caret = context.1.min(chars.len());
+    let mirrored = context.0.as_ref();
+    let chars: Vec<u16> = match mirrored {
+        Some(mirrored) => mirrored.text.encode_utf16().collect(),
+        None => Vec::new(),
+    };
+    // 光标是文档里的下标，这份文本从文档的中间某处开始。
+    let window_start = mirrored.map_or(0, |mirrored| mirrored.start);
+    let caret = context.1.saturating_sub(window_start).min(chars.len());
     let count = number.max(0) as usize;
     let slice = if left {
         &chars[caret.saturating_sub(count)..caret]
@@ -493,7 +511,7 @@ fn show_now() -> i32 {
     // 12800009 IME_ERR_DETACHED: the system unbinds the client when its window
     // loses focus, and a detached client rejects ShowTextInput. Bind again.
     *ATTACHED.lock().unwrap() = false;
-    *IME_CONTEXT.lock().unwrap() = (String::new(), 0, (0.0, 0.0, 2.0, 20.0));
+    *IME_CONTEXT.lock().unwrap() = (None, 0, (0.0, 0.0, 2.0, 20.0));
     attach();
     try_show()
 }
@@ -513,18 +531,34 @@ pub(crate) fn drain() -> Vec<ImeCommand> {
     std::mem::take(&mut *QUEUE.lock().unwrap())
 }
 
-/// Most UTF-16 units one notification may carry. The input method replaces its
-/// text with whatever it is given and rejects anything longer, so sending the
-/// whole document silently disabled composition in every larger file.
-const IME_TEXT_LIMIT: usize = 8192;
+/// Most UTF-16 units one notification may carry, and therefore the width of the
+/// window the platform reads around the caret. The input method replaces its text
+/// with whatever it is given and rejects anything longer, so sending the whole
+/// document silently disabled composition in every larger file.
+pub(crate) const IME_TEXT_LIMIT: usize = 8192;
 
-/// Mirror the focused editor's text and caret to the input method. The IME
-/// needs these notifications to start composing, and only ever sees a window
-/// around the caret.
-pub(crate) fn update_context(text: &str, caret: usize, cursor: (f64, f64, f64, f64)) {
+/// Mirror the focused editor's text around the caret, its caret and its caret
+/// rectangle to the input method.
+///
+/// `text` is the window the platform read from the editor and `document_start`
+/// the UTF-16 offset it begins at; the caret is a document offset as well. The
+/// input method is handed that window with the offsets made relative to it, which
+/// is all it reads against the text.
+pub(crate) fn update_context(
+    text: &Arc<String>,
+    document_start: usize,
+    caret: usize,
+    cursor: (f64, f64, f64, f64),
+) {
     {
         let context = IME_CONTEXT.lock().unwrap();
-        if context.0 == text && context.1 == caret && context.2 == cursor {
+        // 同一个字符串就是同一份内容：文本只在编辑器可能改动它时才重新读，光标每一拍
+        // 都读，所以先认身份，只有真的换过一份才逐字节比。
+        let same_text = context.0.as_ref().is_some_and(|mirrored| {
+            mirrored.start == document_start
+                && (Arc::ptr_eq(&mirrored.text, text) || mirrored.text.as_str() == text.as_str())
+        });
+        if same_text && context.1 == caret && context.2 == cursor {
             return;
         }
     }
@@ -533,16 +567,8 @@ pub(crate) fn update_context(text: &str, caret: usize, cursor: (f64, f64, f64, f
         return;
     }
     let mut utf16: Vec<u16> = text.encode_utf16().collect();
-    let caret_units = caret.min(utf16.len());
-    // Only the window around the caret is sent, with the offsets made relative
-    // to it: the input method reads them against the text it was handed.
-    let half = IME_TEXT_LIMIT / 2;
-    let start = caret_units
-        .saturating_sub(half)
-        .min(utf16.len().saturating_sub(IME_TEXT_LIMIT));
-    let end = (start + IME_TEXT_LIMIT).min(utf16.len());
-    let window = &mut utf16[start..end];
-    let caret_in_window = caret_units - start;
+    let caret_in_window = caret.saturating_sub(document_start).min(utf16.len());
+    let window = utf16.as_mut_slice();
     let length = window.len();
     let mut accepted = false;
     unsafe {
@@ -559,7 +585,7 @@ pub(crate) fn update_context(text: &str, caret: usize, cursor: (f64, f64, f64, f
                 );
                 accepted = code == 0;
                 if !accepted {
-                    log_notify_failure(code, length, caret_in_window, start);
+                    log_notify_failure(code, length, caret_in_window, document_start);
                 }
             }
         }
@@ -575,7 +601,10 @@ pub(crate) fn update_context(text: &str, caret: usize, cursor: (f64, f64, f64, f
     // the input method knows stayed wrong for good.
     if length == 0 || accepted {
         let mut context = IME_CONTEXT.lock().unwrap();
-        context.0 = text.to_string();
+        context.0 = Some(MirroredText {
+            text: text.clone(),
+            start: document_start,
+        });
         context.1 = caret;
         context.2 = cursor;
     }
