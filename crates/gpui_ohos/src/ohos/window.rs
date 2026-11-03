@@ -804,7 +804,11 @@ impl WindowShared {
                 && last.elapsed() < MULTI_CLICK_INTERVAL
                 && (dx * dx + dy * dy).sqrt() < MULTI_CLICK_RADIUS
         });
-        if repeats { self.click_count.get() + 1 } else { 1 }
+        if repeats {
+            self.click_count.get() + 1
+        } else {
+            1
+        }
     }
 
     pub(crate) fn pointer_up(&self, button: MouseButton, position: Point<Pixels>) {
