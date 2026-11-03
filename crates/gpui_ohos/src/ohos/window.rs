@@ -981,16 +981,17 @@ impl PlatformWindow for OhosWindow {
         self.shared.callbacks.borrow_mut().request_frame = Some(callback);
     }
 
-    /// gpui tells the platform that it wants a frame drawn. The host draws on
-    /// every refresh anyway, so this only has to bring the next frame forward
-    /// for changes that arrive between refreshes, such as background work
-    /// finishing.
-    fn schedule_frame(&self) {
-        super::host::request_frame();
-    }
+    /// 空实现是这里的正解，沿用 trait 的默认实现。宿主每次刷新都无条件送来
+    /// 一次请求，帧请求源从不停止，这个入口要唤醒的东西不存在；把它接到
+    /// `want_tick` 上只会让帧在结束前替自己请求下一帧，而主循环在画之前就取走
+    /// 了那个标志，于是每一轮都把下一轮从睡眠里救回来（实测一秒 8493 轮）。
+    /// macOS、Windows、X11 也都是默认的空实现。
+    fn schedule_frame(&self) {}
 
+    /// 与 `schedule_frame` 同理：`invalidator.wake_platform` 在同一个条件下
+    /// 紧跟着调它，两者只要有一个接回 `want_tick`，帧内自我续接就成立。
     fn frame_waker(&self) -> Option<std::rc::Rc<dyn Fn()>> {
-        Some(std::rc::Rc::new(super::host::request_frame))
+        None
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {

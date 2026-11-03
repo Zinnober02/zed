@@ -155,15 +155,6 @@ fn send(id: &str, op: i32, arg: &str) {
     unsafe { call(op, id.as_ptr(), arg.as_ptr()) };
 }
 
-/// Ask for a frame now. gpui calls this as soon as anything changes, and the
-/// platform thread draws one immediately instead of waiting for the next refresh,
-/// which is what keeps a keystroke from landing a period late. Going out to the
-/// host and back for this cost a trip through the page's JavaScript before
-/// anything could be drawn at all.
-pub(crate) fn request_frame() {
-    super::want_tick();
-}
-
 /// Numbers for the questions this side asks.
 ///
 /// The number, and not the position in any queue, is what matches an answer to the
