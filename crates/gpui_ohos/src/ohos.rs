@@ -862,9 +862,15 @@ pub(crate) fn request_quit() {
 
 /// A frame was asked for. Requests coalesce: the first one wakes the loop and the
 /// loop draws once for all of them, which is the backpressure the frame loop had.
+///
+/// 已经记下的请求不再叫第二次：画一帧时 `request_frames` 会再请求下一帧，
+/// 若每次都唤醒，`take()` 见的永远是「有请求待处理」，一步也不睡，循环变成空转。
+/// 拖拽时实测一秒空转六千多轮，`gap` 掉到 25us，`wait` 为 0。
 pub(crate) fn want_tick() {
+    if TICK_WANTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     frame_probe::note_want();
-    TICK_WANTED.store(true, Ordering::SeqCst);
     platform_queue().wake();
 }
 
