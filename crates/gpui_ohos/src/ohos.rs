@@ -928,6 +928,27 @@ pub fn pointer_down(id: &str, x: f32, y: f32, button: u32) {
     });
 }
 
+/// 手指在 x,y 处按住超过了长按阈值。
+///
+/// 宿主报的是这件事本身，不报「这是第几击」：把一次触摸在编辑器眼里当成双击（从而
+/// 选中按住处的一个词）是这个后端的选择，次数在这里定，跨边界上只有事实。
+pub fn long_press(id: &str, x: f32, y: f32) {
+    let id = id.to_string();
+    post(move |platform| {
+        let targets = platform.route_targets(&id);
+        vk::log(&format!(
+            "[gpui_ohos] long_press id={id} targets={}",
+            targets.len()
+        ));
+        for window in targets {
+            let position = crate::point(logical(x), logical(y));
+            // 命中测试跟着上一次指针位置走，先把它挪过来再按下，否则选中的是上一次的位置。
+            window.pointer_move(position);
+            window.long_press(position);
+        }
+    });
+}
+
 pub fn pointer_up(id: &str, x: f32, y: f32, button: u32) {
     let id = id.to_string();
     post(move |platform| {

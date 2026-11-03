@@ -118,6 +118,14 @@ pub extern "C" fn ohos_gpui_pointer_down(id: *const c_char, x: f32, y: f32, butt
     gpui_ohos::pointer_down(&text(id), x, y, button);
 }
 
+/// 手指在 x,y 处按住超过了长按阈值。
+///
+/// 宿主只报这件事：这份触摸在编辑器眼里算双击（选中按住处的一个词）是后端的决定。
+#[unsafe(no_mangle)]
+pub extern "C" fn ohos_gpui_long_press(id: *const c_char, x: f32, y: f32) {
+    gpui_ohos::long_press(&text(id), x, y);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ohos_gpui_pointer_up(id: *const c_char, x: f32, y: f32, button: u32) {
     gpui_ohos::pointer_up(&text(id), x, y, button);

@@ -38,6 +38,16 @@ use super::vk::{DrawBatch, DrawPipeline, VkRenderer};
 /// Teal so it is unambiguous versus the old probe blue.
 const CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.45, 1.0];
 
+/// 两次按下算作同一次多击的时间上界。
+///
+/// 取值与 `gpui_web` 的一致：那个后端同样没有系统接口可问，用的是同一个经验值。
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+
+/// 两次按下算作同一次多击的位置容差，逻辑像素。
+///
+/// 手指与触控板的落点每次都会有偏差，容差太小会让双击认不出来。
+const MULTI_CLICK_RADIUS: f32 = 5.0;
+
 /// Logical-to-device pixel scale. The 2in1 panel is 3120x2080 at a high DPI,
 /// so a logical pixel maps to ~3 device pixels (otherwise 16px text is tiny).
 pub(crate) const SCALE: f32 = 3.0;
@@ -145,6 +155,14 @@ pub(crate) struct WindowShared {
     renderer_window: Cell<usize>,
     pointer_position: Cell<Point<Pixels>>,
     pressed_button: Cell<Option<MouseButton>>,
+    /// 上一次按下落在哪里、什么时候、按的哪个键。
+    ///
+    /// gpui 不替平台算多击：`click_count` 由每个后端自己维护，Windows、Linux、Web
+    /// 各有各的那一份。这里少算过一次，双击选词在鸿蒙上一直没生效过。
+    last_click_position: Cell<Point<Pixels>>,
+    last_click_at: Cell<Option<Instant>>,
+    click_button: Cell<MouseButton>,
+    click_count: Cell<usize>,
     active: Cell<bool>,
     /// Whether the pointer is over this window, reported by the host's hover
     /// events. Nothing has entered a window before its first one.
@@ -209,6 +227,10 @@ impl WindowShared {
             renderer_window: Cell::new(0),
             pointer_position: Cell::new(point(px(0.0), px(0.0))),
             pressed_button: Cell::new(None),
+            last_click_position: Cell::new(point(px(0.0), px(0.0))),
+            last_click_at: Cell::new(None),
+            click_button: Cell::new(MouseButton::Left),
+            click_count: Cell::new(0),
             active: Cell::new(true),
             hovered: Cell::new(false),
             fullscreen: Cell::new(false),
@@ -730,27 +752,71 @@ impl WindowShared {
         }
     }
 
-    pub(crate) fn pointer_down(&self, button: MouseButton, position: Point<Pixels>) {
+    /// 记下这次按下并发出事件。
+    ///
+    /// 这是第几击由这一侧算：gpui 不替平台算，Windows、Linux、Web 各有各的那一份。
+    /// 长按要的是编辑器眼里的一次双击（选中按住处的那一个词），而手指只有一次真实
+    /// 按下，所以那种情况下次数由 `long_press` 直接给 2，不再走计数。
+    fn press(&self, button: MouseButton, position: Point<Pixels>, click_count: usize) {
         self.pointer_position.set(position);
         self.pressed_button.set(Some(button));
+        // 抬起报的是按下时的次数，所以这里要把状态写上：长按给的是 2，不写的话抬起会
+        // 报上一次点击留下的数。同时记下时刻，否则下一次轻点会凑出一次并不存在的连击。
+        self.click_count.set(click_count);
+        self.last_click_at.set(Some(Instant::now()));
+        self.last_click_position.set(position);
+        self.click_button.set(button);
         self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
             button,
             position,
             // 修饰键只有一份真相，由按键路径累积，这里读的是同一处。
             modifiers: super::modifiers(),
-            click_count: 1,
+            click_count,
             first_mouse: false,
         }));
+    }
+
+    /// 按下，并记一次点击。
+    pub(crate) fn pointer_down(&self, button: MouseButton, position: Point<Pixels>) {
+        let click_count = self.click_count_for(button, position);
+        self.press(button, position, click_count);
+    }
+
+    /// 长按：光标落在按住处，并选中那里的一个词。
+    ///
+    /// 编辑器对「选中一个词」的实现就是双击（`editor/src/selection.rs` 里
+    /// `click_count == 2` 取 `surrounding_word`），所以这里报 2，与真实的双击走
+    /// 同一条路。次数不经过点击计数：手指只按了一次，计数会给出 1。
+    pub(crate) fn long_press(&self, position: Point<Pixels>) {
+        self.press(MouseButton::Left, position, 2);
+    }
+
+    /// 这次按下属于第几击。
+    ///
+    /// 时间、位置与按钮都在容差内才算连击，否则重头数：两下隔得远、隔得久，或者
+    /// 换了一个键，都是独立的单次点击。状态由 `press` 写，这里只读。
+    fn click_count_for(&self, button: MouseButton, position: Point<Pixels>) -> usize {
+        let repeats = self.last_click_at.get().is_some_and(|last| {
+            let previous = self.last_click_position.get();
+            let dx = f32::from(position.x) - f32::from(previous.x);
+            let dy = f32::from(position.y) - f32::from(previous.y);
+            self.click_button.get() == button
+                && last.elapsed() < MULTI_CLICK_INTERVAL
+                && (dx * dx + dy * dy).sqrt() < MULTI_CLICK_RADIUS
+        });
+        if repeats { self.click_count.get() + 1 } else { 1 }
     }
 
     pub(crate) fn pointer_up(&self, button: MouseButton, position: Point<Pixels>) {
         self.pointer_position.set(position);
         self.pressed_button.set(None);
+        // 抬起报的是这次按下时的那个次数：编辑器按它决定一次拖选是扩到词还是扩到行。
+        let click_count = self.click_count.get();
         self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
             button,
             position,
             modifiers: super::modifiers(),
-            click_count: 1,
+            click_count,
         }));
     }
 
